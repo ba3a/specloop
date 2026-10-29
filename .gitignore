@@ -4,3 +4,16 @@ __pycache__/
 
 # specloop installed into this repository for testing; generated from kit/
 .claude/
+
+# >>> specloop (managed by install.py; config.json and overrides/ stay tracked)
+.claude/specloop/*
+!.claude/specloop/config.json
+!.claude/specloop/overrides/
+.claude/commands/sl-advance.md
+.claude/commands/sl-feature.md
+.claude/commands/sl-go.md
+.claude/commands/sl-pause.md
+.claude/commands/sl-reset.md
+.claude/commands/sl-spec.md
+.claude/commands/sl-status.md
+# <<< specloop
