@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -176,6 +178,51 @@ class EngineTest(unittest.TestCase):
         self.assertEqual("exit 0", config["phases"]["implement"]["check"]["command"])
         self.assertEqual("review", config["phases"]["implement"]["next"])
         self.assertEqual("verdict", config["phases"]["review"]["check"]["type"])
+
+    def write_local_config(self, text):
+        with open(os.path.join(self.base, "config.local.json"), "w") as f:
+            f.write(text)
+
+    def test_local_config_overrides_config_json_for_nested_keys(self):
+        self.write_local_config(json.dumps({"phases": {"implement": {"check": {"command": "exit 1"}}}}))
+        config = workflow.load_config(self.root)
+        check = config["phases"]["implement"]["check"]
+        self.assertEqual("exit 1", check["command"])            # config.local.json wins
+        self.assertEqual("command", check["type"])              # sibling from config.json kept
+        self.assertEqual("review", config["phases"]["implement"]["next"])  # sibling from defaults kept
+        self.assertEqual(15, config["maxIterations"])            # untouched config.json key kept
+
+    def test_local_config_overrides_defaults_when_config_json_is_silent(self):
+        self.write_local_config(json.dumps({"feature": {"enforceDelegation": True}}))
+        config = workflow.load_config(self.root)
+        self.assertIs(True, config["feature"]["enforceDelegation"])
+        self.assertIn("stepPhases", config["feature"])
+
+    def test_missing_local_config_changes_nothing(self):
+        without = workflow.load_config(self.root)
+        self.write_local_config("{}")
+        self.assertEqual(without, workflow.load_config(self.root))
+
+    def test_invalid_local_config_is_ignored_with_warning(self):
+        expected = workflow.load_config(self.root)
+        for text in ("{broken", "[1, 2]", "\"text\""):
+            self.write_local_config(text)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                config = workflow.load_config(self.root)
+            self.assertEqual(expected, config, text)
+            self.assertIn("[specloop] ignoring .claude/specloop/config.local.json: ", err.getvalue(), text)
+            self.assertEqual(1, len(err.getvalue().strip().splitlines()), text)
+
+    def test_local_config_is_protected_like_config_json(self):
+        self.start()
+        workflow.cmd_advance(self.root)
+        self.assertEqual("implement", self.state()["phase"])
+        for name in ("config.json", "config.local.json"):
+            path = os.path.join(self.base, name)
+            out = workflow.handle_pretool(self.root, {"tool_name": "Edit", "tool_input": {"file_path": path}})
+            self.assertEqual("deny", out["hookSpecificOutput"]["permissionDecision"], name)
+            self.assertIn(".claude/specloop/" + name, out["hookSpecificOutput"]["permissionDecisionReason"])
 
     def test_phase_set_to_null_is_removed_and_flow_skips_it(self):
         self.set_config({"phases": {"implement": {"next": "done"}, "review": None}})

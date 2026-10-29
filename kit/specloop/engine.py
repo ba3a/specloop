@@ -16,8 +16,11 @@ Manual commands (used by slash commands):
     engine.py status             print the current state
     engine.py reset              delete state and run artifacts
 
-Configuration is layered: defaults.json (shipped with the kit, replaced on update)
-is deep-merged with config.json (owned by the project, never touched by updates).
+Configuration is layered, later layers winning in a deep merge:
+    defaults.json      shipped with the kit, replaced on update
+    config.json        owned by the project and shared through git, never touched by updates
+    config.local.json  personal, per person and git-ignored, optional; an invalid file is
+                       ignored with a warning on stderr
 Phase instructions are read from overrides/<phase>.md first, then phases/<phase>.md.
 Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 """
@@ -79,9 +82,27 @@ def _read_json(path):
         return {}
 
 
+def _read_local_config(root):
+    """Read config.local.json; a missing, unreadable or invalid file counts as {} (with a warning)."""
+    try:
+        with open(_path(root, "config.local.json"), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        reason = str(e).splitlines()[0] if str(e) else e.__class__.__name__
+        sys.stderr.write("[specloop] ignoring %s: %s\n" % (_rel("config.local.json"), reason))
+        return {}
+    if not isinstance(data, dict):
+        sys.stderr.write("[specloop] ignoring %s: top level is not a JSON object\n" % _rel("config.local.json"))
+        return {}
+    return data
+
+
 def load_config(root):
     config = deep_merge(_read_json(_path(root, "defaults.json")), _read_json(_path(root, "config.json")))
-    # Phases explicitly set to null in config.json are removed.
+    config = deep_merge(config, _read_local_config(root))
+    # Phases explicitly set to null in config.json or config.local.json are removed.
     config["phases"] = {k: v for k, v in config.get("phases", {}).items() if v}
     if not isinstance(config.get("feature"), dict):
         config["feature"] = {}
@@ -970,7 +991,8 @@ def handle_pretool(root, hook_input):
 
     if tool in EDIT_TOOLS:
         rel = relative_to_project(root, tool_input.get("file_path") or tool_input.get("notebook_path"))
-        protected = [_rel(n) for n in ("state.json", "config.json", "defaults.json", "engine.py")]
+        protected = [_rel(n) for n in ("state.json", "config.json", "config.local.json",
+                                                "defaults.json", "engine.py")]
         if rel in protected:
             return deny("%s is managed by specloop; use the %s* commands." % (rel, cmd_name(config, "")))
         allowed = phase_graph(config, state).get(phase, {}).get("allowEdits")
