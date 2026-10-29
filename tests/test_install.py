@@ -191,6 +191,49 @@ class InstallTest(unittest.TestCase):
         install.uninstall(self.root, keep_config=True)
         self.assertEqual(["config.json", "overrides"], sorted(os.listdir(self.path(".claude", "specloop"))))
 
+    LOCAL_CONFIG = b'{\n  "update": {"mode": "off"},\r\n  "custom": 1\n}\n'
+
+    def write_local_config(self):
+        with open(self.path(".claude", "specloop", "config.local.json"), "wb") as f:
+            f.write(self.LOCAL_CONFIG)
+
+    def assert_local_config_unchanged(self):
+        with open(self.path(".claude", "specloop", "config.local.json"), "rb") as f:
+            self.assertEqual(self.LOCAL_CONFIG, f.read())
+
+    def test_install_never_creates_local_config(self):
+        install.install(self.root, test_command="true")
+        install.install(self.root, force=True)
+        self.assertFalse(os.path.exists(self.path(".claude", "specloop", "config.local.json")))
+
+    def test_reinstall_and_force_keep_local_config(self):
+        install.install(self.root, test_command="true")
+        self.write_local_config()
+        install.install(self.root)
+        self.assert_local_config_unchanged()
+        install.install(self.root, force=True)
+        self.assert_local_config_unchanged()
+
+    def test_uninstall_keep_config_keeps_local_config(self):
+        install.install(self.root, test_command="true")
+        self.write_local_config()
+        install.uninstall(self.root, keep_config=True)
+        self.assertEqual(["config.json", "config.local.json", "overrides"],
+                         sorted(os.listdir(self.path(".claude", "specloop"))))
+        self.assert_local_config_unchanged()
+
+    def test_uninstall_without_keep_config_removes_local_config(self):
+        install.install(self.root, test_command="true")
+        self.write_local_config()
+        install.uninstall(self.root)
+        self.assertFalse(os.path.exists(self.path(".claude", "specloop")))
+
+    def test_gitignore_ignores_local_config(self):
+        self.git_init()
+        install.install(self.root, test_command="true")
+        self.write_local_config()
+        self.assertTrue(self.git_check_ignore(".claude/specloop/config.local.json"))
+
     def test_detects_test_commands(self):
         cases = [("gradlew", "", "./gradlew test -q"),
                  ("pom.xml", "", "mvn -q test"),

@@ -246,6 +246,10 @@ def install(target, scope="project", prefix=None, test_command=None, force=False
     return prefix
 
 
+# Project-owned entries in .claude/specloop/ that --uninstall --keep-config preserves.
+PROJECT_OWNED = ("config.json", "config.local.json", "overrides")
+
+
 def uninstall(target, keep_config=False):
     remove_commands(target)
     write_gitignore(target, [])
@@ -259,7 +263,7 @@ def uninstall(target, keep_config=False):
         shutil.rmtree(dest)
         return
     for name in os.listdir(dest):
-        if name not in ("config.json", "overrides"):
+        if name not in PROJECT_OWNED:
             path = os.path.join(dest, name)
             shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
 
@@ -275,7 +279,7 @@ def main(argv):
     parser.add_argument("--force", action="store_true", help="recreate config.json from scratch")
     parser.add_argument("--no-gitignore", action="store_true", help="do not touch .gitignore")
     parser.add_argument("--uninstall", action="store_true", help="remove specloop from the project")
-    parser.add_argument("--keep-config", action="store_true", help="with --uninstall: keep config.json and overrides/")
+    parser.add_argument("--keep-config", action="store_true", help="with --uninstall: keep config.json, config.local.json and overrides/")
     args = parser.parse_args(argv)
 
     target = os.path.abspath(args.target)
