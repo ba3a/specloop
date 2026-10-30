@@ -190,6 +190,115 @@ def cmd_name(config, name):
     return "/" + config.get("commandPrefix", "") + name
 
 
+# --- Update checker building blocks -------------------------------------------------------
+
+UPDATE_FILE = "update.json"
+UPDATE_MODES = ("off", "notify", "auto")
+VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
+
+
+def parse_version(text):
+    """Parse 'MAJOR.MINOR.PATCH' (surrounding whitespace allowed) into a tuple; None otherwise."""
+    if not isinstance(text, str):
+        return None
+    match = VERSION_PATTERN.match(text.strip())
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def is_major_update(installed, available):
+    """True when `available` has a higher major number, or (while the major number is 0) a higher minor."""
+    old, new = parse_version(installed), parse_version(available)
+    if old is None or new is None:
+        return False
+    if new[0] != old[0]:
+        return new[0] > old[0]
+    return new[0] == 0 and new[1] > old[1]
+
+
+def _read_json_tolerant(path):
+    """Read a JSON object; a missing, unreadable or invalid file, or a non-object, gives {}."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def read_manifest_source(root):
+    """The `source` recorded by the installer in manifest.json, or None (old install or no manifest)."""
+    source = _read_json_tolerant(_path(root, "manifest.json")).get("source")
+    return source if isinstance(source, dict) else None
+
+
+def load_update_state(root):
+    """The update checker's semaphore file, update.json; {} when missing or unreadable."""
+    return _read_json_tolerant(_path(root, UPDATE_FILE))
+
+
+def save_update_state(root, data):
+    os.makedirs(_path(root), exist_ok=True)
+    with open(_path(root, UPDATE_FILE), "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2) + "\n")
+
+
+def update_mode(config):
+    """The effective update mode: 'off' in CI or with SPECLOOP_DISABLED=1, else update.mode
+    ('off', 'notify' or 'auto'; anything else counts as 'notify')."""
+    if os.environ.get("CI") or os.environ.get("SPECLOOP_DISABLED") == "1":
+        return "off"
+    update = config.get("update")
+    mode = update.get("mode") if isinstance(update, dict) else None
+    return mode if mode in UPDATE_MODES else "notify"
+
+
+def _read_version_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def available_version(root, source, update_state):
+    """The highest of the clone's VERSION and the last recorded remote version, if it is newer
+    than the installed VERSION and newer than a skipped version; None otherwise."""
+    installed = parse_version(_read_version_file(_path(root, "VERSION")))
+    if installed is None:
+        return None
+    floor = installed
+    skipped = parse_version((update_state or {}).get("skipped"))
+    if skipped is not None and skipped > floor:
+        floor = skipped
+    candidates = [(update_state or {}).get("remote")]
+    if source and source.get("path"):
+        candidates.append(_read_version_file(os.path.join(source["path"], "VERSION")))
+    best = None
+    for text in candidates:
+        version = parse_version(text)
+        if version is not None and version > floor and (best is None or version > best):
+            best = version
+    return "%d.%d.%d" % best if best else None
+
+
+def display_url(url):
+    """Shorten a remote URL for display: drop the scheme, credentials, the 'user@host:' form
+    and a trailing '.git', e.g. 'git@github.com:a/b.git' -> 'github.com/a/b'."""
+    text = (url or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+        host, sep, rest = text.partition("/")
+        text = host.rsplit("@", 1)[-1] + sep + rest
+    else:
+        scp = re.match(r"^[^/@]+@([^/:]+):(.*)$", text)
+        if scp:
+            text = scp.group(1) + "/" + scp.group(2)
+    text = text.rstrip("/")
+    if text.endswith(".git"):
+        text = text[:-4]
+    return text
+
+
 def _kit_text(root, name, custom=None):
     """Read <custom>, overrides/<name>.md or phases/<name>.md, whichever exists first; None if none does."""
     names = [custom] if custom else []

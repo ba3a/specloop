@@ -1694,5 +1694,150 @@ class FeatureModeTest(unittest.TestCase):
         self.assertTrue(self.state()["awaitingApproval"])
 
 
+class UpdateHelpersTest(unittest.TestCase):
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        shutil.copytree(KIT, self.base)
+        self.clone = os.path.join(self.root, "clone")
+        os.makedirs(self.clone)
+        self.saved_env = {k: os.environ.pop(k, None) for k in ("CI", "SPECLOOP_DISABLED")}
+
+    def tearDown(self):
+        for key, value in self.saved_env.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def write(self, path, text):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def set_versions(self, installed, clone=None):
+        self.write(os.path.join(self.base, "VERSION"), installed + "\n")
+        if clone is not None:
+            self.write(os.path.join(self.clone, "VERSION"), clone + "\n")
+
+    def source(self):
+        return {"path": self.clone.replace("\\", "/"), "remote": "origin", "branch": "main"}
+
+    def test_defaults_contain_update_block(self):
+        with open(os.path.join(KIT, "defaults.json"), encoding="utf-8") as f:
+            defaults = json.load(f)
+        self.assertEqual({"mode": "notify", "intervalHours": 24, "timeoutSec": 20}, defaults["update"])
+        self.assertEqual("notify", workflow.load_config(self.root)["update"]["mode"])
+
+    def test_parse_version(self):
+        self.assertEqual((0, 2, 0), workflow.parse_version("0.2.0"))
+        self.assertEqual((12, 34, 56), workflow.parse_version(" 12.34.56\n"))
+        for text in ("", "1.2", "1.2.3.4", "v1.2.3", "1.2.x", "1.2.3-beta", "abc", None, 3):
+            self.assertIsNone(workflow.parse_version(text), repr(text))
+
+    def test_is_major_update(self):
+        self.assertTrue(workflow.is_major_update("0.2.0", "0.3.0"))
+        self.assertTrue(workflow.is_major_update("1.2.0", "2.0.0"))
+        self.assertTrue(workflow.is_major_update("0.9.1", "1.0.0"))
+        self.assertFalse(workflow.is_major_update("1.2.0", "1.3.0"))
+        self.assertFalse(workflow.is_major_update("0.2.0", "0.2.1"))
+        self.assertFalse(workflow.is_major_update("1.2.0", "1.2.5"))
+        self.assertFalse(workflow.is_major_update("garbage", "2.0.0"))
+
+    def test_read_manifest_source(self):
+        manifest = os.path.join(self.base, "manifest.json")
+        self.assertIsNone(workflow.read_manifest_source(self.root))          # no manifest
+        self.write(manifest, json.dumps({"commands": [], "settings": "x"}))
+        self.assertIsNone(workflow.read_manifest_source(self.root))          # old install
+        self.write(manifest, "{not json")
+        self.assertIsNone(workflow.read_manifest_source(self.root))          # unreadable
+        self.write(manifest, json.dumps({"source": self.source()}))
+        self.assertEqual(self.source(), workflow.read_manifest_source(self.root))
+
+    def test_update_state_round_trip(self):
+        path = os.path.join(self.base, "update.json")
+        self.assertEqual({}, workflow.load_update_state(self.root))
+        self.write(path, "{broken")
+        self.assertEqual({}, workflow.load_update_state(self.root))
+        self.write(path, "[1, 2]")
+        self.assertEqual({}, workflow.load_update_state(self.root))
+        data = {"checkedAt": "2026-10-30T10:00:00+00:00", "remote": "0.3.0", "skipped": None}
+        workflow.save_update_state(self.root, data)
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(json.dumps(data, indent=2) + "\n", text)
+        self.assertEqual(data, workflow.load_update_state(self.root))
+
+    def test_update_mode(self):
+        self.assertEqual("notify", workflow.update_mode(workflow.load_config(self.root)))
+        for mode in ("off", "notify", "auto"):
+            self.assertEqual(mode, workflow.update_mode({"update": {"mode": mode}}))
+        self.assertEqual("notify", workflow.update_mode({"update": {"mode": "sometimes"}}))
+        self.assertEqual("notify", workflow.update_mode({"update": None}))
+        self.assertEqual("notify", workflow.update_mode({}))
+
+        os.environ["CI"] = "true"
+        self.assertEqual("off", workflow.update_mode({"update": {"mode": "auto"}}))
+        del os.environ["CI"]
+        os.environ["SPECLOOP_DISABLED"] = "1"
+        self.assertEqual("off", workflow.update_mode({"update": {"mode": "auto"}}))
+        del os.environ["SPECLOOP_DISABLED"]
+
+    def test_local_config_overrides_update_mode(self):
+        self.write(os.path.join(self.base, "config.json"), json.dumps({"update": {"mode": "notify"}}))
+        self.write(os.path.join(self.base, "config.local.json"), json.dumps({"update": {"mode": "auto"}}))
+        config = workflow.load_config(self.root)
+        self.assertEqual("auto", workflow.update_mode(config))
+        self.assertEqual(24, config["update"]["intervalHours"])
+
+    def test_available_version_prefers_highest(self):
+        self.set_versions("0.2.0", clone="0.3.0")
+        self.assertEqual("0.3.0", workflow.available_version(self.root, self.source(), {}))
+        self.assertEqual("0.4.0", workflow.available_version(self.root, self.source(), {"remote": "0.4.0"}))
+        self.assertEqual("0.3.0", workflow.available_version(self.root, self.source(), {"remote": "0.2.5"}))
+        self.set_versions("0.2.0", clone="0.2.0")
+        self.assertEqual("0.2.1", workflow.available_version(self.root, self.source(), {"remote": "0.2.1"}))
+
+    def test_available_version_none_when_not_newer(self):
+        self.set_versions("0.2.0", clone="0.2.0")
+        self.assertIsNone(workflow.available_version(self.root, self.source(), {}))
+        self.assertIsNone(workflow.available_version(self.root, self.source(), {"remote": "0.1.9"}))
+        self.set_versions("0.2.0", clone="not a version")
+        self.assertIsNone(workflow.available_version(self.root, self.source(), {"remote": "garbage"}))
+        shutil.rmtree(self.clone)
+        self.assertIsNone(workflow.available_version(self.root, self.source(), {}))
+        self.assertEqual("0.3.0", workflow.available_version(self.root, self.source(), {"remote": "0.3.0"}))
+        self.assertIsNone(workflow.available_version(self.root, None, {}))
+
+    def test_available_version_without_installed_version(self):
+        self.write(os.path.join(self.clone, "VERSION"), "0.3.0\n")
+        self.assertIsNone(workflow.available_version(self.root, self.source(), {"remote": "0.3.0"}))
+
+    def test_available_version_ignores_skipped_but_not_later(self):
+        self.set_versions("0.2.0", clone="0.3.0")
+        self.assertIsNone(workflow.available_version(self.root, self.source(), {"skipped": "0.3.0"}))
+        self.assertIsNone(workflow.available_version(self.root, self.source(),
+                                                     {"skipped": "0.3.0", "remote": "0.2.9"}))
+        self.assertEqual("0.3.1", workflow.available_version(self.root, self.source(),
+                                                             {"skipped": "0.3.0", "remote": "0.3.1"}))
+        self.set_versions("0.2.0", clone="0.4.0")
+        self.assertEqual("0.4.0", workflow.available_version(self.root, self.source(), {"skipped": "0.3.0"}))
+
+    def test_display_url(self):
+        cases = {
+            "https://github.com/someone/specloop-fork.git": "github.com/someone/specloop-fork",
+            "https://user:token@github.com/someone/specloop-fork": "github.com/someone/specloop-fork",
+            "git@github.com:someone/specloop-fork.git": "github.com/someone/specloop-fork",
+            "ssh://git@gitlab.example.com/team/specloop.git": "gitlab.example.com/team/specloop",
+            "https://github.com/someone/specloop/": "github.com/someone/specloop",
+            "/home/me/remote.git": "/home/me/remote",
+            "C:/repos/remote.git": "C:/repos/remote",
+            "": "",
+        }
+        for url, expected in cases.items():
+            self.assertEqual(expected, workflow.display_url(url), url)
+        self.assertEqual("", workflow.display_url(None))
+
+
 if __name__ == "__main__":
     unittest.main()

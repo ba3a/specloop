@@ -135,6 +135,7 @@ Top-level keys (the `feature` block is described under [Feature mode](#feature-m
 | `shell` | `"bash"` | Shell that runs `command` checks (Git Bash on Windows). |
 | `blockedCommandsUntilDone` | `git push`, `gh pr create`, `gh pr merge` | Bash commands denied while a run is active, in both modes. |
 | `largeSpecWarning` | `maxLines` 200, `maxWords` 2000, `maxPlanItems` 12 | Single-mode size warnings; see [Large specs and plans](#large-specs-and-plans). |
+| `update` | `mode` `"notify"`, `intervalHours` 24, `timeoutSec` 20 | Update checks for the kit: `mode` is `"off"`, `"notify"` or `"auto"`; `intervalHours` is the minimum time between network checks; `timeoutSec` limits each git call. Checks are off when `CI` is set or `SPECLOOP_DISABLED=1`. |
 | `phases` | `plan` → `implement` → `review` | The single-mode phase graph; see below. |
 | `feature` | see [Feature mode](#feature-mode) | Feature-mode settings and phase graphs. |
 
