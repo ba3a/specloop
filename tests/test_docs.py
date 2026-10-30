@@ -24,9 +24,11 @@ class DocsTest(unittest.TestCase):
 
     def test_multi_chat_behaviour_is_documented(self):
         readme, guide = read("README.md"), read("CLAUDE.md")
-        for needle in ("{attempt_dir}", "## Several chats in one project", "git worktree"):
+        for needle in ("{attempt_dir}", "## Several chats in one project", "git worktree",
+                       "waits on its own background work"):
             self.assertIn(needle, readme)
-        for needle in ("state.lock", "run/attempts/", "update_state", "background_tasks"):
+        for needle in ("state.lock", "run/attempts/", "update_state", "background_tasks",
+                       "waits on its own background work"):
             self.assertIn(needle, guide)
         self.assertNotIn("Nothing in this repository runs inside this repository", guide)
 

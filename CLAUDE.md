@@ -50,7 +50,7 @@ python -m unittest tests.test_engine -v       # one suite
 
 ## Hook protocol reference
 
-- Stop: print `{"decision": "block", "reason": "..."}` to keep Claude working, or `{"systemMessage": "..."}` / nothing to let it stop. The input has `background_tasks` when the task registry is reachable: one entry per in-flight task, with a `type` such as `subagent`, `workflow`, `teammate`, `shell` or `monitor`.
+- Stop: print `{"decision": "block", "reason": "..."}` to keep Claude working, or `{"systemMessage": "..."}` / nothing to let it stop. The input has `background_tasks` when the task registry is reachable: one entry per in-flight task, with a `type` such as `subagent`, `workflow`, `teammate`, `shell` or `monitor`. A subagent that waits on its own background work has ended its turn, so it is not listed and only its shell is; `SubagentStop` fires when it parks and `SubagentStart` when it resumes.
 - PreToolUse: print `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "..."}}` to block a tool call.
 - SessionStart / UserPromptSubmit: print `{"hookSpecificOutput": {"hookEventName": "<event>", "additionalContext": "..."}}`.
 - UserPromptSubmit: `prompt` holds a typed command as typed. Print `{"decision": "block", "reason": "..."}` to stop the prompt, and with it the command's shell lines.
