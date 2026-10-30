@@ -11,4 +11,6 @@ Write `{run_dir}/review.md` with the findings (list each required change), and e
 - `VERDICT: APPROVE` if the change is ready, or
 - `VERDICT: CHANGES_REQUESTED` if anything must be fixed.
 
+Put the verdict alone on the last line; a marker inside a sentence or a code block does not count.
+
 Then finish your turn.

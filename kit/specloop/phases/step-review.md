@@ -22,6 +22,8 @@ Write `{run_dir}/review.md` with the findings (list each required change), and e
 - `VERDICT: APPROVE` if the step is ready to be committed, or
 - `VERDICT: CHANGES_REQUESTED` if anything must be fixed.
 
+Put the verdict alone on the last line; a marker inside a sentence or a code block does not count.
+
 If the review shows that the remaining plan itself is wrong (not just this step's implementation), write `{run_dir}/replan.md` instead of a verdict: explain what is wrong with the remaining plan and propose the change to the pending steps.
 
 Then finish your turn. When the review approves, specloop commits the step and starts the next one.

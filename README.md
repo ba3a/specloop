@@ -146,7 +146,7 @@ Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of
 |--------------|--------|-------------|
 | `file` | `path` | the file exists and is non-empty |
 | `command` | `command` | the command exits 0 (run with `shell`, default `bash`, from the project root) |
-| `verdict` | `path`, `approve`, `reject`, `onReject` | the file contains `approve`. If it contains `reject`, the file is archived and the flow jumps to `onReject`. |
+| `verdict` | `path`, `approve`, `reject` (optional: `null` drops the default), `onReject` | the last verdict line of the file is `approve`. A verdict line is a whole line equal to `approve` or `reject` once surrounding whitespace, Markdown emphasis, `-`/`+`/`*` bullets, heading and quote markers and a trailing period are removed from both (markers are single-line; ones that become empty or identical are compared as written); a marker inside a sentence or a fenced code block does not count, and an unclosed fence hides every verdict. If the last verdict line is `reject`, the file is archived and the flow jumps to `onReject`. |
 
 A phase with no check passes immediately. To remove a phase, set it to `null` and re-point the previous phase's `next`. For example, to skip review:
 

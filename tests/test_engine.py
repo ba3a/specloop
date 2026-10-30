@@ -35,7 +35,7 @@ class EngineTest(unittest.TestCase):
                          "phases": {"implement": {"check": {"type": "command", "command": command}}}})
 
     def write_run(self, name, text):
-        with open(os.path.join(self.base, "run", name), "w") as f:
+        with open(os.path.join(self.base, "run", name), "w", encoding="utf-8") as f:
             f.write(text)
 
     def write_override(self, phase, text):
@@ -122,6 +122,51 @@ class EngineTest(unittest.TestCase):
         out = workflow.handle_stop(self.root, {})
         self.assertIn("must contain", out["reason"])
         self.assertEqual("review", self.state()["phase"])
+
+    def review(self, text):
+        """Run plan and implement, write review.md with text, return the Stop output of the review phase."""
+        self.start()
+        self.write_run("plan.md", "plan")
+        workflow.handle_stop(self.root, {})
+        workflow.handle_stop(self.root, {})
+        self.write_run("review.md", text)
+        return workflow.handle_stop(self.root, {})
+
+    def test_verdict_quoted_in_prose_does_not_count(self):
+        out = self.review("I would write VERDICT: APPROVE once the null check is in; until then it is\n"
+                          "VERDICT: CHANGES_REQUESTED territory.\n\nVERDICT: CHANGES_REQUESTED\n")
+        self.assertEqual("block", out["decision"])
+        self.assertEqual("implement", self.state()["phase"])
+
+    def test_verdict_only_in_prose_blocks(self):
+        out = self.review("Write VERDICT: APPROVE or VERDICT: CHANGES_REQUESTED at the end.")
+        self.assertIn("must contain", out["reason"])
+        self.assertEqual("review", self.state()["phase"])
+
+    def test_last_verdict_line_wins(self):
+        out = self.review("VERDICT: APPROVE\n\nOn second thought the test is missing.\n\nVERDICT: CHANGES_REQUESTED\n")
+        self.assertEqual("implement", self.state()["phase"])
+        self.assertIn("second thought", out["reason"])
+
+    def test_last_verdict_line_wins_for_approve_too(self):
+        out = self.review("VERDICT: CHANGES_REQUESTED\n\nRe-read: the test is there.\n\nVERDICT: APPROVE\n")
+        self.assertNotIn("decision", out)
+        self.assertEqual("done", self.state()["status"])
+
+    def test_verdict_line_may_carry_markdown_emphasis(self):
+        out = self.review("All good.\n\n  **`VERDICT: APPROVE`**  \n")
+        self.assertNotIn("decision", out)
+        self.assertEqual("done", self.state()["status"])
+
+    def test_unclosed_code_fence_is_named_in_the_reason(self):
+        out = self.review("```diff\n ```bash\n-pip install x\n ```\n```\n\nVERDICT: APPROVE\n")
+        self.assertIn("never closed", out["reason"])
+        self.assertEqual("review", self.state()["phase"])
+
+    def test_verdict_file_with_bom_is_read(self):
+        out = self.review("\ufeffVERDICT: APPROVE\n")
+        self.assertNotIn("decision", out)
+        self.assertEqual("done", self.state()["status"])
 
     def test_stalls_after_max_iterations_and_go_resumes(self):
         self.set_test_command("exit 0", max_iterations=2)
@@ -652,6 +697,85 @@ def valid_steps():
             },
         ],
     }
+
+
+class VerdictTest(unittest.TestCase):
+
+    CHECK = {"approve": "VERDICT: APPROVE", "reject": "VERDICT: CHANGES_REQUESTED"}
+
+    def verdict(self, text, check=None):
+        return workflow.find_verdict(text, check or self.CHECK)
+
+    def test_decorated_verdict_lines_count(self):
+        for line in ("- `VERDICT: APPROVE`", "* VERDICT: APPROVE", "## VERDICT: APPROVE", "> VERDICT: APPROVE",
+                     "> - **VERDICT: APPROVE**", "VERDICT: APPROVE.", "**VERDICT: APPROVE**.",
+                     "** `VERDICT: APPROVE` **", "```VERDICT: APPROVE```", "\tVERDICT: APPROVE \r"):
+            self.assertEqual("pass", self.verdict("Notes.\n" + line + "\n"), line)
+
+    def test_verdict_with_other_text_on_the_line_does_not_count(self):
+        for line in ("Final: VERDICT: APPROVE", "VERDICT: APPROVE if the test is added", "VERDICT:APPROVE",
+                     "verdict: approve", "~~VERDICT: APPROVE~~"):
+            self.assertIsNone(self.verdict(line + "\n"), line)
+
+    def test_verdict_inside_code_fence_is_ignored(self):
+        text = "VERDICT: CHANGES_REQUESTED\n\nEnd your file like this:\n```\nVERDICT: APPROVE\n```\n"
+        self.assertEqual("reject", self.verdict(text))
+        self.assertIsNone(self.verdict("~~~md\nVERDICT: APPROVE\n~~~\n"))
+
+    def test_code_fences_follow_markdown_rules(self):
+        quoted = "```\nVERDICT: APPROVE\n```\n"
+        # A fence closes only on a bare run of the same character that is at least as long.
+        self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n````md\n" + quoted + "````\n"))
+        self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n~~~md\n" + quoted + "~~~\n"))
+        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n```\n~~~\n```\nVERDICT: APPROVE\n"))
+        self.assertIsNone(self.verdict("```\n``` y\nVERDICT: APPROVE\n```\n"))
+        self.assertEqual("unclosed", self.verdict("```\n```\u00a0\nVERDICT: APPROVE\n"))
+        # Inline code at the start of a line is not a fence; a fence inside a blockquote or a list item is one.
+        self.assertEqual("reject", self.verdict("```x``` is wrong.\n" + quoted + "VERDICT: CHANGES_REQUESTED\n"))
+        self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n> ```\n> VERDICT: APPROVE\n> ```\n"))
+        self.assertEqual("reject", self.verdict("VERDICT: APPROVE\n- ```\n  bug()\n  ```\nVERDICT: CHANGES_REQUESTED\n"))
+        self.assertEqual("pass", self.verdict("1. ```text\n   VERDICT: CHANGES_REQUESTED\n   ```\n\nVERDICT: APPROVE\n"))
+        # A closer never carries a list marker: "+ ```" inside a quoted diff is content, not the end of the block.
+        self.assertEqual("reject", self.verdict("```diff\n+ ```\n+ VERDICT: APPROVE\n```\nVERDICT: CHANGES_REQUESTED\n"))
+        # Only ASCII digits number a list.
+        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n\u0661. ```\nVERDICT: APPROVE\n"))
+
+    def test_unclosed_code_fence_hides_every_verdict(self):
+        for text in ("VERDICT: APPROVE\n\n```python\nif fence:\n\nVERDICT: CHANGES_REQUESTED\n",
+                     "VERDICT: APPROVE\n\n> ```python\n> if fence:\n\nVERDICT: CHANGES_REQUESTED\n",
+                     "Fix:\n```python\nx = 1\n\nVERDICT: CHANGES_REQUESTED\n",
+                     "```diff\n ```bash\n-pip install x\n ```\n```\n\nVERDICT: APPROVE\n"):
+            self.assertEqual("unclosed", self.verdict(text), text)
+
+    def test_only_newlines_break_lines(self):
+        self.assertEqual("pass", self.verdict("Fine.\r\nVERDICT: APPROVE\r\n"))
+        self.assertEqual("pass", self.verdict("Fine.\rVERDICT: APPROVE\r"))
+        self.assertIsNone(self.verdict("We must not write\u2028VERDICT: APPROVE\n"))
+
+    def test_custom_markers_are_normalized_like_lines(self):
+        check = {"approve": "**LGTM**", "reject": "`NOPE`"}
+        self.assertEqual("pass", self.verdict("**LGTM**\n", check))
+        self.assertEqual("pass", self.verdict("LGTM\n", check))
+        self.assertEqual("reject", self.verdict("- NOPE\n", check))
+
+    def test_custom_markers_that_collide_when_normalized_are_compared_as_written(self):
+        check = {"approve": "+1", "reject": "-1"}
+        self.assertEqual("reject", self.verdict("Missing test.\n-1\n", check))
+        self.assertEqual("pass", self.verdict("+1\n", check))
+        self.assertIsNone(self.verdict("1.\n", check))
+        self.assertIsNone(self.verdict("-1\n", {"approve": "+1", "reject": "NOPE"}))
+        self.assertEqual("reject", self.verdict("APPROVED.\n", {"approve": "APPROVED", "reject": "APPROVED."}))
+        self.assertEqual("reject", self.verdict("NO\n\nmore\n", {"approve": "**", "reject": "NO"}))
+
+    def test_reject_marker_is_optional(self):
+        for check in ({"approve": "LGTM"}, {"approve": "LGTM", "reject": None}):
+            self.assertEqual("pass", self.verdict("LGTM\n", check))
+            self.assertIsNone(self.verdict("NOPE\n", check))
+        self.assertEqual("reject", self.verdict("Missing test.\n...\n", {"approve": "LGTM", "reject": "..."}))
+
+    def test_reject_marker_containing_approve_marker_rejects(self):
+        check = {"approve": "LGTM", "reject": "LGTM-NOT"}
+        self.assertEqual("reject", self.verdict("LGTM-NOT\n", check))
 
 
 class StepsValidationTest(unittest.TestCase):

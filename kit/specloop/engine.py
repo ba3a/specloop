@@ -43,6 +43,11 @@ FAILURE_FILE = "last-failure.md"
 COMMIT = "commit"
 REPLAN_FILE = "replan.md"
 MAX_SLUG_LENGTH = 50
+VERDICT_PREFIX = re.compile(r"^(?:\s|>|#+(?=\s)|[-+*](?=\s))+")  # Markdown quote, heading and list markers
+VERDICT_WRAP = " \t`*_."  # whitespace, emphasis and a trailing period around a verdict
+CODE_FENCE = re.compile(r"(?:[ \t>]|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t]))*(`{3,}|~{3,})(.*)$")  # opener: run, info
+FENCE_CLOSE = re.compile(r"[ \t>]*(`{3,}|~{3,})[ \t]*$")  # closer: a bare run, never behind a list marker
+LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
 def project_dir(hook_input=None):
@@ -388,6 +393,49 @@ def check_steps_immutable(previous, current):
 
 # --- checks --------------------------------------------------------------------
 
+def verdict_line(line):
+    """Reduce a review line (or a configured marker) to its bare text: "- `VERDICT: APPROVE`." -> "VERDICT: APPROVE"."""
+    return VERDICT_PREFIX.sub("", line.strip()).strip(VERDICT_WRAP)
+
+
+def code_fence(line):
+    """Return the fence run when the line opens a fenced code block, else None (CommonMark: a backtick
+    fence may not have a backtick in its info string, that is inline code)."""
+    match = CODE_FENCE.match(line)
+    if not match or (match.group(1)[0] == "`" and "`" in match.group(2)):
+        return None
+    return match.group(1)
+
+
+def find_verdict(text, check):
+    """Return 'pass', 'reject', 'unclosed' or None from the verdict lines of a review.
+
+    A verdict line is a whole line whose bare text (see verdict_line) equals check["approve"] or the
+    optional check["reject"]; lines inside fenced code blocks are skipped. So a marker quoted inside a
+    sentence or a code block never counts. The last verdict line wins, so a reviewer who changes their
+    mind is read correctly. A fence still open at the end hides the rest of the file: 'unclosed'."""
+    approve, reject, bare = verdict_line(check["approve"]), verdict_line(check.get("reject") or ""), verdict_line
+    if not approve or approve == reject or (check.get("reject") and not reject):
+        # Markers that are nothing but decoration: compare them as written.
+        approve, reject, bare = check["approve"].strip(), (check.get("reject") or "").strip(), str.strip
+    verdict, fence = None, ""
+    for line in LINE_BREAK.split(text):  # not str.splitlines: Markdown breaks lines only on \n and \r
+        if fence:  # only a bare run of the same character, at least as long, closes the block
+            close = FENCE_CLOSE.match(line)
+            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
+                fence = ""
+            continue
+        fence = code_fence(line) or ""
+        if fence:
+            continue
+        line = bare(line)
+        if line == approve:
+            verdict = "pass"
+        elif reject and line == reject:
+            verdict = "reject"
+    return "unclosed" if fence else verdict
+
+
 def check_phase(root, config, phase_config):
     """Run the check of one phase (its config dict from the phase graph).
 
@@ -420,13 +468,19 @@ def check_phase(root, config, phase_config):
         path = os.path.join(root, check["path"])
         if not os.path.exists(path):
             return _same("fail", "Review file %s is missing." % check["path"])
-        with open(path, encoding="utf-8", errors="replace") as f:
+        with open(path, encoding="utf-8-sig", errors="replace") as f:
             text = f.read()
-        if check["approve"] in text:
+        verdict = find_verdict(text, check)
+        if verdict == "pass":
             return "pass", "review approved", ""
-        if check["reject"] in text:
+        if verdict == "reject":
             return "reject", tail(text, limit), text
-        return _same("fail", "%s must contain '%s' or '%s'." % (check["path"], check["approve"], check["reject"]))
+        if verdict == "unclosed":
+            return _same("fail", "%s has a fenced code block that is never closed, so no verdict line counts. "
+                         "Close it (a snippet that contains ``` goes inside a ```` fence)." % check["path"])
+        markers = " or ".join("'%s'" % m for m in (check["approve"], check.get("reject")) if m)
+        return _same("fail", "%s must contain a verdict line: exactly %s on a line of its own." % (
+            check["path"], markers))
     if kind == "steps":
         path = os.path.join(root, check["path"])
         if not os.path.exists(path):
