@@ -60,6 +60,14 @@ class InstallTest(unittest.TestCase):
         config = self.read_json(".claude", "specloop", "config.json")
         self.assertEqual("make test", config["phases"]["implement"]["check"]["command"])
 
+    def test_commands_that_change_the_workflow_are_only_for_the_user(self):
+        install.install(self.root, test_command="make test")
+        for name in ("spec", "feature", "go", "advance", "pause", "reset"):
+            with open(self.path(".claude", "commands", "sl-%s.md" % name), encoding="utf-8") as f:
+                self.assertIn("disable-model-invocation: true\n", f.read(), name)
+        with open(self.path(".claude", "commands", "sl-status.md"), encoding="utf-8") as f:
+            self.assertNotIn("disable-model-invocation", f.read())
+
     def test_feature_command_installed_with_prefix(self):
         install.install(self.root, test_command="make test")
         with open(self.path(".claude", "commands", "sl-feature.md"), encoding="utf-8") as f:

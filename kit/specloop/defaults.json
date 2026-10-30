@@ -41,7 +41,7 @@
         "allowEdits": [".claude/specloop/run/"],
         "check": {
           "type": "verdict",
-          "path": ".claude/specloop/run/review.md",
+          "path": "{attempt_dir}/review.md",
           "approve": "VERDICT: APPROVE",
           "reject": "VERDICT: CHANGES_REQUESTED",
           "onReject": "implement"
@@ -70,7 +70,7 @@
       "allowEdits": [".claude/specloop/run/"],
       "check": {
         "type": "verdict",
-        "path": ".claude/specloop/run/review.md",
+        "path": "{attempt_dir}/review.md",
         "approve": "VERDICT: APPROVE",
         "reject": "VERDICT: CHANGES_REQUESTED",
         "onReject": "implement"

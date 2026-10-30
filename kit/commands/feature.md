@@ -1,6 +1,7 @@
 ---
 description: "specloop: load a specification in feature mode (one commit per planned step)"
 argument-hint: <path-to-spec.md>
+disable-model-invocation: true
 allowed-tools: Bash(sh .claude/specloop/run.sh:*)
 ---
 !`sh .claude/specloop/run.sh init-feature "$ARGUMENTS"`

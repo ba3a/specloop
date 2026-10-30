@@ -19,8 +19,18 @@ class DocsTest(unittest.TestCase):
         missing = [k for k in keys if "`%s`" % k not in readme]
         self.assertEqual([], missing, "config keys missing from README.md")
 
-    def test_version_is_0_2_0(self):
-        self.assertEqual("0.2.0", read("VERSION").strip())
+    def test_version_is_0_2_1(self):
+        self.assertEqual("0.2.1", read("VERSION").strip())
+
+    def test_multi_chat_behaviour_is_documented(self):
+        readme, guide = read("README.md"), read("CLAUDE.md")
+        for needle in ("{attempt_dir}", "{review_file}", "lateReviews", "commitBase", "{run_dir}/review.md",
+                       "## Several chats in one project", "git worktree", "waits on its own background work"):
+            self.assertIn(needle, readme)
+        for needle in ("state.lock", "run/attempts/", "update_state", "background_tasks",
+                       "waits on its own background work"):
+            self.assertIn(needle, guide)
+        self.assertNotIn("Nothing in this repository runs inside this repository", guide)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ Check that:
 - there are no correctness bugs, unhandled edge cases, or leftover debug code;
 - the code follows the project's conventions (CLAUDE.md, linters, existing patterns).
 
-Write `{run_dir}/review.md` with the findings (list each required change), and end it with exactly one verdict line:
+Write `{review_file}` with the findings (list each required change), and end it with exactly one verdict line:
 - `VERDICT: APPROVE` if the change is ready, or
 - `VERDICT: CHANGES_REQUESTED` if anything must be fixed.
 
