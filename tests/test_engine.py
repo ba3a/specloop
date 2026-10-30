@@ -1261,6 +1261,57 @@ class FeatureModeTest(unittest.TestCase):
         self.assertIn("specloop/my-big-feature", out["systemMessage"])
         self.assertIsNone(workflow.handle_stop(self.root, {}))
 
+    def install_source(self, clone_version):
+        """Give the kit copy a manifest that points at a clone (a directory with a VERSION file)."""
+        clone = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, clone, True)
+        for path, text in ((os.path.join(clone, "VERSION"), clone_version + "\n"),
+                           (os.path.join(self.base, "VERSION"), "0.2.0\n"),
+                           (os.path.join(self.base, "manifest.json"), json.dumps({"commands": [], "source": {
+                               "path": clone, "remote": "origin", "branch": "main", "checkable": True,
+                               "url": "https://example.invalid/kit.git", "version": "0.2.0"}}))):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+
+    def finish_feature(self):
+        """Run both steps; return (last hook output, recorded update-check spawns)."""
+        spawns, saved = [], workflow.spawn_update_check
+        workflow.spawn_update_check = lambda root: spawns.append(root) or True
+        try:
+            self.approve()
+            self.run_step({"a.py": "a = 1\n"})
+            out = self.run_step({"README.txt": "docs\n"})
+        finally:
+            workflow.spawn_update_check = saved
+        self.assertEqual("done", self.state()["status"])
+        return out, spawns
+
+    def test_feature_completion_message_carries_the_update_notice(self):
+        self.install_source("9.0.0")
+        out, spawns = self.finish_feature()
+        self.assertNotIn("decision", out)
+        self.assertIn("All 2 steps are finished on branch specloop/my-big-feature", out["systemMessage"])
+        self.assertIn("9.0.0 is available (installed 0.2.0", out["systemMessage"])
+        self.assertTrue(out["systemMessage"].endswith("to turn checks off."))
+        self.assertIn("specloop never pushes.\n\n[specloop] 9.0.0", out["systemMessage"])
+        self.assertEqual([], spawns)
+
+    def test_feature_completion_message_is_unchanged_without_a_newer_version(self):
+        self.install_source("0.2.0")
+        out, spawns = self.finish_feature()
+        self.assertNotIn("available", out["systemMessage"])
+        self.assertIn("All 2 steps are finished", out["systemMessage"])
+        self.assertTrue(out["systemMessage"].endswith("specloop never pushes."))
+        self.assertEqual([], spawns)
+
+    def test_feature_steps_in_between_carry_no_notice(self):
+        self.install_source("9.0.0")
+        self.approve()
+        out = self.run_step({"a.py": "a = 1\n"})
+        self.assertEqual("block", out["decision"])
+        self.assertNotIn("available", out["reason"])
+        self.assertNotIn("announced", workflow.load_update_state(self.root))
+
     def test_rejected_review_returns_to_implement_without_commit(self):
         self.approve()
         out = self.run_step({"a.py": "a = 1\n"}, verdict="CHANGES_REQUESTED")
@@ -2328,6 +2379,93 @@ class UpdateNoticeTest(UpdateNoticeHelpers, unittest.TestCase):
             workflow.update_notice = saved
         self.assertEqual("the notice", output["systemMessage"])
         self.assertIn("additionalContext", output["hookSpecificOutput"])
+
+    # --- workflow completion (Stop hook) --------------------------------------------
+
+    DONE_MESSAGE = "[specloop] all phases passed - done."
+
+    def finish_workflow(self):
+        """Run a single-mode workflow to its end through the Stop hook; return the last hook output.
+        The spawn helper is recorded, git is left alone because the gates run real commands."""
+        with open(os.path.join(self.base, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}}}, f)
+        self.start_workflow()
+        with open(os.path.join(self.base, "run", "plan.md"), "w", encoding="utf-8") as f:
+            f.write("- [ ] step")
+        saved = workflow.spawn_update_check
+        workflow.spawn_update_check = lambda root: self.spawns.append(root) or True
+        try:
+            workflow.handle_stop(self.root, {})  # plan -> implement
+            workflow.handle_stop(self.root, {})  # implement -> review
+            path = os.path.join(workflow.attempt_path(self.root, workflow.load_state(self.root)), "review.md")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("Fine.\nVERDICT: APPROVE")
+            out = workflow.handle_stop(self.root, {})
+        finally:
+            workflow.spawn_update_check = saved
+        self.assertEqual("done", workflow.load_state(self.root)["status"])
+        return out
+
+    def test_completion_message_carries_the_update_notice(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(checkedAt=self.fresh())
+        out = self.finish_workflow()
+        self.assertNotIn("decision", out)
+        self.assertTrue(out["systemMessage"].startswith(self.DONE_MESSAGE + "\n\n"))
+        self.assertIn(self.NEWER + " is available", out["systemMessage"])
+        self.assertIn("/sl-update", out["systemMessage"])
+        self.assertEqual(self.NEWER, workflow.load_update_state(self.root)["announced"]["version"])
+
+    def test_completion_notice_never_spawns_a_check(self):
+        self.bump_clone(self.NEWER)  # no checkedAt: SessionStart would start a check now
+        out = self.finish_workflow()
+        self.assertIn(self.NEWER + " is available", out["systemMessage"])
+        self.assertEqual([], self.spawns)
+
+    def test_completion_message_is_unchanged_without_a_newer_version(self):
+        self.assertEqual({"systemMessage": self.DONE_MESSAGE}, self.finish_workflow())
+        self.assertEqual([], self.spawns)
+
+    def test_completion_message_is_unchanged_when_the_mode_is_off(self):
+        self.bump_clone(self.NEWER)
+        self.write_local_config({"update": {"mode": "off"}})
+        self.assertEqual({"systemMessage": self.DONE_MESSAGE}, self.finish_workflow())
+
+    def test_completion_message_is_unchanged_for_a_skipped_version(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(skipped=self.NEWER)
+        self.assertEqual({"systemMessage": self.DONE_MESSAGE}, self.finish_workflow())
+
+    def test_completion_notice_is_shown_once_per_interval(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(announced={"version": self.NEWER, "at": self.fresh()})
+        self.assertEqual({"systemMessage": self.DONE_MESSAGE}, self.finish_workflow())
+
+    def test_failing_notice_leaves_the_completion_message_unchanged(self):
+        saved = workflow.update_notice
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("notice path broke")
+        workflow.update_notice = boom
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                out = self.finish_workflow()
+        finally:
+            workflow.update_notice = saved
+        self.assertEqual({"systemMessage": self.DONE_MESSAGE}, out)
+        self.assertIn("notice path broke", err.getvalue())
+
+    def test_no_notice_while_the_workflow_goes_on(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(checkedAt=self.fresh())
+        self.start_workflow()
+        with open(os.path.join(self.base, "run", "plan.md"), "w", encoding="utf-8") as f:
+            f.write("- [ ] step")
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertNotIn("systemMessage", out)
+        self.assertNotIn("announced", workflow.load_update_state(self.root))
 
     def test_recent_check_does_not_spawn(self):
         self.edit_update_state(checkedAt=self.fresh(hours_ago=23))

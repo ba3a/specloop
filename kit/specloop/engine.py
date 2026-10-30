@@ -718,9 +718,10 @@ def update_notice_text(root, config, source, version):
                 version, _read_version_file(_path(root, "VERSION")), origin, update, update, update))
 
 
-def update_notice(root, config, state):
-    """The SessionStart side of the update checker: start the background check when it is due
-    and return the notice to show, or None. Errors of past checks are never part of a notice."""
+def update_notice(root, config, state, spawn=True):
+    """The notice side of the update checker: start the background check when it is due (only
+    with `spawn`; SessionStart is the one place that does) and return the notice to show, or
+    None. Errors of past checks are never part of a notice."""
     if update_mode(config) == "off" or not os.path.isfile(_path(root, "manifest.json")):
         return None
     source = read_manifest_source(root)
@@ -737,18 +738,39 @@ def update_notice(root, config, state):
     if version and not is_busy(state) and _announce_once(root, config, version):
         notice = update_notice_text(root, config, source, version)
     # Spawned last: the check keeps what it reads from update.json, so it must see the announcement.
-    if interval_elapsed(data.get("checkedAt"), update_interval(config)):
+    if spawn and interval_elapsed(data.get("checkedAt"), update_interval(config)):
         spawn_update_check(root)
     return notice
 
 
-def safe_update_notice(root, state):
+def safe_update_notice(root, state, spawn=True):
     """update_notice for a hook: an exception is logged to stderr and gives no notice."""
     try:
-        return update_notice(root, load_config(root), state)
+        config = load_config(root)
+        return update_notice(root, config, state) if spawn else update_notice(root, config, state, spawn=False)
     except Exception as e:
         print("[specloop] update check error: %s" % e, file=sys.stderr)
         return None
+
+
+def add_completion_notice(root, output):
+    """Append the update notice to the completion message of a Stop hook that finished the workflow.
+
+    The state is read after it was saved as done, so the workflow counts as idle. This never starts
+    a check. Any failure leaves `output` unchanged."""
+    try:
+        if not isinstance(output, dict) or "decision" in output or not output.get("systemMessage"):
+            return output
+        state = load_state(root)
+        if not state or state.get("status") != DONE:
+            return output
+        notice = safe_update_notice(root, state, spawn=False)
+        if not notice:
+            return output
+        return dict(output, systemMessage=output["systemMessage"] + "\n\n" + notice)
+    except Exception as e:
+        print("[specloop] update notice error: %s" % e, file=sys.stderr)
+        return output
 
 
 def _kit_file(root, name, custom=None):
@@ -1667,10 +1689,11 @@ def handle_stop(root, hook_input):
     if state is None:
         return output
     try:
-        return run_gate(root, config, state, hook_input)
+        output = run_gate(root, config, state, hook_input)
     except Exception:
         release_gate(root)
         raise
+    return add_completion_notice(root, output)
 
 
 def run_gate(root, config, state, hook_input):
