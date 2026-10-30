@@ -5,6 +5,9 @@ __pycache__/
 # specloop installed into this repository for testing; generated from kit/
 .claude/
 
+# working specifications for developing specloop itself
+specs/
+
 # >>> specloop (managed by install.py; config.json and overrides/ stay tracked)
 .claude/specloop/*
 !.claude/specloop/config.json
