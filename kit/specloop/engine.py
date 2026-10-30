@@ -15,6 +15,7 @@ Manual commands (used by slash commands):
     engine.py advance            force-pass the current phase
     engine.py status             print the current state
     engine.py reset              delete state and run artifacts
+    engine.py update-check       background update check (run detached; prints nothing)
 
 Configuration is layered, later layers winning in a deep merge:
     defaults.json      shipped with the kit, replaced on update
@@ -25,12 +26,15 @@ Phase instructions are read from overrides/<phase>.md first, then phases/<phase>
 Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 """
 
+import contextlib
+import io
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import unicodedata
 from datetime import datetime, timezone
 
@@ -297,6 +301,138 @@ def display_url(url):
     if text.endswith(".git"):
         text = text[:-4]
     return text
+
+
+# --- Background update check ----------------------------------------------------------------
+
+GIT = "git"  # The git executable used by the update checker; tests point it elsewhere.
+UPDATE_LOCK = "update.lock"
+DEFAULT_UPDATE_TIMEOUT = 20
+
+
+def update_timeout(config):
+    """update.timeoutSec as a positive number; the default when it is missing or invalid."""
+    update = config.get("update") if isinstance(config, dict) else None
+    value = update.get("timeoutSec") if isinstance(update, dict) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return value
+    return DEFAULT_UPDATE_TIMEOUT
+
+
+def update_git(path, timeout, *args):
+    """Run `git -C <path> <args>` for the update checker with a timeout.
+    Return (ok, output, error): output is stripped stdout, error a short message on failure."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        proc = subprocess.run([GIT, "-C", path] + list(args), env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "", "git %s timed out after %ss" % (args[0], timeout)
+    except OSError as e:
+        return False, "", "git could not be run: %s" % e
+    output = proc.stdout.decode("utf-8", errors="replace").strip()
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()
+        message = "git %s failed" % args[0]
+        return False, output, message + (": " + detail[-1] if detail else "")
+    return True, output, None
+
+
+def _acquire_update_lock(root, timeout):
+    """Create update.lock atomically. A lock younger than 2 x timeout belongs to a live check
+    (return False); an older one is stale and replaced."""
+    path = _path(root, UPDATE_LOCK)
+    os.makedirs(_path(root), exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(path)
+            except OSError:
+                continue  # Released in the meantime: try again.
+            if age < 2 * timeout:
+                return False
+            try:
+                os.remove(path)
+            except OSError:
+                return False
+            continue
+        with os.fdopen(fd, "w") as f:
+            f.write("%d %s\n" % (os.getpid(), now()))
+        return True
+    return False
+
+
+def _run_update_check(root, config):
+    """Fetch the recorded source's upstream and record the result in update.json."""
+    timeout = update_timeout(config)
+    data = load_update_state(root)
+    data.update(checkedAt=now(), installed=_read_version_file(_path(root, "VERSION")), clone=None)
+    source = read_manifest_source(root)
+    error = None
+    if source is None:
+        error = "no source recorded in manifest.json; reinstall with install.py to enable update checks"
+    elif source.get("checkable") is False:
+        error = "update checks unavailable: %s" % (source.get("reason") or "source is not checkable")
+    elif not source.get("path") or not source.get("remote") or not source.get("branch"):
+        error = "the recorded source has no path, remote or branch"
+    elif not os.path.isdir(source["path"]):
+        error = "clone not found: %s" % source["path"]
+    if error is None:
+        path, ref = source["path"], "%s/%s" % (source["remote"], source["branch"])
+        data["clone"] = _read_version_file(os.path.join(path, "VERSION"))
+        ok, _, error = update_git(path, timeout, "fetch", "--quiet", source["remote"], source["branch"])
+        if ok:
+            ok, remote_version, error = update_git(path, timeout, "show", ref + ":VERSION")
+        if ok:
+            ok, remote_commit, error = update_git(path, timeout, "rev-parse", ref)
+        if ok and parse_version(remote_version) is None:
+            error = "remote VERSION is not a MAJOR.MINOR.PATCH version: %r" % remote_version[:40]
+        elif ok:
+            data.update(remote=remote_version.strip(), remoteCommit=remote_commit)
+    data["error"] = error
+    save_update_state(root, data)
+
+
+def cmd_update_check(root):
+    """engine.py update-check: the network check, meant to run detached. Never raises, prints nothing."""
+    sink = io.StringIO()
+    with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+        try:
+            try:
+                config = load_config(root)
+            except Exception:
+                config = {}
+            if not _acquire_update_lock(root, update_timeout(config)):
+                return
+            try:
+                _run_update_check(root, config)
+            finally:
+                try:
+                    os.remove(_path(root, UPDATE_LOCK))
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+
+def spawn_update_check(root):
+    """Start `engine.py update-check` for root as a detached process. Return True when started."""
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                                       | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "update-check"], cwd=root,
+                         env=dict(os.environ, CLAUDE_PROJECT_DIR=root), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **kwargs)
+        return True
+    except Exception as e:
+        print("[specloop] could not start the update check: %s" % e, file=sys.stderr)
+        return False
 
 
 def _kit_text(root, name, custom=None):
@@ -1345,6 +1481,9 @@ def main(argv):
             print(json.dumps(out))
         return 0
     root = project_dir()
+    if command == "update-check":
+        cmd_update_check(root)
+        return 0
     handlers = {
         "init": lambda: cmd_init(root, " ".join(args).strip().strip('"')),
         "init-feature": lambda: cmd_init(root, " ".join(args).strip().strip('"'), mode="feature"),

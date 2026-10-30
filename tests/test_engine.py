@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +14,9 @@ KIT = os.path.join(os.path.dirname(HERE), "kit", "specloop")
 sys.path.insert(0, KIT)
 
 import engine as workflow  # noqa: E402
+
+sys.path.insert(0, HERE)
+import gitfixture  # noqa: E402
 
 
 class EngineTest(unittest.TestCase):
@@ -1837,6 +1841,187 @@ class UpdateHelpersTest(unittest.TestCase):
         for url, expected in cases.items():
             self.assertEqual(expected, workflow.display_url(url), url)
         self.assertEqual("", workflow.display_url(None))
+
+
+@unittest.skipUnless(gitfixture.git_available(), "git not available")
+class UpdateCheckTest(unittest.TestCase):
+    """engine.py update-check: the background network check, run in-process here."""
+
+    def setUp(self):
+        self.saved_env = {k: os.environ.pop(k, None) for k in ("CI", "SPECLOOP_DISABLED")}
+        self.addCleanup(self.restore_env)
+        self.fx = gitfixture.GitFixture()
+        self.addCleanup(self.fx.cleanup)
+        result = self.fx.run_install("--test-command", "exit 0")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.root = self.fx.target
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        self.lock = os.path.join(self.base, "update.lock")
+
+    def restore_env(self):
+        for key, value in self.saved_env.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    def check(self):
+        """Run update-check, assert it prints nothing and releases the lock; return update.json."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            workflow.cmd_update_check(self.root)
+        self.assertEqual("", out.getvalue())
+        self.assertEqual("", err.getvalue())
+        self.assertFalse(os.path.exists(self.lock))
+        return workflow.load_update_state(self.root)
+
+    def assert_failed(self, data, installed=None):
+        self.assertTrue(data.get("error"))
+        self.assertTrue(data.get("checkedAt"))
+        self.assertEqual(installed or self.fx.read_version(), data.get("installed"))
+
+    def write_source(self, source):
+        path = os.path.join(self.base, "manifest.json")
+        with open(path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        if source is None:
+            manifest.pop("source", None)
+        else:
+            manifest["source"] = source
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+
+    def test_records_remote_version_and_commit(self):
+        announced = {"version": "0.1.0", "at": "2026-01-01T00:00:00+00:00"}
+        workflow.save_update_state(self.root, {"skipped": "0.1.0", "announced": announced})
+        installed = self.fx.read_version()
+        commit = self.fx.bump_remote_version("0.9.0")
+        data = self.check()
+        self.assertEqual("0.9.0", data["remote"])
+        self.assertEqual(commit, data["remoteCommit"])
+        self.assertEqual(installed, data["installed"])
+        self.assertEqual(installed, data["clone"])
+        self.assertIsNone(data.get("error"))
+        self.assertTrue(data["checkedAt"].endswith("+00:00"))
+        self.assertEqual("0.1.0", data["skipped"])
+        self.assertEqual(announced, data["announced"])
+        self.assertEqual(installed, self.fx.read_version())  # a check never changes the clone
+
+    def test_success_clears_previous_error(self):
+        workflow.save_update_state(self.root, {"error": "old failure"})
+        data = self.check()
+        self.assertIsNone(data.get("error"))
+        self.assertEqual(self.fx.read_version(), data["remote"])
+
+    def test_unreachable_remote_records_error(self):
+        shutil.rmtree(self.fx.remote, onerror=gitfixture._force_remove)
+        self.assert_failed(self.check())
+
+    def test_deleted_clone_records_error(self):
+        installed = self.fx.read_version()
+        shutil.rmtree(self.fx.clone, onerror=gitfixture._force_remove)
+        data = self.check()
+        self.assert_failed(data, installed)
+        self.assertIsNone(data.get("clone"))
+
+    def test_missing_git_records_error(self):
+        saved = workflow.GIT
+        workflow.GIT = "specloop-no-such-git-executable"
+        try:
+            data = self.check()
+        finally:
+            workflow.GIT = saved
+        self.assert_failed(data)
+        self.assertIn("git", data["error"])
+
+    def test_unparseable_remote_version_records_error(self):
+        self.fx.bump_remote_version("not-a-version")
+        data = self.check()
+        self.assert_failed(data)
+        self.assertIn("not-a-version", data["error"])
+
+    def test_not_checkable_or_missing_source_records_error(self):
+        self.write_source({"path": self.fx.clone.replace("\\", "/"), "version": "0.2.0",
+                           "checkable": False, "reason": "no upstream"})
+        self.assertIn("no upstream", self.check()["error"])
+        self.write_source(None)
+        self.assert_failed(self.check())
+
+    def test_fresh_lock_makes_check_a_no_op(self):
+        workflow.save_update_state(self.root, {"skipped": "0.1.0"})
+        self.fx.bump_remote_version("0.9.0")
+        with open(self.lock, "w") as f:
+            f.write("12345 2026-01-01T00:00:00+00:00\n")
+        before = workflow.load_update_state(self.root)
+        workflow.cmd_update_check(self.root)
+        self.assertEqual(before, workflow.load_update_state(self.root))
+        self.assertTrue(os.path.exists(self.lock))  # another check's lock is left alone
+
+    def test_stale_lock_is_replaced(self):
+        self.fx.bump_remote_version("0.9.0")
+        with open(self.lock, "w") as f:
+            f.write("12345 2020-01-01T00:00:00+00:00\n")
+        old = time.time() - 3600
+        os.utime(self.lock, (old, old))
+        self.assertEqual("0.9.0", self.check()["remote"])
+
+    def test_lock_is_released_when_the_check_raises(self):
+        saved = workflow._run_update_check
+
+        def boom(root, config):
+            raise RuntimeError("boom")
+        workflow._run_update_check = boom
+        try:
+            self.check()
+        finally:
+            workflow._run_update_check = saved
+
+    def test_main_update_check_prints_nothing(self):
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+        self.addCleanup(os.environ.pop, "CLAUDE_PROJECT_DIR", None)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(0, workflow.main(["update-check"]))
+        self.assertEqual(("", ""), (out.getvalue(), err.getvalue()))
+        self.assertTrue(workflow.load_update_state(self.root).get("checkedAt"))
+
+
+class SpawnUpdateCheckTest(unittest.TestCase):
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.addCleanup(setattr, subprocess, "Popen", subprocess.Popen)
+
+    def test_starts_detached_engine_with_null_streams(self):
+        calls = []
+
+        def fake_popen(args, **kwargs):
+            calls.append((args, kwargs))
+        subprocess.Popen = fake_popen
+        self.assertTrue(workflow.spawn_update_check(self.root))
+        self.assertEqual(1, len(calls))
+        args, kwargs = calls[0]
+        self.assertEqual(sys.executable, args[0])
+        self.assertEqual("engine.py", os.path.basename(args[1]))
+        self.assertEqual("update-check", args[2])
+        self.assertEqual(self.root, kwargs["cwd"])
+        self.assertEqual(self.root, kwargs["env"]["CLAUDE_PROJECT_DIR"])
+        for stream in ("stdin", "stdout", "stderr"):
+            self.assertEqual(subprocess.DEVNULL, kwargs[stream])
+        if os.name == "nt":
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            self.assertEqual(flags, kwargs["creationflags"] & flags)
+        else:
+            self.assertTrue(kwargs["start_new_session"])
+
+    def test_spawn_failure_is_swallowed(self):
+        def failing_popen(args, **kwargs):
+            raise OSError("cannot start")
+        subprocess.Popen = failing_popen
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(workflow.spawn_update_check(self.root))
+        self.assertIn("cannot start", err.getvalue())
 
 
 if __name__ == "__main__":
