@@ -11,6 +11,9 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import install  # noqa: E402
 
+sys.path.insert(0, HERE)
+import gitfixture  # noqa: E402
+
 
 class InstallTest(unittest.TestCase):
 
@@ -258,6 +261,94 @@ class InstallTest(unittest.TestCase):
 
     def test_cli_rejects_missing_target(self):
         self.assertEqual(1, install.main([self.path("missing")]))
+
+
+@unittest.skipUnless(gitfixture.git_available(), "git not available")
+class InstallSourceTest(unittest.TestCase):
+    """install.py records the clone it runs from in manifest.json for update checks."""
+
+    def setUp(self):
+        self.fx = gitfixture.GitFixture()
+        self.addCleanup(self.fx.cleanup)
+
+    def manifest(self):
+        with open(os.path.join(self.fx.target, ".claude", "specloop", "manifest.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def install(self, *args, **kwargs):
+        result = self.fx.run_install("--test-command", "exit 0", *args, **kwargs)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        return result
+
+    def test_records_clone_upstream_and_commit(self):
+        result = self.install()
+        manifest = self.manifest()
+        source = manifest["source"]
+        self.assertEqual(self.fx.clone.replace("\\", "/"), source["path"])
+        self.assertTrue(os.path.isabs(source["path"]))
+        self.assertNotIn("\\", source["path"])
+        self.assertEqual("origin", source["remote"])
+        self.assertEqual("main", source["branch"])
+        self.assertEqual(self.fx.head(), source["commit"])
+        self.assertEqual(self.fx.remote, os.path.normpath(source["url"]))
+        self.assertEqual(self.fx.read_version(), source["version"])
+        self.assertEqual({"scope": "project", "gitignore": True}, source["installArgs"])
+        self.assertTrue(source["checkable"])
+        self.assertNotIn("update checks unavailable", result.stdout)
+        self.assertIn("commands", manifest)
+        self.assertIn("settings", manifest)
+
+    def test_records_install_args(self):
+        self.install("--scope", "local", "--no-gitignore")
+        self.assertEqual({"scope": "local", "gitignore": False}, self.manifest()["source"]["installArgs"])
+
+    def test_commit_follows_clone_head(self):
+        commit = self.fx.bump_clone_version("9.9.9")
+        self.install()
+        source = self.manifest()["source"]
+        self.assertEqual(commit, source["commit"])
+        self.assertEqual("9.9.9", source["version"])
+
+    def test_branch_without_upstream_is_not_checkable(self):
+        self.fx.git(self.fx.clone, "checkout", "-q", "-b", "local-only")
+        result = self.install()
+        manifest = self.manifest()
+        source = manifest["source"]
+        self.assertFalse(source["checkable"])
+        self.assertIn("upstream", source["reason"])
+        self.assertEqual(self.fx.clone.replace("\\", "/"), source["path"])
+        self.assertEqual(self.fx.read_version(), source["version"])
+        self.assertNotIn("commit", source)
+        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
+        self.assertIn("commands", manifest)
+
+    def test_non_git_copy_is_not_checkable(self):
+        copy = os.path.join(self.fx.root, "zip")
+        gitfixture.copy_kit_source(copy)
+        result = self.install(source=copy)
+        manifest = self.manifest()
+        source = manifest["source"]
+        self.assertEqual({"path", "version", "checkable", "reason"}, set(source))
+        self.assertEqual(copy.replace("\\", "/"), source["path"])
+        self.assertFalse(source["checkable"])
+        self.assertTrue(source["reason"])
+        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
+        self.assertIn("commands", manifest)
+        self.assertIn("settings", manifest)
+
+    def test_copy_inside_another_work_tree_is_not_checkable(self):
+        copy = os.path.join(self.fx.clone, "vendored")
+        gitfixture.copy_kit_source(copy)
+        result = self.install(source=copy)
+        source = self.manifest()["source"]
+        self.assertEqual({"path", "version", "checkable", "reason"}, set(source))
+        self.assertEqual(copy.replace("\\", "/"), source["path"])
+        self.assertFalse(source["checkable"])
+        self.assertIn("not the top of a git work tree", source["reason"])
+        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
 
 
 if __name__ == "__main__":

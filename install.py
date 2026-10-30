@@ -182,6 +182,55 @@ def in_git_work_tree(target):
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+def run_git(cwd, *args):
+    """Run git in cwd and return its stripped stdout, or None on any failure."""
+    try:
+        result = subprocess.run(["git"] + list(args), cwd=cwd, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                universal_newlines=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def same_path(a, b):
+    """True when a and b name the same directory (git prints forward slashes on Windows)."""
+    def norm(p):
+        return os.path.normcase(os.path.realpath(os.path.abspath(p)))
+    return norm(a) == norm(b)
+
+
+def describe_source(scope, gitignore):
+    """Describe the clone that runs this installer, for update checks (manifest.json 'source')."""
+    path = os.path.dirname(KIT)
+    source = {"path": os.path.abspath(path).replace("\\", "/")}
+    try:
+        with open(os.path.join(path, "VERSION"), encoding="utf-8") as f:
+            source["version"] = f.read().strip()
+    except OSError:
+        source["version"] = None
+    if run_git(path, "rev-parse", "--is-inside-work-tree") != "true":
+        reason = "%s is not a git work tree" % source["path"]
+        if run_git(path, "--version") is None:
+            reason = "git is not available"
+        return dict(source, checkable=False, reason=reason)
+    toplevel = run_git(path, "rev-parse", "--show-toplevel")
+    if not toplevel or not same_path(toplevel, path):
+        return dict(source, checkable=False, reason="%s is not the top of a git work tree" % source["path"])
+    upstream = run_git(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+    if not upstream or "/" not in upstream:
+        return dict(source, checkable=False, reason="the current branch of %s has no upstream" % source["path"])
+    remote, branch = upstream.split("/", 1)
+    commit = run_git(path, "rev-parse", "HEAD")
+    if not commit:
+        return dict(source, checkable=False, reason="cannot read HEAD of %s" % source["path"])
+    source.update(remote=remote, branch=branch, url=run_git(path, "remote", "get-url", remote),
+                  commit=commit, installArgs={"scope": scope, "gitignore": gitignore}, checkable=True)
+    return source
+
+
 def gitignore_writable(path):
     if os.path.exists(path):
         return os.path.isfile(path) and os.access(path, os.R_OK | os.W_OK)
@@ -240,7 +289,11 @@ def install(target, scope="project", prefix=None, test_command=None, force=False
         if path != chosen and os.path.exists(path):
             write_json(path, strip_hooks(read_json(path)))
     write_json(chosen, merge_hooks(read_json(chosen), stop_timeout))
-    write_json(manifest_path(target), {"commands": commands, "settings": os.path.relpath(chosen, target)})
+    source = describe_source(scope, gitignore)
+    write_json(manifest_path(target), {"commands": commands, "settings": os.path.relpath(chosen, target),
+                                       "source": source})
+    if not source["checkable"]:
+        print("! update checks unavailable: " + source["reason"])
     if gitignore:
         update_gitignore(target, commands)
     return prefix
