@@ -15,6 +15,8 @@ Manual commands (used by slash commands):
     engine.py advance            force-pass the current phase
     engine.py status             print the current state
     engine.py reset              delete state and run artifacts
+    engine.py update [check|skip|never]
+                                 check for kit updates now and report, skip or silence them
     engine.py update-check       background update check (run detached; prints nothing)
 
 Configuration is layered, later layers winning in a deep merge:
@@ -634,6 +636,18 @@ def _run_update_check(root, config):
     merge_update_state(root, **result)
 
 
+def run_update_check_locked(root, config):
+    """Run the network check under update.lock. Return False, doing nothing, when a fresh lock
+    shows that another check is running; True after the check ran."""
+    os.makedirs(_path(root), exist_ok=True)
+    try:
+        with FileLock(_path(root, UPDATE_LOCK), 2 * update_timeout(config), wait=0):
+            _run_update_check(root, config)
+    except LockBusy:
+        return False
+    return True
+
+
 def cmd_update_check(root):
     """engine.py update-check: the network check, meant to run detached. Never raises, prints nothing.
     A lock younger than 2 x timeoutSec belongs to a running check: exit at once."""
@@ -644,12 +658,7 @@ def cmd_update_check(root):
                 config = load_config(root)
             except Exception:
                 config = {}
-            os.makedirs(_path(root), exist_ok=True)
-            try:
-                with FileLock(_path(root, UPDATE_LOCK), 2 * update_timeout(config), wait=0):
-                    _run_update_check(root, config)
-            except LockBusy:
-                pass
+            run_update_check_locked(root, config)
         except Exception:
             pass
 
@@ -2214,6 +2223,122 @@ def cmd_reset(root):
     return "Workflow state reset."
 
 
+def update_usage(config):
+    update = cmd_name(config, "update")
+    return "\n".join([
+        "Usage: %s [check|skip|never]" % update,
+        "  %s         check now, then update when a newer version is available" % update,
+        "  %s check   check now and report; changes nothing" % update,
+        "  %s skip    do not announce the newest available version again" % update,
+        "  %s never   skip it and turn update checks off (update.mode in config.local.json)" % update,
+    ])
+
+
+def update_unavailable(source):
+    """Why update checks cannot work for this install, or None when they can."""
+    if source is None:
+        return ("this install does not record where it came from; reinstall once with install.py <project> "
+                "from your specloop clone to enable update checks")
+    if source.get("checkable") is False:
+        return source.get("reason") or "the install source is not checkable"
+    if not all(isinstance(source.get(key), str) and source.get(key) for key in ("path", "remote", "branch")):
+        return "the recorded source has no path, remote or branch; reinstall with install.py"
+    return None
+
+
+def update_report(root, source, data, version):
+    """Lines that describe the versions of the last check."""
+    lines = ["installed: %s" % (data.get("installed") or _read_version_file(_path(root, "VERSION")) or "unknown"),
+             "clone: %s (%s)" % (_read_version_file(os.path.join(source["path"], "VERSION")) or "unknown",
+                                 source["path"])]
+    if data.get("error"):
+        lines.append("remote: check failed (%s)" % data["error"])
+    else:
+        origin = "%s/%s" % (source["remote"], source["branch"])
+        url = display_url(source.get("url"))
+        lines.append("remote: %s (%s%s)" % (data.get("remote") or "unknown", origin, ", " + url if url else ""))
+    if version:
+        lines.append("available: %s" % version)
+    elif data.get("skipped"):
+        lines.append("available: nothing newer than the installed version (%s skipped)" % data["skipped"])
+    else:
+        lines.append("available: nothing newer than the installed version")
+    return lines
+
+
+def check_now(root, config, source):
+    """Run the network check synchronously, ignoring intervalHours. Return (lines, version):
+    the report and the available version. version is None with a busy lock (lines say so)."""
+    if not run_update_check_locked(root, config):
+        return ["A background update check is running. Try again in a moment; nothing was changed."], None
+    data = load_update_state(root)
+    version = available_version(root, source, data)
+    return update_report(root, source, data, version), version
+
+
+def set_update_mode_off(root):
+    """Set update.mode to 'off' in config.local.json, keeping its other keys. Return an error text
+    (and write nothing) when the file exists but cannot be used as it is."""
+    path = _path(root, "config.local.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            local = json.load(f)
+    except FileNotFoundError:
+        local = {}
+    except (OSError, ValueError) as e:
+        return "%s is not valid JSON (%s). Fix it first; nothing was changed." % (_rel("config.local.json"), e)
+    if not isinstance(local, dict):
+        return "%s is not a JSON object. Fix it first; nothing was changed." % _rel("config.local.json")
+    if not isinstance(local.get("update"), dict):
+        local["update"] = {}
+    local["update"]["mode"] = "off"
+    os.makedirs(_path(root), exist_ok=True)
+    atomic_write(path, json.dumps(local, indent=2, ensure_ascii=False) + "\n")
+    return None
+
+
+def cmd_update(root, args):
+    """engine.py update [check|skip|never]: manual update commands."""
+    config = load_config(root)
+    if len(args) > 1 or (args and args[0] not in ("check", "skip", "never")):
+        return update_usage(config)
+    action = args[0] if args else "apply"
+    state = load_state(root)
+    if action == "apply" and is_busy(state):
+        return ("[specloop] A workflow is busy (status %s), so the kit is not updated now. Let it finish, or run "
+                "%s to end it, then run %s again." % (state.get("status"), cmd_name(config, "reset"),
+                                                      cmd_name(config, "update")))
+    source = read_manifest_source(root)
+    reason = update_unavailable(source)
+    if reason:
+        return "[specloop] Update checks are unavailable: %s." % reason.rstrip(".")
+    if action == "check":
+        lines, _ = check_now(root, config, source)
+        return "\n".join(["[specloop] Update check:"] + lines)
+    if action in ("skip", "never"):
+        if action == "never":
+            error = set_update_mode_off(root)
+            if error:
+                return "[specloop] " + error
+        version = available_version(root, source, load_update_state(root))
+        lines = []
+        if version:
+            merge_update_state(root, skipped=version)
+            lines.append("[specloop] %s will not be announced or applied again; a later version is announced "
+                         "as usual." % version)
+        else:
+            lines.append("[specloop] No newer version is available, so nothing was skipped.")
+        if action == "never":
+            lines.append("Update checks are off: update.mode is \"off\" in %s. To turn them back on, set "
+                         "update.mode to \"notify\" or \"auto\" there, or remove the key." % _rel("config.local.json"))
+        return "\n".join(lines)
+    lines, version = check_now(root, config, source)
+    if version:
+        lines.append("[specloop] %s is available (installed %s). Applying updates is not available yet." % (
+            version, _read_version_file(_path(root, "VERSION"))))
+    return "\n".join(["[specloop] Update:"] + lines)
+
+
 def corrupt_message(root):
     return ("[specloop] state.json is unreadable, so specloop is not enforcing anything. Run %s to clear it." %
             cmd_name(load_config(root), "reset"))
@@ -2276,6 +2401,7 @@ def main(argv):
         "advance": lambda: cmd_advance(root),
         "status": lambda: cmd_status(root),
         "reset": lambda: cmd_reset(root),
+        "update": lambda: cmd_update(root, args),
     }
     if command not in handlers:
         print("Unknown command: " + command)

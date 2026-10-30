@@ -2727,5 +2727,199 @@ class SpawnUpdateCheckTest(unittest.TestCase):
         self.assertIn("cannot start", err.getvalue())
 
 
+class UpdateCommandTest(UpdateNoticeHelpers, unittest.TestCase):
+    """engine.py update [check|skip|never] after a real install from a clone."""
+
+    def setUp(self):
+        self.save_env()
+        self.fx = gitfixture.GitFixture()
+        self.addCleanup(self.fx.cleanup)
+        result = self.fx.run_install("--test-command", "exit 0")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.root = self.fx.target
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        self.installed = self.fx.read_version()
+
+    def update(self, *args):
+        return workflow.cmd_update(self.root, list(args))
+
+    def kit_snapshot(self):
+        """Contents of every installed kit file, except the update checker's own runtime files."""
+        files = {}
+        for folder, _, names in os.walk(self.base):
+            for name in names:
+                if name in ("update.json", "update.lock"):
+                    continue
+                path = os.path.join(folder, name)
+                with open(path, "rb") as f:
+                    files[os.path.relpath(path, self.base)] = f.read()
+        return files
+
+    def local_config_path(self):
+        return os.path.join(self.base, "config.local.json")
+
+    def test_check_reports_versions_and_changes_nothing_else(self):
+        self.fx.bump_remote_version(self.NEWER)
+        kit, head = self.kit_snapshot(), self.fx.head()
+        status = self.fx.git(self.fx.clone, "status", "--porcelain")
+        out = self.update("check")
+        self.assertIn("installed: " + self.installed, out)
+        self.assertIn("clone: " + self.installed, out)
+        self.assertIn("remote: " + self.NEWER, out)
+        self.assertIn("available: " + self.NEWER, out)
+        self.assertEqual(self.NEWER, workflow.load_update_state(self.root)["remote"])
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(head, self.fx.head())
+        self.assertEqual(self.installed, self.fx.read_version())
+        self.assertEqual(status, self.fx.git(self.fx.clone, "status", "--porcelain"))
+        self.assertFalse(os.path.exists(self.local_config_path()))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "update.lock")))
+
+    def test_check_ignores_the_interval(self):
+        self.fx.bump_remote_version(self.NEWER)
+        workflow.save_update_state(self.root, {"checkedAt": self.fresh(), "remote": self.installed})
+        self.assertIn("remote: " + self.NEWER, self.update("check"))
+
+    def test_check_reports_an_error(self):
+        shutil.rmtree(self.fx.remote, onerror=gitfixture._force_remove)
+        out = self.update("check")
+        self.assertIn("check failed", out)
+        self.assertTrue(workflow.load_update_state(self.root)["error"])
+
+    def test_check_with_a_fresh_lock_reports_it_and_does_not_override_it(self):
+        self.fx.bump_remote_version(self.NEWER)
+        lock = os.path.join(self.base, "update.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"token": "other", "at": time.time()}, f)
+        out = self.update("check")
+        self.assertIn("background update check is running", out)
+        self.assertNotIn("remote", workflow.load_update_state(self.root))
+        with open(lock, encoding="utf-8") as f:
+            self.assertEqual("other", json.load(f)["token"])
+
+    def test_check_works_while_a_workflow_is_busy(self):
+        self.start_workflow()
+        self.assertIn("installed: " + self.installed, self.update("check"))
+
+    def test_skip_suppresses_that_version_but_not_a_later_one(self):
+        self.record_remote_version()
+        out = self.update("skip")
+        self.assertIn(self.NEWER, out)
+        self.assertEqual(self.NEWER, workflow.load_update_state(self.root)["skipped"])
+        self.assertIsNone(self.notice())
+        self.assertFalse(os.path.exists(self.local_config_path()))
+        self.fx.bump_remote_version("9.1.0")
+        workflow.cmd_update_check(self.root)
+        self.assertIn("9.1.0 is available", self.notice())
+
+    def test_skip_without_an_available_version_says_so(self):
+        out = self.update("skip")
+        self.assertIn("No newer version", out)
+        self.assertNotIn("skipped", workflow.load_update_state(self.root))
+
+    def test_never_writes_mode_off_keeping_other_keys(self):
+        self.write_local_config({"commandPrefix": "x-", "update": {"intervalHours": 5}, "maxIterations": 3})
+        self.record_remote_version()
+        out = self.update("never")
+        with open(self.local_config_path(), encoding="utf-8") as f:
+            text = f.read()
+        expected = {"commandPrefix": "x-", "update": {"intervalHours": 5, "mode": "off"}, "maxIterations": 3}
+        self.assertEqual(expected, json.loads(text))
+        self.assertEqual(json.dumps(expected, indent=2) + "\n", text)
+        self.assertEqual(self.NEWER, workflow.load_update_state(self.root)["skipped"])
+        self.assertIn("update.mode", out)
+        self.assertIn("config.local.json", out)
+        self.assertIn("remove the key", out)
+        self.assertEqual("off", workflow.update_mode(workflow.load_config(self.root)))
+
+    def test_never_creates_config_local_json_when_missing(self):
+        self.update("never")
+        with open(self.local_config_path(), encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(json.dumps({"update": {"mode": "off"}}, indent=2) + "\n", text)
+
+    def test_never_leaves_an_invalid_config_local_json_alone(self):
+        self.record_remote_version()
+        with open(self.local_config_path(), "w", encoding="utf-8") as f:
+            f.write("{broken")
+        out = self.update("never")
+        self.assertIn("config.local.json", out)
+        with open(self.local_config_path(), encoding="utf-8") as f:
+            self.assertEqual("{broken", f.read())
+        self.assertNotIn("skipped", workflow.load_update_state(self.root))
+
+    def test_unknown_argument_prints_usage_and_changes_nothing(self):
+        self.record_remote_version()
+        kit, state = self.kit_snapshot(), workflow.load_update_state(self.root)
+        for args in (("frobnicate",), ("check", "extra"), ("--help",)):
+            self.assertIn("Usage: /sl-update [check|skip|never]", self.update(*args))
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(state, workflow.load_update_state(self.root))
+        self.assertFalse(os.path.exists(self.local_config_path()))
+
+    def test_refuses_while_busy_and_names_reset(self):
+        self.record_remote_version()
+        self.start_workflow()
+        for status in ("active", "paused", "stalled", "ready"):
+            self.set_status(status)
+            before = workflow.load_update_state(self.root)
+            out = self.update()
+            self.assertIn("/sl-reset", out, status)
+            self.assertIn(status, out)
+            self.assertEqual(before, workflow.load_update_state(self.root), status)
+
+    def test_no_argument_reports_what_is_available_when_idle(self):
+        self.fx.bump_remote_version(self.NEWER)
+        out = self.update()
+        self.assertIn(self.NEWER + " is available", out)
+        self.assertEqual(self.installed, self.fx.read_version())
+
+    def test_no_argument_with_a_finished_workflow_is_not_busy(self):
+        self.start_workflow()
+        self.set_status("done")
+        self.fx.bump_remote_version(self.NEWER)
+        self.assertIn(self.NEWER + " is available", self.update())
+
+    def test_uses_the_configured_prefix(self):
+        self.write_local_config({"commandPrefix": "x-"})
+        self.assertIn("/x-update", self.update("bogus"))
+
+    def test_old_install_reports_unavailable_and_changes_nothing(self):
+        self.write_manifest_source(None)
+        kit = self.kit_snapshot()
+        for args in ((), ("check",), ("skip",), ("never",)):
+            out = self.update(*args)
+            self.assertIn("unavailable", out)
+            self.assertIn("reinstall", out)
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertFalse(os.path.exists(self.local_config_path()))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "update.json")))
+
+    def test_not_checkable_install_reports_the_reason(self):
+        self.write_manifest_source({"path": self.fx.clone, "version": self.installed, "checkable": False,
+                                    "reason": "no upstream branch"})
+        out = self.update("check")
+        self.assertIn("unavailable", out)
+        self.assertIn("no upstream branch", out)
+
+    def run_main(self, *args):
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                code = workflow.main(["update"] + list(args))
+        finally:
+            del os.environ["CLAUDE_PROJECT_DIR"]
+        return code, out.getvalue()
+
+    def test_main_dispatches_update(self):
+        code, out = self.run_main("nonsense")
+        self.assertEqual(0, code)
+        self.assertIn("Usage: /sl-update", out)
+        code, out = self.run_main("check")
+        self.assertEqual(0, code)
+        self.assertIn("installed: " + self.installed, out)
+
+
 if __name__ == "__main__":
     unittest.main()
