@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -257,6 +258,25 @@ class OwnerTest(ProjectTest):
         workflow.cmd_reset(self.root)
         self.assertIsNone(self.state())
 
+    def test_a_refused_go_on_the_wrong_branch_does_not_move_the_owner(self):
+        self.start_feature()
+        self.claim()
+        branch = self.state()["branch"]
+        self.git("checkout", "-q", "-b", "elsewhere")
+        before = self.state_bytes()
+        self.assertIsNone(self.claim(OTHER))
+        self.assertEqual(before, self.state_bytes())
+        self.assertIn("Not started", workflow.cmd_go(self.root))
+        self.git("checkout", "-q", branch)
+        self.claim(OTHER)
+        self.assertEqual(OTHER, self.state()["owner"]["session"])
+
+    def test_a_reset_during_the_claim_returns_nothing(self):
+        self.start()
+        with mock.patch.object(workflow, "handle_prompt_command",
+                               side_effect=lambda *_: workflow.cmd_reset(self.root) and None):
+            self.assertIsNone(self.claim())
+
     def test_delegated_context_tells_the_chat_to_answer_other_questions_first(self):
         self.set_config({"phases": {"plan": {"delegate": True}}})
         self.start()
@@ -411,6 +431,20 @@ class InitGuardTest(ProjectTest):
         before = self.state_bytes()
         self.assertIn("/sl-reset", workflow.cmd_init(self.root, "spec.md", mode="feature"))
         self.assertEqual(before, self.state_bytes())
+
+    def test_pause_leaves_ready_and_done_alone_so_the_next_spec_loads(self):
+        workflow.cmd_init(self.root, "spec.md")
+        before = self.state_bytes()
+        self.assertEqual("Nothing to pause.", workflow.cmd_pause(self.root))
+        self.assertEqual(before, self.state_bytes())
+        self.assertIn("Spec loaded", workflow.cmd_init(self.root, "spec.md"))
+        workflow.cmd_go(self.root)
+        for _ in range(3):
+            workflow.cmd_advance(self.root)
+        before = self.state_bytes()
+        self.assertEqual("Nothing to pause.", workflow.cmd_pause(self.root))
+        self.assertEqual(before, self.state_bytes())
+        self.assertIn("Spec loaded", workflow.cmd_init(self.root, "spec.md"))
 
     def test_works_on_ready_done_and_no_state(self):
         self.assertIn("Spec loaded", workflow.cmd_init(self.root, "spec.md"))
@@ -599,8 +633,17 @@ class LockTest(ProjectTest):
         before = self.state_bytes()
         self.short_wait()
         self.fresh_lock()
-        self.assertEqual("", self.main("stop", stdin="{}"))
+        self.assertEqual("", self.main("pretool", stdin="{}"))
+        self.assertIn("/sl-go", json.loads(self.main("stop", stdin="{}"))["systemMessage"])
         self.assertEqual(before, self.state_bytes())
+
+    def test_a_result_that_cannot_be_recorded_is_reported_and_clears_the_gate(self):
+        self.start()
+        with mock.patch.object(workflow, "apply_gate", side_effect=workflow.LockBusy("state.lock")):
+            message = json.loads(self.main("stop", stdin="{}"))["systemMessage"]
+        self.assertIn("not recorded", message)
+        self.assertIn("/sl-go", message)
+        self.assertNotIn("gate", self.state())
 
     def test_reset_waits_for_the_lock_too(self):
         self.start()
@@ -715,7 +758,9 @@ class StopOrderTest(ProjectTest):
         self.assertEqual([0, 0], [p.returncode for p in procs])
         with open(os.path.join(self.root, "ran")) as f:
             self.assertEqual(1, len(f.read().split()))
-        self.assertEqual(1, sum(1 for o in outputs if o.strip()))
+        decoded = [json.loads(o) for o in outputs]
+        self.assertEqual(1, sum(1 for o in decoded if o.get("decision") == "block"))
+        self.assertEqual(1, sum(1 for o in decoded if "marked as running" in o.get("systemMessage", "")))
 
     def test_an_old_gate_does_not_block_the_check(self):
         self.implement_with_check("exit 1")
@@ -723,12 +768,23 @@ class StopOrderTest(ProjectTest):
         workflow.update_state(self.root, lambda s: s.update(gate={"session": "x", "at": stamp}))
         self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])
 
-    def test_a_young_gate_makes_stop_return_nothing(self):
+    def test_a_young_gate_makes_stop_say_so_and_change_nothing(self):
+        self.implement_with_check("echo x >> ran; exit 1")
+        stamp = workflow.now()
+        workflow.update_state(self.root, lambda s: s.update(gate={"session": "x", "at": stamp}))
+        before = self.state_bytes()
+        message = workflow.handle_stop(self.root, {})["systemMessage"]
+        self.assertIn("marked as running since " + stamp, message)
+        self.assertIn("/sl-go", message)
+        self.assertEqual(before, self.state_bytes())
+        self.assertFalse(os.path.exists(os.path.join(self.root, "ran")))
+
+    def test_go_clears_a_leaked_gate(self):
         self.implement_with_check("exit 1")
         workflow.update_state(self.root, lambda s: s.update(gate={"session": "x", "at": workflow.now()}))
-        before = self.state_bytes()
-        self.assertIsNone(workflow.handle_stop(self.root, {}))
-        self.assertEqual(before, self.state_bytes())
+        workflow.cmd_go(self.root)
+        self.assertNotIn("gate", self.state())
+        self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])
 
     def test_a_crash_in_the_gate_clears_it(self):
         self.implement_with_check("exit 1")
@@ -820,6 +876,80 @@ class FeatureStopTest(ProjectTest):
         self.write("a.py", "a = 1\n")
         self.stop(OWNER)
         self.assertEqual("review", self.state()["phase"])
+
+    def approve(self):
+        self.write_attempt("review.md", "VERDICT: APPROVE")
+
+    def stop_losing_the_commit_result(self):
+        """A Stop whose commit lands while its result cannot be recorded."""
+        with mock.patch.object(workflow, "apply_commit", side_effect=workflow.LockBusy("state.lock")):
+            with self.assertRaises(workflow.LockBusy):
+                workflow.handle_stop(self.root, {})
+
+    def test_a_commit_whose_result_was_lost_is_not_marked_empty(self):
+        self.start_feature()
+        base = self.git("rev-parse", "HEAD")
+        self.to_review()
+        self.approve()
+        self.stop_losing_the_commit_result()
+        self.assertEqual(base, self.state()["commitBase"])
+        self.assertNotEqual(base, self.git("rev-parse", "HEAD"))
+        self.assertEqual(1, self.state()["stepId"])
+        workflow.handle_stop(self.root, {})
+        state = self.state()
+        step = state["approvedSteps"]["steps"][0]
+        self.assertEqual(("done", self.git("rev-parse", "HEAD")), (step["status"], step["commit"]))
+        self.assertEqual(2, state["stepId"])
+        self.assertNotIn("commitBase", state)
+
+    def test_a_second_lost_result_keeps_the_first_base(self):
+        self.start_feature()
+        base = self.git("rev-parse", "HEAD")
+        self.to_review()
+        self.approve()
+        self.stop_losing_the_commit_result()
+        self.stop_losing_the_commit_result()
+        self.assertEqual(base, self.state()["commitBase"])
+        workflow.handle_stop(self.root, {})
+        self.assertEqual("done", self.state()["approvedSteps"]["steps"][0]["status"])
+
+    def test_a_commit_lost_by_advance_is_not_marked_empty(self):
+        self.start_feature()
+        self.to_review()
+        with mock.patch.object(workflow, "finish_step", side_effect=workflow.LockBusy("state.lock")):
+            with self.assertRaises(workflow.LockBusy):
+                workflow.cmd_advance(self.root)
+        workflow.cmd_advance(self.root)
+        state = self.state()
+        self.assertEqual("done", state["approvedSteps"]["steps"][0]["status"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), state["approvedSteps"]["steps"][0]["commit"])
+        self.assertNotIn("commitBase", state)
+
+    def test_a_step_with_no_changes_stays_empty_and_clears_the_base(self):
+        self.start_feature()
+        workflow.handle_stop(self.root, {})
+        self.approve()
+        workflow.handle_stop(self.root, {})
+        state = self.state()
+        self.assertEqual("empty", state["approvedSteps"]["steps"][0]["status"])
+        self.assertNotIn("commitBase", state)
+
+    def test_a_failed_commit_clears_the_base(self):
+        self.start_feature()
+        self.to_review()
+        self.pre_commit("exit 1")
+        self.approve()
+        workflow.handle_stop(self.root, {})
+        self.assertEqual("implement", self.state()["phase"])
+        self.assertNotIn("commitBase", self.state())
+
+    def test_a_new_step_clears_a_stale_base(self):
+        self.start_feature()
+        workflow.update_state(self.root, lambda s: s.update(commitBase="0" * 40))
+        self.to_review()
+        self.approve()
+        workflow.handle_stop(self.root, {})
+        self.assertNotIn("commitBase", self.state())
 
     def test_a_replan_request_follows_the_same_rules(self):
         self.start_feature()
@@ -949,12 +1079,117 @@ class AttemptTest(ProjectTest):
             "type": "verdict", "path": ".claude/specloop/run/custom.md", "approve": "VERDICT: APPROVE",
             "reject": "VERDICT: CHANGES_REQUESTED", "onReject": "implement"}}}})
 
+    def brief(self):
+        return workflow.phase_brief(self.root, workflow.load_config(self.root), self.state())
+
     def test_a_fixed_check_path_keeps_working(self):
         self.fixed_path()
         self.to_review()
-        self.write(os.path.join(".claude", "specloop", "run", "custom.md"), "VERDICT: APPROVE")
+        written = re.search(r"Write `([^`]+)`", self.brief()).group(1)
+        self.assertEqual(".claude/specloop/run/custom.md", written)
+        self.write(written, "VERDICT: APPROVE")
         workflow.handle_stop(self.root, {})
         self.assertEqual("done", self.state()["status"])
+
+    def test_the_step_review_brief_names_a_fixed_check_path_too(self):
+        self.start_feature({
+            "phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+            "feature": {"stepPhases": {"review": {"check": {"path": "reviews/step.md"}}}}})
+        self.write("a.py", "a = 1\n")
+        workflow.handle_stop(self.root, {})
+        self.assertIn("Write `reviews/step.md`", self.brief())
+
+    def test_review_file_follows_the_attempt_by_default(self):
+        self.to_review()
+        self.assertIn("Write `.claude/specloop/run/attempts/single-1/review.md`", self.brief())
+        self.assertNotIn("{review_file}", self.brief())
+
+    def test_the_brief_leaves_out_a_late_review_and_keeps_used_ones(self):
+        self.to_review()
+        closed = self.attempt_file("review.md")
+        self.claim(OWNER)
+        self.claim(OTHER)
+        workflow.cmd_go(self.root)
+        with open(closed, "w") as f:
+            f.write("VERDICT: APPROVE")
+        self.assertNotIn("attempts/single-1/review.md`", self.brief().split("## Files to read")[1])
+
+        self.write_attempt("review.md", "Fix it.\nVERDICT: CHANGES_REQUESTED")
+        self.assertIn("attempts/single-2/review.md`", self.brief().split("## Files to read")[1])
+        workflow.handle_stop(self.root, {})
+        self.assertEqual("implement", self.state()["phase"])
+        files = self.brief().split("## Files to read")[1]
+        self.assertIn("attempts/single-2/review.md`", files)
+        self.assertNotIn("attempts/single-1/review.md`", files)
+
+    def test_single_mode_status_stays_json_with_late_reviews(self):
+        self.to_review()
+        closed = self.attempt_file("review.md")
+        self.assertNotIn("lateReviews", json.loads(workflow.cmd_status(self.root)))
+        self.claim(OWNER)
+        self.claim(OTHER)
+        workflow.cmd_go(self.root)
+        with open(closed, "w") as f:
+            f.write("VERDICT: APPROVE")
+        late = json.loads(workflow.cmd_status(self.root))["lateReviews"]
+        self.assertEqual(["late review (attempt 1): APPROVE, .claude/specloop/run/attempts/single-1/review.md"], late)
+        self.assertNotIn("lateReviews", self.state())
+
+    def test_advancing_past_a_review_with_a_file_is_not_a_late_review(self):
+        self.to_review()
+        self.write_attempt("review.md", "VERDICT: CHANGES_REQUESTED")
+        workflow.cmd_advance(self.root)
+        self.assertEqual("done", self.state()["status"])
+        self.assertNotIn("late review", workflow.cmd_status(self.root))
+
+    def test_a_rewrite_after_advancing_is_a_late_review(self):
+        self.to_review()
+        self.write_attempt("review.md", "VERDICT: APPROVE")
+        path = self.attempt_file("review.md")
+        workflow.cmd_advance(self.root)
+        with open(path, "w") as f:
+            f.write("Too late.\nVERDICT: CHANGES_REQUESTED")
+        self.assertIn("lateReviews", json.loads(workflow.cmd_status(self.root)))
+
+    def fixed_step_review(self):
+        self.start_feature({
+            "phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+            "feature": {"stepPhases": {"review": {"check": {"path": "reviews/step.md"}}}}})
+        self.write("a.py", "a = 1\n")
+        workflow.handle_stop(self.root, {})
+        self.write("reviews/step.md", "VERDICT: APPROVE")
+        workflow.handle_stop(self.root, {})
+        self.assertEqual(2, self.state()["stepId"])
+
+    def test_the_previous_steps_approved_review_at_a_fixed_path_is_not_late(self):
+        self.fixed_step_review()
+        self.write("b.py", "b = 1\n")
+        workflow.handle_stop(self.root, {})
+        self.assertEqual("review", self.state()["phase"])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "reviews", "step.md")))
+        self.assertTrue(os.path.exists(self.run_path("attempts", "1-1", "review.md")))
+        self.assertNotIn("late review", workflow.cmd_status(self.root))
+        self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])  # it does not count again
+
+    def test_a_rewrite_of_the_approved_review_at_a_fixed_path_is_late(self):
+        self.fixed_step_review()
+        self.write("reviews/step.md", "Too late.\nVERDICT: CHANGES_REQUESTED")
+        self.write("b.py", "b = 1\n")
+        workflow.handle_stop(self.root, {})
+        self.assertIn("late review for step 2", workflow.cmd_status(self.root))
+
+    def test_advancing_past_a_fixed_path_review_is_not_late(self):
+        self.start_feature({
+            "phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+            "feature": {"stepPhases": {"review": {"check": {"path": "reviews/step.md"}}}}})
+        self.write("a.py", "a = 1\n")
+        workflow.handle_stop(self.root, {})
+        self.write("reviews/step.md", "VERDICT: CHANGES_REQUESTED")
+        workflow.cmd_advance(self.root)
+        self.assertEqual(2, self.state()["stepId"])
+        self.write("b.py", "b = 1\n")
+        workflow.handle_stop(self.root, {})
+        self.assertNotIn("late review", workflow.cmd_status(self.root))
 
     def test_a_fixed_check_path_is_archived_on_entering_the_phase(self):
         self.fixed_path()
@@ -1028,6 +1263,72 @@ class InFlightTest(ProjectTest):
     def test_delegate_preamble_says_to_wait(self):
         self.set_config({"phases": {"plan": {"delegate": True}}})
         self.assertIn("Never start a second one", self.start())
+
+    def test_the_subagent_is_told_not_to_park(self):
+        self.set_config({"phases": {"plan": {"delegate": True}}})
+        out = self.start()
+        brief = out.split("\n--- BEGIN PHASE BRIEF ---\n")[1].split("\n--- END PHASE BRIEF ---")[0]
+        self.assertIn("Run long commands in the foreground", brief)
+        self.assertIn("do not end your turn", brief)
+
+
+class StaleOverrideTest(ProjectTest):
+
+    def override(self, name, text):
+        self.write(os.path.join(".claude", "specloop", "overrides", name + ".md"), text)
+
+    def test_go_names_an_override_with_an_old_path(self):
+        self.override("review", "Write `{run_dir}/review.md`, or `{run_dir}/replan.md`.")
+        out = self.start()
+        self.assertIn("[specloop] Warning: .claude/specloop/overrides/review.md still uses "
+                      "{run_dir}/replan.md and {run_dir}/review.md", out)
+        self.assertIn("{review_file}", out.split("Warning:")[1])
+        self.assertTrue(workflow.cmd_go(self.root).rstrip().endswith("replan request."))
+
+    def test_a_takeover_still_starts_with_its_own_line(self):
+        self.override("review", "Write `{run_dir}/review.md`.")
+        self.start()
+        self.claim()
+        self.claim(OTHER)
+        out = workflow.cmd_go(self.root)
+        self.assertTrue(out.startswith("[specloop] This chat now drives the workflow."), out[:80])
+        self.assertIn("Warning:", out)
+
+    def test_clean_and_unused_overrides_are_not_named(self):
+        self.override("review", "Write `{review_file}`.")
+        self.override("unused", "Write `{run_dir}/review.md`.")
+        self.assertNotIn("Warning:", self.start())
+
+    def test_a_fixed_check_path_at_the_old_place_is_what_the_gate_reads(self):
+        self.set_config({"phases": {"review": {"check": {"path": "{run_dir}/review.md"}}}})
+        self.override("review", "Write `{run_dir}/review.md`.")
+        self.assertNotIn("Warning:", self.start())
+
+    def test_an_old_replan_path_is_named_even_with_that_fixed_path(self):
+        self.set_config({"phases": {"review": {"check": {"path": "{run_dir}/review.md"}}}})
+        self.override("review", "Write `{run_dir}/review.md` or `{run_dir}/replan.md`.")
+        out = self.start()
+        self.assertIn("still uses {run_dir}/replan.md,", out)
+
+    def test_feature_mode_checks_the_step_override_it_uses(self):
+        self.override("review", "Write `{run_dir}/review.md`.")  # a step uses step-review
+        self.override("step-review", "Write `{run_dir}/replan.md`.")
+        self.start_feature()
+        out = workflow.cmd_go(self.root)
+        self.assertIn(".claude/specloop/overrides/step-review.md", out)
+        self.assertNotIn("overrides/review.md", out)
+
+    def test_a_delegate_override_counts(self):
+        self.override("delegate", "Reviews go to {run_dir}/review.md\n{brief}")
+        self.assertIn(".claude/specloop/overrides/delegate.md", self.start())
+
+    def test_the_gate_still_ignores_the_old_path(self):
+        self.override("review", "Write `{run_dir}/review.md`.")
+        self.start()
+        workflow.cmd_advance(self.root)
+        workflow.cmd_advance(self.root)
+        self.write(os.path.join(".claude", "specloop", "run", "review.md"), "VERDICT: APPROVE")
+        self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])
 
 
 class AttributionTest(ProjectTest):

@@ -8,5 +8,7 @@ You are the orchestrator for this phase. The work is done by a subagent that sta
 4. If a subagent for this phase is already running, including one the Agent tool reports as running in the background, finish your turn and wait for it. Never start a second one.
 
 --- BEGIN PHASE BRIEF ---
+Run long commands in the foreground, and do not end your turn while you wait on background work: specloop cannot see a subagent that has stopped to wait, and it would check the phase before you finish.
+
 {brief}
 --- END PHASE BRIEF ---

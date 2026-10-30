@@ -82,6 +82,8 @@ cd ~/tools/specloop && git pull
 
 An update replaces the engine, launcher, `defaults.json` and the shipped `phases/`. Your `config.json` and `overrides/` are never touched.
 
+An override written for 0.2.0 or earlier may still send a review to `{run_dir}/review.md` or a replan request to `{run_dir}/replan.md`. The gate no longer reads those files, so the phase would never pass. `/sl-go` prints a warning naming each such file in use. Change it to `{review_file}` for a review and `{attempt_dir}/replan.md` for a replan request.
+
 ### Git worktrees
 
 The kit is git-ignored, so a new `git worktree` does not get it. Run the installer once per worktree. If the project commits its hook settings, a worktree without the kit has the hooks but no `run.sh`: each hook fails with exit code 127, which Claude Code reports as a hook error and otherwise ignores, so nothing is enforced there.
@@ -93,7 +95,7 @@ The kit is git-ignored, so a new `git worktree` does not get it. Run the install
 | `/sl-spec <file>` | Load a spec; status `ready`. Clears the previous run's `run/` artifacts (plan, reviews). Refused while a workflow is `active`, `paused` or `stalled`; run `/sl-reset` first. Claude summarizes the spec and waits. |
 | `/sl-feature <file>` | Load a spec in [feature mode](#feature-mode) (one commit per planned step). Also clears `run/`, and is refused in the same cases. |
 | `/sl-go` | Start, or resume after pause/stall. The chat that types it becomes the [owner](#several-chats-in-one-project) of the workflow. |
-| `/sl-pause` | Stop driving the session; keep the phase. Works from any chat. |
+| `/sl-pause` | Stop driving the session; keep the phase. Works from any chat. A workflow that has not started or is done stays as it is. |
 | `/sl-status` | Show the state: the raw state JSON in single mode, a step summary in feature mode. Works from any chat, and lists reviews that arrived too late to count. |
 | `/sl-advance` | Force-pass the current phase. Blocked in a chat that is not the owner while the workflow is `active`. |
 | `/sl-reset` | Delete the state and the `run/` artifacts. Blocked in a chat that is not the owner while the workflow is `active`. |
@@ -124,9 +126,9 @@ Hooks are configured per project, so they fire in every chat open in that folder
 - Edits under `.claude/specloop/run/` are denied outside a subagent, so a stray review file cannot affect a gate.
 - `/sl-advance` and `/sl-reset` are blocked while `active`; the message names `/sl-go` and `/sl-pause`. A paused workflow whose chat is gone can still be advanced or reset from anywhere.
 
-**Takeover.** `/sl-go` in another chat replaces the owner. This is how you recover from a closed chat. It is also needed after `/clear`, which gives the chat a new session id; `--resume` and compaction keep it. The output starts with a line saying that this chat now drives the workflow. Stop any subagent still running in the previous chat: the takeover opens a new [review attempt](#review-attempts), so its result no longer counts. There is no heartbeat or timeout.
+**Takeover.** `/sl-go` in another chat replaces the owner. This is how you recover from a closed chat. It is also needed after `/clear`, which gives the chat a new session id; `--resume` and compaction keep it. The output starts with a line saying that this chat now drives the workflow. Stop any subagent still running in the previous chat: the takeover opens a new [review attempt](#review-attempts), so its result no longer counts. There is no heartbeat or timeout. A `/sl-go` refused because the current branch is not the feature run's branch leaves the owner as it is.
 
-**State files.** `state.json` and `run/steps.json` are replaced atomically, and every state change takes `state.lock` and reloads the file first, so two processes cannot overwrite each other and a `/sl-pause` is never lost. The lock is not held while a check or git runs. A Stop that finds its workflow changed during the check (paused, taken over, moved to another phase) drops the result. A pause during a step commit is kept: the commit stands, the next step is prepared and the workflow stays paused. If two Stops overlap, for example during a takeover, only one runs the check. `history` entries written by hooks carry `session`, the first 8 characters of the session id, and claims and takeovers are recorded there too.
+**State files.** `state.json` and `run/steps.json` are replaced atomically, and every state change takes `state.lock` and reloads the file first, so two processes cannot overwrite each other and a `/sl-pause` is never lost. The lock is not held while a check or git runs. A Stop that finds its workflow changed during the check (paused, taken over, moved to another phase) drops the result. A pause during a step commit is kept: the commit stands, the next step is prepared and the workflow stays paused. If two Stops overlap, for example during a takeover, only one runs the check, and the other says that a check is marked as running. A Stop hook that was killed leaves that mark behind for `checkTimeoutSec` plus a minute; `/sl-go` clears it at once. A Stop that cannot record its result because the lock stays taken says so, and `/sl-go` continues. A step commit whose result was lost that way still counts: the next Stop finds HEAD past `commitBase` in the state and records that commit for the step. `history` entries written by hooks carry `session`, the first 8 characters of the session id, and claims and takeovers are recorded there too.
 
 **Limits.**
 
@@ -197,17 +199,17 @@ A check's `path` may use `{attempt_dir}`. A phase with no check passes immediate
 
 To add a phase, for example `docs` after `implement`, define it in `config.json`, point `implement.next` at it, and put the instructions in `overrides/docs.md`.
 
-In instruction files, `{spec}` becomes the spec path, `{run_dir}` becomes `.claude/specloop/run`, and `{attempt_dir}` becomes the current attempt's directory.
+In instruction files, `{spec}` becomes the spec path, `{run_dir}` becomes `.claude/specloop/run`, `{attempt_dir}` becomes the current attempt's directory, and `{review_file}` becomes the path the current phase's verdict check reads, which is `{attempt_dir}/review.md` in a phase without one.
 
 ### Review attempts
 
 A review belongs to one attempt, so a result that arrives late never counts for the wrong step. `attempt` in the state goes up each time a phase with a `verdict` check is entered and on every takeover. A failed check or a pause and resume keeps it, so a subagent that is still running can finish.
 
-`{attempt_dir}` is `.claude/specloop/run/attempts/<step id or "single">-<attempt>`. The default `check.path` of both review phases is `{attempt_dir}/review.md`, and a replan request goes to `{attempt_dir}/replan.md`. A rejected attempt's review stays in its directory, and the phase brief lists the reviews of the current step.
+`{attempt_dir}` is `.claude/specloop/run/attempts/<step id or "single">-<attempt>`. The default `check.path` of both review phases is `{attempt_dir}/review.md`, and a replan request goes to `{attempt_dir}/replan.md`. A rejected attempt's review stays in its directory, and the phase brief lists the reviews of the current step that a gate used, plus the open attempt's file. `/sl-advance` past a review counts as using it.
 
-A file written into a closed attempt never affects the workflow, and `/sl-status` lists it, for example `late review for step 5 (attempt 1): CHANGES_REQUESTED, <path>`. A commit is never undone automatically; you decide what to do about a late rejection.
+A file written into a closed attempt never affects the workflow and stays out of the brief, and `/sl-status` lists it, for example `late review for step 5 (attempt 1): CHANGES_REQUESTED, <path>`. In single mode, where `/sl-status` prints JSON, these lines are in a `lateReviews` key. A commit is never undone automatically; you decide what to do about a late rejection.
 
-`check.path` stays configurable. With a fixed path that does not use `{attempt_dir}`, a rejected review is renamed to `<name>-<iteration>` as before, and a file already there when the phase starts moves to `{attempt_dir}/late-review.md`.
+`check.path` stays configurable. With a fixed path that does not use `{attempt_dir}`, the shipped review instructions use that path through `{review_file}`. A rejected review is renamed to `<name>-<iteration>` as before. When the phase starts, a review a gate already used moves back to its own attempt, and any other file already there moves to `{attempt_dir}/late-review.md`.
 
 Whenever a check fails or a review requests changes, the full details (the complete check output or review text, not truncated) are written to `.claude/specloop/run/last-failure.md`. The file is removed when a phase passes and on `/sl-advance`.
 
@@ -223,7 +225,7 @@ In a delegated phase the main session acts as an orchestrator. Instead of the ba
 
 Gates still run only when the main session stops; specloop registers no `SubagentStop` hook. A phase is not checked while its subagent runs: when Stop's `background_tasks` lists a `subagent`, `workflow` or `teammate`, in any phase, the Stop hook does nothing and costs no iteration. The subagent's completion wakes the chat, and the next Stop runs the gate. Shell tasks and monitors do not count, because a dev server must not hold a phase open forever. On a Claude Code version that does not send `background_tasks`, the check runs as usual.
 
-There is one gap. A subagent that ends its turn and waits on its own background work is not listed as a `subagent`: Stop sees only its shell, as `type: shell`, until the work finishes and the subagent resumes. The check therefore runs while that subagent is unfinished, as it would on a version with no `background_tasks`. A failed check costs an iteration, and a passing check can advance the phase before the subagent reports. A subagent stays listed for as long as it keeps working, so a brief can avoid the gap by asking it to run its long commands in the foreground.
+There is one gap. A subagent that ends its turn and waits on its own background work is not listed as a `subagent`: Stop sees only its shell, as `type: shell`, until the work finishes and the subagent resumes. The check therefore runs while that subagent is unfinished, as it would on a version with no `background_tasks`. A failed check costs an iteration, and a passing check can advance the phase before the subagent reports. A subagent stays listed for as long as it keeps working, so the shipped preamble's brief tells it to run long commands in the foreground and not to end its turn while it waits on background work. An override of `delegate.md` should keep that line.
 
 Note that a phase named `delegate` would share its instructions file with the preamble.
 

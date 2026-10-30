@@ -61,6 +61,7 @@ RUNNING_STATUSES = ("active", "paused", "stalled")
 OWNER_ONLY_COMMANDS = ("advance", "reset")
 IN_FLIGHT_TASKS = ("subagent", "workflow", "teammate")
 COMMIT_PENDING = object()
+STALE_PATHS = ("{run_dir}/" + REVIEW_FILE, "{run_dir}/" + REPLAN_FILE)
 
 
 class StateCorrupt(Exception):
@@ -366,36 +367,60 @@ def cmd_name(config, name):
     return "/" + config.get("commandPrefix", "") + name
 
 
-def _kit_text(root, name, custom=None):
-    """Read <custom>, overrides/<name>.md or phases/<name>.md, whichever exists first; None if none does."""
+def _kit_file(root, name, custom=None):
+    """Path of <custom>, overrides/<name>.md or phases/<name>.md, whichever exists first; None if none does."""
     names = [custom] if custom else []
     names += [os.path.join("overrides", name + ".md"), os.path.join("phases", name + ".md")]
     for candidate in names:
         path = candidate if os.path.isabs(candidate) else _path(root, candidate)
         if os.path.exists(path):
-            with open(path, encoding="utf-8") as f:
-                return f.read()
+            return path
     return None
 
 
-def _render(text, state):
-    """Fill {spec}, {run_dir}, {attempt_dir} and, while a step is active, the step placeholders, in a single pass."""
+def _read_text(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def instruction_file(root, phase, phase_config, step):
+    """Path of a phase's instructions; a step phase prefers step-<phase>."""
+    custom = phase_config.get("instructions")
+    return (_kit_file(root, "step-" + phase, custom) if step else None) or _kit_file(root, phase, custom)
+
+
+def _render(text, state, **extra):
+    """Fill {spec}, {run_dir}, {attempt_dir}, the `extra` values and, while a step is active, the step placeholders,
+    in a single pass."""
     values = dict(step_values(state), spec=state.get("spec", ""), run_dir=_rel("run"),
-                  attempt_dir=_rel("run", ATTEMPTS_DIR, attempt_key(state)))
+                  attempt_dir=_rel("run", ATTEMPTS_DIR, attempt_key(state)), **extra)
     return re.sub(r"\{(\w+)\}", lambda m: values.get(m.group(1), m.group(0)), text)
+
+
+def verdict_check(config, state):
+    """The current phase's check when it is a verdict, else None."""
+    check = phase_graph(config, state).get(state.get("phase"), {}).get("check") or {}
+    return check if check.get("type") == "verdict" else None
+
+
+def review_file(config, state):
+    """Where a review goes: the current phase's check.path, else the default in the attempt's directory."""
+    check = verdict_check(config, state)
+    return check_path(check, state) if check else _rel("run", ATTEMPTS_DIR, attempt_key(state), REVIEW_FILE)
+
+
+def render_phase(text, config, state):
+    """_render for an instruction file, which may also use {review_file}."""
+    return _render(text, state, review_file=review_file(config, state))
 
 
 def phase_instructions(root, config, state):
     phase = state["phase"]
     if phase == DONE:
         return "The workflow is complete."
-    custom = phase_graph(config, state).get(phase, {}).get("instructions")
-    text = None
-    if in_step(state):
-        text = _kit_text(root, "step-" + phase, custom)
-    if text is None:
-        text = _kit_text(root, phase, custom)
-    return _render(text if text is not None else "(no instructions file for phase '%s')" % phase, state)
+    path = instruction_file(root, phase, phase_graph(config, state).get(phase, {}), in_step(state))
+    text = _read_text(path) if path else "(no instructions file for phase '%s')" % phase
+    return render_phase(text, config, state)
 
 
 def is_delegated(config, state):
@@ -413,7 +438,7 @@ def phase_brief(root, config, state):
     if is_feature(state) and os.path.exists(replan_path(root, state)):
         files.append(_rel("run", ATTEMPTS_DIR, attempt_key(state), REPLAN_FILE))
     files += [_rel("run", n) for n in names if n.startswith("review") and n.endswith(".md")]
-    files += attempt_reviews(root, state)
+    files += attempt_reviews(root, config, state)
     if FAILURE_FILE in names:
         files.append(_rel("run", FAILURE_FILE))
     return "%s\n\n## Files to read\n\nRead these files from disk first (paths are relative to the project root):\n\n%s" % (
@@ -428,11 +453,23 @@ def attempt_dirs(root):
     return sorted(found, key=lambda entry: entry[1])
 
 
-def attempt_reviews(root, state):
-    """Project-relative paths of the reviews of the current step (or single-mode run), oldest first."""
-    current = attempt_key(state).rsplit("-", 1)[0]
-    return [_rel("run", ATTEMPTS_DIR, name, REVIEW_FILE) for step, _, name in attempt_dirs(root)
-            if step == current and os.path.exists(os.path.join(run_dir(root), ATTEMPTS_DIR, name, REVIEW_FILE))]
+def open_attempt(config, state):
+    """Key of the attempt that can still receive a review, or None outside a running verdict phase."""
+    return attempt_key(state) if verdict_check(config, state) and state.get("status") != "done" else None
+
+
+def attempt_reviews(root, config, state):
+    """Project-relative paths of the current step's (or single-mode run's) reviews that count, oldest first: the
+    ones a gate used, plus the open attempt's file. A late review is for the user, not for the implementer."""
+    current, open_key = attempt_key(state).rsplit("-", 1)[0], open_attempt(config, state)
+    found = []
+    for step, _, name in attempt_dirs(root):
+        directory = os.path.join(run_dir(root), ATTEMPTS_DIR, name)
+        path = os.path.join(directory, REVIEW_FILE)
+        if step == current and os.path.exists(path) and (
+                name == open_key or is_sealed_copy(path, os.path.join(directory, SEAL_FILE))):
+            found.append(_rel("run", ATTEMPTS_DIR, name, REVIEW_FILE))
+    return found
 
 
 def phase_prompt(root, config, state):
@@ -440,8 +477,8 @@ def phase_prompt(root, config, state):
     if not is_delegated(config, state):
         return phase_instructions(root, config, state)
     brief = phase_brief(root, config, state)
-    preamble = _kit_text(root, "delegate")
-    return _render(preamble, state).replace("{brief}", brief) if preamble is not None else brief
+    path = _kit_file(root, "delegate")
+    return render_phase(_read_text(path), config, state).replace("{brief}", brief) if path else brief
 
 
 def failure_path(root):
@@ -700,6 +737,31 @@ def spec_size_warning(root, config, spec):
             "consider %s for multi-commit features." % (lines, words, limits, cmd_name(config, "feature")))
 
 
+def stale_override_warning(root, config, state):
+    """Overrides are never updated, so one can still send a review or a replan to run/, where the gate does not
+    look. Return a warning naming each such project file that this run uses, else None."""
+    if is_feature(state):
+        graphs = ((config["feature"]["planPhases"], False), (config["feature"]["stepPhases"], True))
+    else:
+        graphs = ((config["phases"], False),)
+    files = [(instruction_file(root, phase, phase_config, step), phase_config)
+             for graph, step in graphs for phase, phase_config in graph.items()]
+    files.append((_kit_file(root, "delegate"), {}))
+    found = {}
+    for path, phase_config in files:
+        if not path or os.path.dirname(path) == _path(root, "phases"):
+            continue
+        text, check = _read_text(path), phase_config.get("check") or {}
+        allowed = "{run_dir}/" + REVIEW_FILE if "path" in check and check_path(check, state) == _rel(
+            "run", REVIEW_FILE) else None  # a fixed check.path at the old place is what the gate reads
+        found.setdefault(path, set()).update(s for s in STALE_PATHS if s in text and s != allowed)
+    lines = ["[specloop] Warning: %s still uses %s, where the gate no longer looks. Use {review_file} for a review "
+             "and {attempt_dir}/replan.md for a replan request." % (
+                 relative_to_project(root, path) or path, " and ".join(sorted(strings)))
+             for path, strings in sorted(found.items()) if strings]
+    return "\n".join(lines) or None
+
+
 def count_plan_items(root):
     try:
         with open(os.path.join(run_dir(root), "plan.md"), encoding="utf-8", errors="replace") as f:
@@ -710,8 +772,8 @@ def count_plan_items(root):
 
 def fixed_review_path(root, config, state):
     """Path of the current phase's verdict file when the project set one outside the attempt directories."""
-    check = phase_graph(config, state).get(state["phase"], {}).get("check") or {}
-    if check.get("type") == "verdict" and "{attempt_dir}" not in check["path"]:
+    check = verdict_check(config, state)
+    if check and "{attempt_dir}" not in check["path"]:
         return os.path.join(root, check_path(check, state))
     return None
 
@@ -730,23 +792,26 @@ def new_attempt(root, config, state):
     os.makedirs(attempt_path(root, state), exist_ok=True)
     src = fixed_review_path(root, config, state)
     if src and os.path.exists(src):
-        os.replace(src, os.path.join(attempt_path(root, state), LATE_REVIEW_FILE))
+        # The review a gate already used goes back to its own attempt, so that it is not reported as late.
+        sealed = sealed_attempt(root, src)
+        os.replace(src, os.path.join(sealed, REVIEW_FILE) if sealed
+                   else os.path.join(attempt_path(root, state), LATE_REVIEW_FILE))
 
 
 def enter_phase(root, config, state, phase):
     """Make `phase` current. Entering a phase with a verdict check starts a new attempt."""
     state["phase"] = phase
-    check = phase_graph(config, state).get(phase, {}).get("check") or {}
-    if check.get("type") == "verdict":
+    if verdict_check(config, state):
         new_attempt(root, config, state)
     else:
         os.makedirs(attempt_path(root, state), exist_ok=True)
 
 
-def seal_attempt(root, state):
-    """Remember the review the gate just used, so that /status can tell a later rewrite from it."""
-    path = os.path.join(attempt_path(root, state), REVIEW_FILE)
+def seal_attempt(root, config, state):
+    """Remember the review that was just used, so that /status can tell a later rewrite from it."""
+    path = fixed_review_path(root, config, state) or os.path.join(attempt_path(root, state), REVIEW_FILE)
     if os.path.exists(path):
+        os.makedirs(attempt_path(root, state), exist_ok=True)
         info = os.stat(path)
         atomic_write(os.path.join(attempt_path(root, state), SEAL_FILE),
                      json.dumps({"size": info.st_size, "mtime": info.st_mtime_ns}))
@@ -762,10 +827,18 @@ def is_sealed_copy(path, seal_path):
     return seal == {"size": info.st_size, "mtime": info.st_mtime_ns}
 
 
+def sealed_attempt(root, path):
+    """Directory of the attempt whose seal matches the file at `path`, or None."""
+    for _, _, name in reversed(attempt_dirs(root)):
+        directory = os.path.join(run_dir(root), ATTEMPTS_DIR, name)
+        if is_sealed_copy(path, os.path.join(directory, SEAL_FILE)):
+            return directory
+    return None
+
+
 def late_reviews(root, config, state):
     """One line per review that arrived in a closed attempt. It never affects the workflow, but the user decides."""
-    check = phase_graph(config, state).get(state.get("phase"), {}).get("check") or {}
-    open_key = attempt_key(state) if check.get("type") == "verdict" and state.get("status") != "done" else None
+    open_key = open_attempt(config, state)
     lines = []
     for step, attempt, name in attempt_dirs(root):
         directory = os.path.join(run_dir(root), ATTEMPTS_DIR, name)
@@ -1010,6 +1083,7 @@ def start_next_step(root, config, state):
     """Archive the previous step's files and make the next pending step active. Return it, or None."""
     if state.get("stepId") is not None:
         archive_step_files(root, state["stepId"])
+    state.pop("commitBase", None)
     step = next((s for s in state["approvedSteps"]["steps"] if s.get("status") == "pending"), None)
     if step is None:
         state["stepId"] = None
@@ -1061,6 +1135,23 @@ def commit_step(root, config, state):
     return ("committed", sha) if ok else ("failed", "git rev-parse HEAD failed:\n" + sha)
 
 
+def head_sha(root, config):
+    ok, sha = git(root, config, "rev-parse", "HEAD")
+    return sha if ok else None
+
+
+def run_commit(root, config, state):
+    """commit_step for a state that recorded commitBase. A commit whose result was never recorded leaves nothing
+    to commit, so 'empty' with HEAD past commitBase means that commit is this step's."""
+    commit = commit_step(root, config, state)
+    base = state.get("commitBase")
+    if commit[0] == "empty" and base:
+        sha = head_sha(root, config)
+        if sha and sha != base:
+            return "committed", sha
+    return commit
+
+
 def completion_message(config, state):
     lines = ["%s %s" % (s["commit"][:7] if s.get("commit") else "(empty)", s["title"])
              for s in state["approvedSteps"]["steps"]]
@@ -1077,6 +1168,7 @@ def finish_step(root, config, state, commit, session=None):
     'next' (text summarizes the commit; the next step is active), 'paused' or 'done' (text is the message)."""
     label, step = step_label(state)
     result, value = commit
+    state.pop("commitBase", None)
     if result == "failed":
         enter_phase(root, config, state, config["feature"].get("stepInitialPhase", "implement"))
         state["lastFailure"] = tail(value, 500)
@@ -1126,15 +1218,18 @@ def gate_mark(state):
 
 
 def take_gate(root, config, hook_input):
-    """Record that this Stop runs the check. Return the reloaded state, or None when it must not run."""
+    """Record that this Stop runs the check. Return (reloaded state, None), or (None, Stop output) when it must
+    not run."""
     def apply(state):
         if state.get("status") != "active" or not is_owner(state, hook_input):
-            raise Unchanged(None)
+            raise Unchanged((None, None))
         running = state.get("gate") or {}
         if seconds_since(running.get("at")) < config.get("checkTimeoutSec", 900) + 60:
-            raise Unchanged(None)
+            raise Unchanged((None, {"systemMessage": (
+                "[specloop] a check is marked as running since %s, so this stop ran none. If no check is running, "
+                "%s clears the mark." % (running.get("at"), cmd_name(config, "go")))}))
         state["gate"] = {"session": hook_input.get("session_id"), "at": now()}
-        return state
+        return state, None
     return update_state(root, apply)
 
 
@@ -1184,9 +1279,9 @@ def handle_stop(root, hook_input):
     if not is_owner(state, hook_input) or work_in_flight(hook_input):
         return None
     config = load_config(root)
-    state = take_gate(root, config, hook_input)
+    state, output = take_gate(root, config, hook_input)
     if state is None:
-        return None
+        return output
     try:
         return run_gate(root, config, state, hook_input)
     except Exception:
@@ -1198,6 +1293,7 @@ def run_gate(root, config, state, hook_input):
     """Check with no lock, record the result under the lock if it is still current, then commit with no lock."""
     mark, phase = gate_mark(state), state["phase"]
     outcome = evaluate_gate(root, config, state)
+    head = head_sha(root, config) if in_step(state) and outcome["result"] == "pass" else None
 
     def apply(current):
         if gate_mark(current) != mark:
@@ -1208,12 +1304,15 @@ def run_gate(root, config, state, hook_input):
         result = apply_gate(root, config, current, outcome, hook_input)
         if result is not COMMIT_PENDING:
             current.pop("gate", None)
+        elif head:
+            current.setdefault("commitBase", head)  # a retry keeps the base from before the first commit
         return result
 
     out = update_state(root, apply)
     if out is not COMMIT_PENDING:
         return out
-    commit = commit_step(root, config, state)
+    state = load_state(root) or state
+    commit = run_commit(root, config, state)
     return update_state(root, lambda current: apply_commit(root, config, current, commit, state, hook_input))
 
 
@@ -1227,8 +1326,8 @@ def apply_gate(root, config, state, outcome, hook_input):
     graph = phase_graph(config, state)
     state["iter"] = state.get("iter", 0) + 1
     add_history(state, session, phase=phase, result=result, iter=state["iter"])
-    if result in ("pass", "reject") and (graph[phase].get("check") or {}).get("type") == "verdict":
-        seal_attempt(root, state)
+    if result in ("pass", "reject") and verdict_check(config, state):
+        seal_attempt(root, config, state)
 
     if result == "pass":
         clear_failure(root)
@@ -1416,6 +1515,8 @@ def handle_prompt_command(root, config, state, hook_input):
     if command == "go" and session and state.get("status") in CLAIMABLE_STATUSES:
         if (state.get("owner") or {}).get("session") == session:
             return None
+        if is_feature(state) and state.get("branch") and check_feature_branch(root, config, state):
+            return None  # cmd_go refuses and reports it, so the workflow stays with its owner
         try:
             claim_workflow(root, session)
         except LockBusy:
@@ -1437,6 +1538,8 @@ def handle_context(root, event, hook_input=None):
         if blocked:
             return blocked
         state = load_state(root)
+        if not state:
+            return None
     status = state.get("status")
     if status == "active":
         if not is_owner(state, hook_input):
@@ -1529,11 +1632,14 @@ def cmd_go(root):
                 cmd_name(config, "go"), cmd_name(config, "status")))
         current.update(branch)
         return resume(root, config, current, plan, replan)
-    return update_state(root, apply)
+    out = update_state(root, apply)
+    warning = stale_override_warning(root, config, state)
+    return out + "\n\n" + warning if warning else out
 
 
 def resume(root, config, state, plan, replan):
     """Everything cmd_go changes in the state, on the reloaded state. Return the command's output."""
+    state.pop("gate", None)  # left behind by a killed Stop hook, it would hold every later check back
     if plan is not None:
         approve_plan(root, config, state, plan)
     if replan is not None and adopt_replan(root, config, state, replan) == "done":
@@ -1569,7 +1675,7 @@ def cmd_pause(root):
     config = load_config(root)
 
     def apply(state):
-        if not state:
+        if state.get("status") not in RUNNING_STATUSES:
             raise Unchanged("Nothing to pause.")
         state["status"] = "paused"
         return "Workflow paused at phase '%s'. Run %s to resume." % (state["phase"], cmd_name(config, "go"))
@@ -1581,6 +1687,7 @@ def cmd_advance(root):
     if not state or state["phase"] == DONE:
         return "Nothing to advance."
     config = load_config(root)
+    head = head_sha(root, config) if in_step(state) else None
     replan = None
     if in_replan(config, state):
         # Force-passing the replan phase adopts the current steps.json if it is acceptable.
@@ -1598,12 +1705,16 @@ def cmd_advance(root):
             return "Replan adopted. Now in %s, phase '%s'." % (step_label(current)[0].lower(), current["phase"])
         clear_failure(root)
         add_history(current, None, phase=current["phase"], result="skipped")
+        if verdict_check(config, current):
+            seal_attempt(root, config, current)  # advancing past a review uses it, so it is not late
         if is_plan_phase(config, current):
             return await_approval(root, config, current)
         next_phase = phase_graph(config, current)[current["phase"]].get("next", DONE)
         if in_step(current) and next_phase in (COMMIT, DONE):
             # Advancing out of the last step phase commits the step; it never skips the commit.
             current["iter"] = current.get("iter", 0) + 1
+            if head:
+                current.setdefault("commitBase", head)
             return COMMIT_PENDING
         if next_phase == DONE:
             current.update(phase=DONE, status="done")
@@ -1619,7 +1730,7 @@ def advance_commit(root, config):
     """Commit the step /advance moved past. git runs with no lock, then the result goes to the reloaded state."""
     state = load_state(root)
     step_id, label = state.get("stepId"), step_label(state)[0]
-    commit = commit_step(root, config, state)
+    commit = run_commit(root, config, state)
 
     def apply(current):
         if current.get("stepId") != step_id:
@@ -1638,8 +1749,10 @@ def cmd_status(root):
     state = load_state(root)
     if not state:
         return "No workflow state."
-    text = feature_status(root, state) if is_feature(state) else json.dumps(state, indent=2)
-    return "\n".join([text] + late_reviews(root, load_config(root), state))
+    late = late_reviews(root, load_config(root), state)
+    if is_feature(state):
+        return "\n".join([feature_status(root, state)] + late)
+    return json.dumps(dict(state, lateReviews=late) if late else state, indent=2)
 
 
 def feature_status(root, state):
@@ -1709,6 +1822,9 @@ def run_hook(command, args):
         return handle_context(root, args[0] if args else "UserPromptSubmit", hook_input)
     except LockBusy as e:
         print("[specloop] state is locked, nothing written: %s" % e, file=sys.stderr)
+        if command == "stop":
+            return {"systemMessage": "[specloop] specloop was busy, so the result of this stop was not recorded. "
+                                     "Run %s to continue." % cmd_name(load_config(root), "go")}
         return None
     except StateCorrupt:
         if command == "pretool":
