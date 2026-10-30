@@ -26,14 +26,17 @@ Phase instructions are read from overrides/<phase>.md first, then phases/<phase>
 Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 """
 
+import collections
 import contextlib
 import io
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -396,6 +399,58 @@ def cmd_name(config, name):
     return "/" + config.get("commandPrefix", "") + name
 
 
+# --- bounded subprocesses ------------------------------------------------------------------
+
+RunResult = collections.namedtuple("RunResult", "returncode stdout stderr timed_out")
+KILL_WAIT_SEC = 5  # How long to wait for a killed process to be reaped.
+
+
+def _kill_process_tree(proc):
+    """Kill proc and every process it started. Never raises."""
+    try:
+        if os.name == "nt":
+            # /T needs the parent alive to find its children, so kill the tree before the parent.
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def run_limited(args, timeout, cwd=None, env=None, merge_stderr=False):
+    """Run a command for at most timeout seconds. Return RunResult(returncode, stdout, stderr, timed_out)
+    with the output as bytes; with merge_stderr the output holds both streams and stderr is empty.
+
+    The output goes to temporary files, not pipes, so a descendant that outlives the command and keeps
+    the streams open cannot block the call. On timeout the whole process tree is killed (a new session
+    and killpg on POSIX, taskkill /T on Windows) and returncode is None. stdin is the null device.
+    Raises OSError when the executable cannot be started."""
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        kwargs = {} if os.name == "nt" else {"start_new_session": True}
+        proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT if merge_stderr else err, **kwargs)
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=KILL_WAIT_SEC)
+            except Exception:
+                pass
+        streams = []
+        for stream in (out, err):
+            stream.seek(0)
+            streams.append(stream.read())
+        return RunResult(None if timed_out else proc.returncode, streams[0], streams[1], timed_out)
+
+
 # --- Update checker building blocks -------------------------------------------------------
 
 UPDATE_FILE = "update.json"
@@ -535,12 +590,11 @@ def update_git(path, timeout, *args):
     Return (ok, output, error): output is stripped stdout, error a short message on failure."""
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     try:
-        proc = subprocess.run([GIT, "-C", path] + list(args), env=env, stdin=subprocess.DEVNULL,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, "", "git %s timed out after %ss" % (args[0], timeout)
+        proc = run_limited([GIT, "-C", path] + list(args), timeout, env=env)
     except OSError as e:
         return False, "", "git could not be run: %s" % e
+    if proc.timed_out:
+        return False, "", "git %s timed out after %ss" % (args[0], timeout)
     output = proc.stdout.decode("utf-8", errors="replace").strip()
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()
@@ -995,11 +1049,11 @@ def check_phase(root, config, phase_config, state):
         return _same("fail", "Required file %s is missing or empty." % rel)
     if kind == "command":
         try:
-            proc = subprocess.run(
-                [resolve_shell(config), "-c", check["command"]],
-                cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                timeout=config.get("checkTimeoutSec", 900))
-        except subprocess.TimeoutExpired:
+            proc = run_limited([resolve_shell(config), "-c", check["command"]],
+                               config.get("checkTimeoutSec", 900), cwd=root, merge_stderr=True)
+        except OSError as e:
+            return _same("fail", "Check command could not be run: %s" % e)
+        if proc.timed_out:
             return _same("fail", "Check command timed out: %s" % check["command"])
         output = proc.stdout.decode("utf-8", errors="replace")
         if proc.returncode == 0:
@@ -1191,12 +1245,12 @@ def late_reviews(root, config, state):
 def git(root, config, *args, raw=False):
     """Run git with feature.gitTimeoutSec. Return (ok, output); never raises."""
     try:
-        proc = subprocess.run(["git"] + list(args), cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                              timeout=config.get("feature", {}).get("gitTimeoutSec", 60))
-    except subprocess.TimeoutExpired:
-        return False, "git %s timed out" % " ".join(args)
+        proc = run_limited(["git"] + list(args), config.get("feature", {}).get("gitTimeoutSec", 60),
+                           cwd=root, merge_stderr=True)
     except OSError as e:
         return False, "git could not be run: %s" % e
+    if proc.timed_out:
+        return False, "git %s timed out" % " ".join(args)
     output = proc.stdout.decode("utf-8", errors="replace")
     return proc.returncode == 0, output if raw else output.strip()
 
