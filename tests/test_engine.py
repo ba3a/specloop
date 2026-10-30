@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KIT = os.path.join(os.path.dirname(HERE), "kit", "specloop")
@@ -1983,6 +1984,415 @@ class UpdateCheckTest(unittest.TestCase):
             self.assertEqual(0, workflow.main(["update-check"]))
         self.assertEqual(("", ""), (out.getvalue(), err.getvalue()))
         self.assertTrue(workflow.load_update_state(self.root).get("checkedAt"))
+
+
+class UpdateTimingTest(unittest.TestCase):
+
+    def stamp(self, hours_ago):
+        moment = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        return moment.isoformat(timespec="seconds")
+
+    def test_is_busy(self):
+        self.assertFalse(workflow.is_busy(None))
+        self.assertFalse(workflow.is_busy({}))
+        self.assertFalse(workflow.is_busy({"status": "done"}))
+        for status in ("ready", "active", "stalled", "paused"):
+            self.assertTrue(workflow.is_busy({"status": status}), status)
+
+    def test_update_interval(self):
+        self.assertEqual(6, workflow.update_interval({"update": {"intervalHours": 6}}))
+        self.assertEqual(0, workflow.update_interval({"update": {"intervalHours": 0}}))
+        self.assertEqual(0.5, workflow.update_interval({"update": {"intervalHours": 0.5}}))
+        for value in (-1, "24", None, True):
+            self.assertEqual(24, workflow.update_interval({"update": {"intervalHours": value}}), value)
+        self.assertEqual(24, workflow.update_interval({}))
+
+    def test_interval_elapsed(self):
+        self.assertFalse(workflow.interval_elapsed(self.stamp(1), 24))
+        self.assertTrue(workflow.interval_elapsed(self.stamp(25), 24))
+        self.assertTrue(workflow.interval_elapsed(self.stamp(0), 0))
+
+    def test_unusable_times_count_as_elapsed(self):
+        for stamp in (None, "", "yesterday", 5, "2026-01-01T00:00:00", self.stamp(-48)):
+            self.assertTrue(workflow.interval_elapsed(stamp, 24), stamp)
+
+
+class UpdateNoticeHelpers(object):
+    """Recording of git and the detached process, and shortcuts for the SessionStart tests."""
+
+    NEWER = "9.0.0"
+
+    def save_env(self):
+        self.saved_env = {k: os.environ.pop(k, None) for k in ("CI", "SPECLOOP_DISABLED", "CLAUDE_PROJECT_DIR")}
+        self.addCleanup(self.restore_env)
+        self.git_calls, self.spawns = [], []
+
+    def restore_env(self):
+        for key, value in self.saved_env.items():
+            os.environ.pop(key, None)
+            if value is not None:
+                os.environ[key] = value
+
+    @contextlib.contextmanager
+    def recording(self):
+        """Patch the git helpers, subprocess.run and the spawn helper to record their calls."""
+        patches = {(workflow, "update_git"): lambda *args: self.git_calls.append(args) or (False, "", "stub"),
+                   (workflow, "git"): lambda *args, **kwargs: self.git_calls.append(args),
+                   (subprocess, "run"): lambda *args, **kwargs: self.git_calls.append(args),
+                   (workflow, "spawn_update_check"): lambda root: self.spawns.append(root) or True}
+        saved = {key: getattr(*key) for key in patches}
+        for (owner, name), stub in patches.items():
+            setattr(owner, name, stub)
+        try:
+            yield
+        finally:
+            for (owner, name), original in saved.items():
+                setattr(owner, name, original)
+
+    def session_start(self):
+        with self.recording():
+            return workflow.handle_context(self.root, "SessionStart")
+
+    def notice(self):
+        output = self.session_start()
+        return output.get("systemMessage") if output else None
+
+    def write_local_config(self, config):
+        with open(os.path.join(self.base, "config.local.json"), "w", encoding="utf-8") as f:
+            json.dump(config, f)
+
+    def edit_update_state(self, **values):
+        data = workflow.load_update_state(self.root)
+        data.update(values)
+        workflow.save_update_state(self.root, data)
+
+    def write_manifest_source(self, source):
+        path = os.path.join(self.base, "manifest.json")
+        with open(path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        manifest.pop("source", None)
+        if source is not None:
+            manifest["source"] = source
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+
+    def fresh(self, hours_ago=0):
+        moment = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+        return moment.isoformat(timespec="seconds")
+
+    def record_remote_version(self):
+        self.fx.bump_remote_version(self.NEWER)
+        workflow.cmd_update_check(self.root)
+        self.assertEqual(self.NEWER, workflow.load_update_state(self.root).get("remote"))
+
+    def start_workflow(self):
+        with open(os.path.join(self.root, "spec.md"), "w", encoding="utf-8") as f:
+            f.write("# Spec\nDo the thing.")
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.assertEqual("active", workflow.load_state(self.root)["status"])
+
+    def set_status(self, status):
+        state = workflow.load_state(self.root)
+        state["status"] = status
+        workflow.save_state(self.root, state)
+
+    def assert_silent(self):
+        before = workflow.load_update_state(self.root)
+        self.assertIsNone(self.session_start())
+        self.assertEqual([], self.git_calls)
+        self.assertEqual([], self.spawns)
+        self.assertEqual(before, workflow.load_update_state(self.root))
+
+    def run_main(self):
+        """main(['context', 'SessionStart']) as the hook runs it; return (exit code, parsed output)."""
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+        out, stdin = io.StringIO(), sys.stdin
+        saved = workflow.spawn_update_check
+        workflow.spawn_update_check = lambda root: self.spawns.append(root) or True
+        sys.stdin = io.StringIO("{}")
+        try:
+            with contextlib.redirect_stdout(out):
+                code = workflow.main(["context", "SessionStart"])
+        finally:
+            sys.stdin = stdin
+            workflow.spawn_update_check = saved
+            del os.environ["CLAUDE_PROJECT_DIR"]
+        text = out.getvalue().strip()
+        return code, json.loads(text) if text else None
+
+
+class UpdateNoticeTest(UpdateNoticeHelpers, unittest.TestCase):
+    """SessionStart side of the update checker in a plain project; the clone is a directory
+    with a VERSION file, which is all that SessionStart reads from it."""
+
+    def setUp(self):
+        self.save_env()
+        self.root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        self.clone = os.path.join(self.root, "clone")
+        self.installed = "0.2.0"
+        shutil.copytree(KIT, self.base)
+        os.makedirs(self.clone)
+        self.bump_clone(self.installed)
+        with open(os.path.join(self.base, "VERSION"), "w", encoding="utf-8") as f:
+            f.write(self.installed + "\n")
+        with open(os.path.join(self.base, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"commands": []}, f)
+        self.write_manifest_source({"path": self.clone, "remote": "origin", "branch": "main", "checkable": True,
+                                    "url": "https://example.invalid/kit.git", "version": self.installed})
+
+    def bump_clone(self, version):
+        with open(os.path.join(self.clone, "VERSION"), "w", encoding="utf-8") as f:
+            f.write(version + "\n")
+
+    def test_notice_text(self):
+        self.write_local_config({"commandPrefix": "x-"})
+        self.write_manifest_source({"path": self.clone, "remote": "origin", "branch": "main", "checkable": True,
+                                    "url": "git@github.com:someone/specloop-fork.git"})
+        self.edit_update_state(remote=self.NEWER, checkedAt=self.fresh())
+        self.assertEqual(
+            "[specloop] 9.0.0 is available (installed %s, from github.com/someone/specloop-fork main). "
+            "Run /x-update to update, /x-update skip to skip this version, or /x-update never to turn "
+            "checks off." % self.installed, self.notice())
+
+    def test_notice_falls_back_to_the_clone_path_without_url(self):
+        self.write_manifest_source({"path": "/tools/specloop", "remote": "origin", "branch": "main",
+                                    "checkable": True})
+        self.edit_update_state(remote=self.NEWER, checkedAt=self.fresh())
+        self.assertIn("from /tools/specloop main)", self.notice())
+
+    def test_workflow_context_and_notice_are_merged(self):
+        self.start_workflow()
+        saved = workflow.update_notice
+        workflow.update_notice = lambda root, config, state: "the notice"
+        try:
+            output = workflow.handle_context(self.root, "SessionStart")
+        finally:
+            workflow.update_notice = saved
+        self.assertEqual("the notice", output["systemMessage"])
+        self.assertIn("additionalContext", output["hookSpecificOutput"])
+
+    def test_recent_check_does_not_spawn(self):
+        self.edit_update_state(checkedAt=self.fresh(hours_ago=23))
+        self.session_start()
+        self.assertEqual([], self.spawns)
+
+    def test_old_check_spawns(self):
+        self.edit_update_state(checkedAt=self.fresh(hours_ago=25))
+        self.session_start()
+        self.assertEqual([self.root], self.spawns)
+
+    def test_missing_check_time_spawns(self):
+        self.session_start()
+        self.assertEqual([self.root], self.spawns)
+
+    def test_interval_zero_always_spawns(self):
+        self.write_local_config({"update": {"intervalHours": 0}})
+        self.edit_update_state(checkedAt=self.fresh())
+        self.session_start()
+        self.session_start()
+        self.assertEqual([self.root, self.root], self.spawns)
+
+    def test_check_is_spawned_while_busy(self):
+        self.start_workflow()
+        self.session_start()
+        self.assertEqual([self.root], self.spawns)
+
+    def test_user_prompt_does_not_check(self):
+        self.bump_clone(self.NEWER)
+        with self.recording():
+            self.assertIsNone(workflow.handle_context(self.root, "UserPromptSubmit"))
+        self.assertEqual([], self.spawns)
+        self.assertEqual({}, workflow.load_update_state(self.root))
+
+    def test_mode_off_is_silent(self):
+        self.bump_clone(self.NEWER)
+        self.write_local_config({"update": {"mode": "off"}})
+        self.assert_silent()
+
+    def test_ci_is_silent(self):
+        self.bump_clone(self.NEWER)
+        os.environ["CI"] = "1"
+        self.assert_silent()
+
+    def test_old_install_is_silent_with_mode_off(self):
+        self.write_manifest_source(None)
+        self.write_local_config({"update": {"mode": "off"}})
+        self.assert_silent()
+
+    def test_same_version_is_not_announced_twice_within_the_interval(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(checkedAt=self.fresh())
+        self.assertIsNotNone(self.notice())
+        self.assertEqual(self.NEWER, workflow.load_update_state(self.root)["announced"]["version"])
+        self.assertIsNone(self.notice())
+        self.bump_clone("9.1.0")
+        self.assertIn("9.1.0", self.notice())
+
+    def test_announcement_repeats_after_the_interval(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(checkedAt=self.fresh(), announced={"version": self.NEWER, "at": self.fresh(25)})
+        self.assertIsNotNone(self.notice())
+        self.assertIsNone(self.notice())
+
+    def test_interval_zero_announces_every_session(self):
+        self.bump_clone(self.NEWER)
+        self.write_local_config({"update": {"intervalHours": 0}})
+        self.assertIsNotNone(self.notice())
+        self.assertIsNotNone(self.notice())
+
+    def test_skipped_version_is_not_announced(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(checkedAt=self.fresh(), skipped=self.NEWER)
+        self.assertIsNone(self.notice())
+
+    def test_check_error_gives_no_notice(self):
+        self.edit_update_state(checkedAt=self.fresh(), error="git fetch failed: boom")
+        self.assertIsNone(self.session_start())
+        self.assertEqual([], self.spawns)
+
+    def test_check_error_is_not_part_of_a_notice(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(checkedAt=self.fresh(), error="git fetch failed: boom")
+        notice = self.notice()
+        self.assertIn(self.NEWER, notice)
+        self.assertNotIn("boom", notice)
+
+    def test_old_install_gets_a_reinstall_hint_once(self):
+        self.write_manifest_source(None)
+        notice = self.notice()
+        self.assertIn("install.py <project>", notice)
+        self.assertIsNone(self.notice())
+        self.assertEqual([], self.git_calls)
+        self.assertEqual([], self.spawns)
+
+    def test_old_install_hint_waits_while_busy(self):
+        self.write_manifest_source(None)
+        self.start_workflow()
+        self.assertIsNone(self.notice())
+        self.set_status("done")
+        self.assertIn("install.py <project>", self.notice())
+
+    def test_non_checkable_install_shows_nothing(self):
+        self.write_manifest_source({"path": self.clone, "version": self.installed,
+                                    "checkable": False, "reason": "no upstream"})
+        self.bump_clone(self.NEWER)
+        self.assert_silent()
+
+    def test_missing_manifest_shows_nothing(self):
+        os.remove(os.path.join(self.base, "manifest.json"))
+        self.assert_silent()
+
+    def test_exception_in_update_path_keeps_normal_output(self):
+        self.start_workflow()
+        saved = workflow.update_notice
+        workflow.update_notice = lambda root, config, state: None
+        try:
+            expected = workflow.handle_context(self.root, "SessionStart")
+        finally:
+            workflow.update_notice = saved
+
+        def boom(root, config, state):
+            raise RuntimeError("update path broke")
+        workflow.update_notice = boom
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                output = workflow.handle_context(self.root, "SessionStart")
+        finally:
+            workflow.update_notice = saved
+        self.assertEqual(expected, output)
+        self.assertIn("update path broke", err.getvalue())
+
+    def test_hook_output_is_valid_json(self):
+        self.bump_clone(self.NEWER)
+        code, output = self.run_main()
+        self.assertEqual(0, code)
+        self.assertIn(self.NEWER, output["systemMessage"])
+
+    def test_hook_survives_an_unreadable_update_file(self):
+        self.bump_clone(self.NEWER)
+        with open(os.path.join(self.base, "update.json"), "w", encoding="utf-8") as f:
+            f.write("{broken")
+        code, output = self.run_main()
+        self.assertEqual(0, code)
+        self.assertIn(self.NEWER, output["systemMessage"])
+
+
+@unittest.skipUnless(gitfixture.git_available(), "git not available")
+class UpdateNoticeGitTest(UpdateNoticeHelpers, unittest.TestCase):
+    """SessionStart after a real install from a clone, and after a real update-check."""
+
+    def setUp(self):
+        self.save_env()
+        self.fx = gitfixture.GitFixture()
+        self.addCleanup(self.fx.cleanup)
+        result = self.fx.run_install("--test-command", "exit 0")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.root = self.fx.target
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        self.clone = self.fx.clone
+        self.installed = self.fx.read_version()
+        self.bump_clone = self.fx.bump_clone_version
+
+    def test_recorded_remote_version_gives_notice_while_idle(self):
+        self.record_remote_version()
+        notice = self.notice()
+        self.assertIn(self.NEWER + " is available", notice)
+        self.assertIn("installed " + self.installed, notice)
+        self.assertEqual([], self.git_calls)
+
+    def test_no_notice_while_busy(self):
+        self.record_remote_version()
+        self.start_workflow()
+        output = self.session_start()
+        self.assertNotIn("systemMessage", output)
+        self.assertIn("additionalContext", output["hookSpecificOutput"])
+        for status in ("ready", "stalled", "paused"):
+            self.set_status(status)
+            self.assertIsNone(self.notice(), status)
+        self.assertNotIn("announced", workflow.load_update_state(self.root))
+
+    def test_notice_after_workflow_is_done(self):
+        self.record_remote_version()
+        self.start_workflow()
+        self.assertIsNone(self.notice())
+        self.set_status("done")
+        self.assertIn(self.NEWER, self.notice())
+
+    def test_clone_only_bump_needs_no_git(self):
+        self.bump_clone(self.NEWER)
+        self.edit_update_state(checkedAt=self.fresh())
+        self.assertIn(self.NEWER + " is available", self.notice())
+        self.assertEqual([], self.git_calls)
+        self.assertEqual([], self.spawns)
+
+    def test_hook_survives_a_deleted_clone(self):
+        self.record_remote_version()
+        shutil.rmtree(self.clone, onerror=gitfixture._force_remove)
+        code, output = self.run_main()
+        self.assertEqual(0, code)
+        self.assertIn(self.NEWER, output["systemMessage"])
+
+    def test_hook_survives_a_deleted_clone_without_a_recorded_version(self):
+        shutil.rmtree(self.clone, onerror=gitfixture._force_remove)
+        self.assertEqual((0, None), self.run_main())
+
+    def test_hook_survives_missing_git(self):
+        self.bump_clone(self.NEWER)
+        saved = workflow.GIT
+        workflow.GIT = os.path.join(self.fx.root, "no-such-git")
+        try:
+            workflow.cmd_update_check(self.root)
+            self.assertIn("git", workflow.load_update_state(self.root)["error"])
+            code, output = self.run_main()
+        finally:
+            workflow.GIT = saved
+        self.assertEqual(0, code)
+        self.assertIn(self.NEWER, output["systemMessage"])
+        self.assertNotIn("could not be run", output["systemMessage"])
 
 
 class SpawnUpdateCheckTest(unittest.TestCase):

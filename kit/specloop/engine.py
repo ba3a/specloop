@@ -308,6 +308,8 @@ def display_url(url):
 GIT = "git"  # The git executable used by the update checker; tests point it elsewhere.
 UPDATE_LOCK = "update.lock"
 DEFAULT_UPDATE_TIMEOUT = 20
+DEFAULT_UPDATE_INTERVAL = 24
+REINSTALL_HINT = "reinstall"  # announced.version for the old-install hint, which names no version.
 
 
 def update_timeout(config):
@@ -433,6 +435,85 @@ def spawn_update_check(root):
     except Exception as e:
         print("[specloop] could not start the update check: %s" % e, file=sys.stderr)
         return False
+
+
+def is_busy(state):
+    """True while a workflow must not be disturbed: a state exists and its status is not done."""
+    return bool(state) and state.get("status") != DONE
+
+
+def update_interval(config):
+    """update.intervalHours as a non-negative number; the default when it is missing or invalid."""
+    update = config.get("update") if isinstance(config, dict) else None
+    value = update.get("intervalHours") if isinstance(update, dict) else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+        return value
+    return DEFAULT_UPDATE_INTERVAL
+
+
+def interval_elapsed(stamp, hours):
+    """False only when the ISO time `stamp` lies less than `hours` in the past. A missing or
+    invalid time counts as elapsed, and so does one in the future (a clock that moved back)."""
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds()
+    except (TypeError, ValueError):
+        return True
+    return not 0 <= age < hours * 3600
+
+
+def _announce_once(root, config, data, version):
+    """Record in update.json that `version` is being announced. Return False, recording nothing,
+    when the same version was already announced within intervalHours."""
+    announced = data.get("announced")
+    if (isinstance(announced, dict) and announced.get("version") == version
+            and not interval_elapsed(announced.get("at"), update_interval(config))):
+        return False
+    data["announced"] = {"version": version, "at": now()}
+    save_update_state(root, data)
+    return True
+
+
+def update_notice_text(root, config, source, version):
+    """The message that tells the user `version` is available from `source`."""
+    origin = " ".join(part for part in (display_url(source.get("url")) or source.get("path"),
+                                        source.get("branch")) if part)
+    update = cmd_name(config, "update")
+    return ("[specloop] %s is available (installed %s, from %s). Run %s to update, %s skip to skip this "
+            "version, or %s never to turn checks off." % (
+                version, _read_version_file(_path(root, "VERSION")), origin, update, update, update))
+
+
+def update_notice(root, config, state):
+    """The SessionStart side of the update checker: start the background check when it is due
+    and return the notice to show, or None. Errors of past checks are never part of a notice."""
+    if update_mode(config) == "off" or not os.path.isfile(_path(root, "manifest.json")):
+        return None
+    source = read_manifest_source(root)
+    data = load_update_state(root)
+    if source is None:
+        if is_busy(state) or not _announce_once(root, config, data, REINSTALL_HINT):
+            return None
+        return ("[specloop] Update checks are not enabled for this install. Reinstall once with "
+                "install.py <project> from your specloop clone to enable them.")
+    if source.get("checkable") is False:
+        return None
+    notice = None
+    version = available_version(root, source, data)
+    if version and not is_busy(state) and _announce_once(root, config, data, version):
+        notice = update_notice_text(root, config, source, version)
+    # Spawned last: the check keeps what it reads from update.json, so it must see the announcement.
+    if interval_elapsed(data.get("checkedAt"), update_interval(config)):
+        spawn_update_check(root)
+    return notice
+
+
+def safe_update_notice(root, state):
+    """update_notice for a hook: an exception is logged to stderr and gives no notice."""
+    try:
+        return update_notice(root, load_config(root), state)
+    except Exception as e:
+        print("[specloop] update check error: %s" % e, file=sys.stderr)
+        return None
 
 
 def _kit_text(root, name, custom=None):
@@ -1266,6 +1347,15 @@ def handle_pretool(root, hook_input):
 
 def handle_context(root, event):
     state = load_state(root)
+    output = workflow_context(root, event, state)
+    if event == "SessionStart":
+        notice = safe_update_notice(root, state)
+        if notice:
+            output = dict(output or {}, systemMessage=notice)
+    return output
+
+
+def workflow_context(root, event, state):
     if not state:
         return None
     config = load_config(root)
