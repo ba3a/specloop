@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1982,6 +1983,119 @@ class UpdateCheckTest(unittest.TestCase):
         os.utime(self.lock, (old, old))
         self.assertEqual("0.9.0", self.check()["remote"])
 
+    def write_during_git(self, **values):
+        """Wrap update_git so that the first call writes `values` into update.json, as another process would."""
+        real = workflow.update_git
+        done = []
+
+        def wrapper(*args):
+            if not done:
+                done.append(True)
+                data = workflow.load_update_state(self.root)
+                data.update(values)
+                workflow.save_update_state(self.root, data)
+            return real(*args)
+        saved = workflow.update_git
+        workflow.update_git = wrapper
+        self.addCleanup(setattr, workflow, "update_git", saved)
+
+    def test_key_written_during_the_check_survives(self):
+        self.fx.bump_remote_version("0.9.0")
+        self.write_during_git(skipped="0.8.0", announced={"version": "0.8.0", "at": "2026-01-01T00:00:00+00:00"})
+        data = self.check()
+        self.assertEqual("0.9.0", data["remote"])
+        self.assertEqual("0.8.0", data["skipped"])
+        self.assertEqual("0.8.0", data["announced"]["version"])
+
+    def test_check_overwrites_only_its_own_keys(self):
+        self.fx.bump_remote_version("0.9.0")
+        workflow.save_update_state(self.root, {"remote": "0.1.0", "error": "old", "extra": 1})
+        self.write_during_git(remote="0.2.0", extra=2)
+        data = self.check()
+        self.assertEqual("0.9.0", data["remote"])
+        self.assertIsNone(data["error"])
+        self.assertEqual(2, data["extra"])
+
+    def test_save_update_state_replaces_the_file_atomically(self):
+        workflow.save_update_state(self.root, {"skipped": "0.1.0"})
+        path = os.path.join(self.base, "update.json")
+        with mock.patch.object(workflow.os, "replace", side_effect=OSError("replace failed")):
+            with self.assertRaises(OSError):
+                workflow.save_update_state(self.root, {"skipped": "0.2.0"})
+        self.assertEqual({"skipped": "0.1.0"}, workflow.load_update_state(self.root))
+        self.assertEqual([], [n for n in os.listdir(self.base) if n.startswith("update.json.")])
+        workflow.save_update_state(self.root, {"skipped": "0.3.0"})
+        self.assertEqual({"skipped": "0.3.0"}, workflow.load_update_state(self.root))
+        self.assertTrue(os.path.exists(path))
+
+    def test_fresh_lock_returns_at_once_and_changes_nothing(self):
+        workflow.save_update_state(self.root, {"skipped": "0.1.0"})
+        with open(self.lock, "w") as f:
+            f.write("12345 2026-01-01T00:00:00+00:00\n")
+        before = workflow.load_update_state(self.root)
+        started = time.monotonic()
+        workflow.cmd_update_check(self.root)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(before, workflow.load_update_state(self.root))
+
+    def set_timeout(self, seconds):
+        path = os.path.join(self.base, "config.json")
+        with open(path, encoding="utf-8") as f:
+            config = json.load(f)
+        config.setdefault("update", {})["timeoutSec"] = seconds
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+
+    def age_lock(self, seconds):
+        with open(self.lock, "w") as f:
+            f.write("12345 2020-01-01T00:00:00+00:00\n")
+        old = time.time() - seconds
+        os.utime(self.lock, (old, old))
+
+    def test_stale_limit_is_twice_the_timeout(self):
+        self.set_timeout(100)
+        self.fx.bump_remote_version("0.9.0")
+        self.age_lock(150)
+        workflow.cmd_update_check(self.root)
+        self.assertIsNone(workflow.load_update_state(self.root).get("remote"))
+        self.assertTrue(os.path.exists(self.lock))
+        self.age_lock(250)
+        self.assertEqual("0.9.0", self.check()["remote"])
+
+    def test_stale_lock_with_a_token_is_replaced(self):
+        self.fx.bump_remote_version("0.9.0")
+        with open(self.lock, "w") as f:
+            json.dump({"token": "old", "at": time.time() - 3600}, f)
+        self.assertEqual("0.9.0", self.check()["remote"])
+
+    def test_lost_lock_is_not_removed_by_the_old_check(self):
+        newer = {"token": "newer-check", "at": time.time()}
+        real = workflow.update_git
+        taken = []
+
+        def replace_lock(*args):
+            if not taken:
+                taken.append(True)
+                with open(self.lock, "w") as f:
+                    json.dump(newer, f)
+            return real(*args)
+        workflow.update_git = replace_lock
+        self.addCleanup(setattr, workflow, "update_git", real)
+        workflow.cmd_update_check(self.root)
+        with open(self.lock, encoding="utf-8") as f:
+            self.assertEqual(newer, json.load(f))
+
+    def test_malformed_source_records_error_and_time(self):
+        good = {"path": self.fx.clone.replace("\\", "/"), "remote": "origin", "branch": "main"}
+        for key, value in (("path", 5), ("path", ["x"]), ("remote", {}), ("remote", 1), ("branch", 7),
+                           ("branch", None), ("path", "")):
+            self.write_source(dict(good, **{key: value}))
+            data = self.check()
+            self.assert_failed(data)
+            self.assertIn("path, remote or branch", data["error"], (key, value))
+        self.write_source("not a dict")
+        self.assert_failed(self.check())
+
     def test_lock_is_released_when_the_check_raises(self):
         saved = workflow._run_update_check
 
@@ -2179,6 +2293,30 @@ class UpdateNoticeTest(UpdateNoticeHelpers, unittest.TestCase):
                                     "checkable": True})
         self.edit_update_state(remote=self.NEWER, checkedAt=self.fresh())
         self.assertIn("from /tools/specloop main)", self.notice())
+
+    def test_key_written_while_announcing_is_kept(self):
+        self.edit_update_state(remote=self.NEWER, checkedAt=self.fresh())
+        real = workflow.available_version
+
+        def available_then_write(*args):
+            version = real(*args)
+            self.edit_update_state(skipped="0.0.1")  # another process, after update_notice read the file
+            return version
+        workflow.available_version = available_then_write
+        self.addCleanup(setattr, workflow, "available_version", real)
+        self.assertIn(self.NEWER, self.notice())
+        data = workflow.load_update_state(self.root)
+        self.assertEqual("0.0.1", data["skipped"])
+        self.assertEqual(self.NEWER, data["announced"]["version"])
+
+    def test_announce_once_reads_the_file_afresh(self):
+        self.edit_update_state(announced={"version": self.NEWER, "at": self.fresh()})
+        self.assertFalse(workflow._announce_once(self.root, workflow.load_config(self.root), self.NEWER))
+        self.edit_update_state(skipped="0.0.1")
+        self.assertTrue(workflow._announce_once(self.root, workflow.load_config(self.root), "9.1.0"))
+        data = workflow.load_update_state(self.root)
+        self.assertEqual("0.0.1", data["skipped"])
+        self.assertEqual("9.1.0", data["announced"]["version"])
 
     def test_workflow_context_and_notice_are_merged(self):
         self.start_workflow()

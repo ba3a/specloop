@@ -75,7 +75,7 @@ class StateCorrupt(Exception):
 
 
 class LockBusy(Exception):
-    """A lock was still taken after LOCK_WAIT_SEC."""
+    """A lock was still taken after the wait."""
 
 
 class Unchanged(Exception):
@@ -268,19 +268,24 @@ def save_state(root, state):
 class FileLock:
     """A lock file holding a random token and the time it was taken."""
 
-    def __init__(self, path, stale_after):
+    def __init__(self, path, stale_after, wait=None):
         self.path = path
         self.stale_after = stale_after
+        self.wait = LOCK_WAIT_SEC if wait is None else wait
         self.token = uuid.uuid4().hex
 
     def __enter__(self):
-        deadline = time.monotonic() + LOCK_WAIT_SEC
-        while not self._try_create():
+        """Take the lock, waiting up to `wait` seconds (default LOCK_WAIT_SEC); a stale lock is replaced. 0 tries once, then gives up."""
+        deadline = time.monotonic() + self.wait
+        while True:
+            if self._try_create():
+                return self
             self._remove_if_stale()
+            if self._try_create():
+                return self
             if time.monotonic() >= deadline:
                 raise LockBusy(self.path)
             time.sleep(LOCK_POLL_SEC)
-        return self
 
     def __exit__(self, *exc):
         self.release()
@@ -439,8 +444,15 @@ def load_update_state(root):
 
 def save_update_state(root, data):
     os.makedirs(_path(root), exist_ok=True)
-    with open(_path(root, UPDATE_FILE), "w", encoding="utf-8") as f:
-        f.write(json.dumps(data, indent=2) + "\n")
+    atomic_write(_path(root, UPDATE_FILE), json.dumps(data, indent=2) + "\n")
+
+
+def merge_update_state(root, **values):
+    """Write `values` into update.json, reloaded just now: keys written by others meanwhile stay."""
+    data = load_update_state(root)
+    data.update(values)
+    save_update_state(root, data)
+    return data
 
 
 def update_mode(config):
@@ -537,50 +549,24 @@ def update_git(path, timeout, *args):
     return True, output, None
 
 
-def _acquire_update_lock(root, timeout):
-    """Create update.lock atomically. A lock younger than 2 x timeout belongs to a live check
-    (return False); an older one is stale and replaced."""
-    path = _path(root, UPDATE_LOCK)
-    os.makedirs(_path(root), exist_ok=True)
-    for _ in range(2):
-        try:
-            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                age = time.time() - os.path.getmtime(path)
-            except OSError:
-                continue  # Released in the meantime: try again.
-            if age < 2 * timeout:
-                return False
-            try:
-                os.remove(path)
-            except OSError:
-                return False
-            continue
-        with os.fdopen(fd, "w") as f:
-            f.write("%d %s\n" % (os.getpid(), now()))
-        return True
-    return False
-
-
 def _run_update_check(root, config):
-    """Fetch the recorded source's upstream and record the result in update.json."""
+    """Fetch the recorded source's upstream and record the result in update.json. Only the keys
+    the check owns are written, into the file as it is after the network calls."""
     timeout = update_timeout(config)
-    data = load_update_state(root)
-    data.update(checkedAt=now(), installed=_read_version_file(_path(root, "VERSION")), clone=None)
+    result = dict(checkedAt=now(), installed=_read_version_file(_path(root, "VERSION")), clone=None)
     source = read_manifest_source(root)
     error = None
     if source is None:
         error = "no source recorded in manifest.json; reinstall with install.py to enable update checks"
     elif source.get("checkable") is False:
         error = "update checks unavailable: %s" % (source.get("reason") or "source is not checkable")
-    elif not source.get("path") or not source.get("remote") or not source.get("branch"):
+    elif not all(source.get(key) and isinstance(source.get(key), str) for key in ("path", "remote", "branch")):
         error = "the recorded source has no path, remote or branch"
     elif not os.path.isdir(source["path"]):
         error = "clone not found: %s" % source["path"]
     if error is None:
         path, ref = source["path"], "%s/%s" % (source["remote"], source["branch"])
-        data["clone"] = _read_version_file(os.path.join(path, "VERSION"))
+        result["clone"] = _read_version_file(os.path.join(path, "VERSION"))
         ok, _, error = update_git(path, timeout, "fetch", "--quiet", source["remote"], source["branch"])
         if ok:
             ok, remote_version, error = update_git(path, timeout, "show", ref + ":VERSION")
@@ -589,13 +575,14 @@ def _run_update_check(root, config):
         if ok and parse_version(remote_version) is None:
             error = "remote VERSION is not a MAJOR.MINOR.PATCH version: %r" % remote_version[:40]
         elif ok:
-            data.update(remote=remote_version.strip(), remoteCommit=remote_commit)
-    data["error"] = error
-    save_update_state(root, data)
+            result.update(remote=remote_version, remoteCommit=remote_commit)
+    result["error"] = error
+    merge_update_state(root, **result)
 
 
 def cmd_update_check(root):
-    """engine.py update-check: the network check, meant to run detached. Never raises, prints nothing."""
+    """engine.py update-check: the network check, meant to run detached. Never raises, prints nothing.
+    A lock younger than 2 x timeoutSec belongs to a running check: exit at once."""
     sink = io.StringIO()
     with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
         try:
@@ -603,15 +590,12 @@ def cmd_update_check(root):
                 config = load_config(root)
             except Exception:
                 config = {}
-            if not _acquire_update_lock(root, update_timeout(config)):
-                return
+            os.makedirs(_path(root), exist_ok=True)
             try:
-                _run_update_check(root, config)
-            finally:
-                try:
-                    os.remove(_path(root, UPDATE_LOCK))
-                except OSError:
-                    pass
+                with FileLock(_path(root, UPDATE_LOCK), 2 * update_timeout(config), wait=0):
+                    _run_update_check(root, config)
+            except LockBusy:
+                pass
         except Exception:
             pass
 
@@ -658,15 +642,15 @@ def interval_elapsed(stamp, hours):
     return not 0 <= age < hours * 3600
 
 
-def _announce_once(root, config, data, version):
+def _announce_once(root, config, version):
     """Record in update.json that `version` is being announced. Return False, recording nothing,
-    when the same version was already announced within intervalHours."""
-    announced = data.get("announced")
+    when the same version was already announced within intervalHours. Reads update.json afresh,
+    so a key written by another process since the caller's read stays."""
+    announced = load_update_state(root).get("announced")
     if (isinstance(announced, dict) and announced.get("version") == version
             and not interval_elapsed(announced.get("at"), update_interval(config))):
         return False
-    data["announced"] = {"version": version, "at": now()}
-    save_update_state(root, data)
+    merge_update_state(root, announced={"version": version, "at": now()})
     return True
 
 
@@ -688,7 +672,7 @@ def update_notice(root, config, state):
     source = read_manifest_source(root)
     data = load_update_state(root)
     if source is None:
-        if is_busy(state) or not _announce_once(root, config, data, REINSTALL_HINT):
+        if is_busy(state) or not _announce_once(root, config, REINSTALL_HINT):
             return None
         return ("[specloop] Update checks are not enabled for this install. Reinstall once with "
                 "install.py <project> from your specloop clone to enable them.")
@@ -696,7 +680,7 @@ def update_notice(root, config, state):
         return None
     notice = None
     version = available_version(root, source, data)
-    if version and not is_busy(state) and _announce_once(root, config, data, version):
+    if version and not is_busy(state) and _announce_once(root, config, version):
         notice = update_notice_text(root, config, source, version)
     # Spawned last: the check keeps what it reads from update.json, so it must see the announcement.
     if interval_elapsed(data.get("checkedAt"), update_interval(config)):
