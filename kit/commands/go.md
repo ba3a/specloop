@@ -1,5 +1,6 @@
 ---
 description: "specloop: start or resume the spec-driven workflow"
+disable-model-invocation: true
 allowed-tools: Bash(sh .claude/specloop/run.sh:*)
 ---
 !`sh .claude/specloop/run.sh go`

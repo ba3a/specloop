@@ -1,5 +1,6 @@
 ---
 description: "specloop: force-pass the current phase"
+disable-model-invocation: true
 allowed-tools: Bash(sh .claude/specloop/run.sh:*)
 ---
 !`sh .claude/specloop/run.sh advance`

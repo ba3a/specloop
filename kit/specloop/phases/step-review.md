@@ -18,10 +18,10 @@ Check that:
 - there are no correctness bugs, unhandled edge cases, or leftover debug code;
 - the code follows the project's conventions (CLAUDE.md, linters, existing patterns).
 
-Write `{run_dir}/review.md` with the findings (list each required change), and end it with exactly one verdict line:
+Write `{attempt_dir}/review.md` with the findings (list each required change), and end it with exactly one verdict line:
 - `VERDICT: APPROVE` if the step is ready to be committed, or
 - `VERDICT: CHANGES_REQUESTED` if anything must be fixed.
 
-If the review shows that the remaining plan itself is wrong (not just this step's implementation), write `{run_dir}/replan.md` instead of a verdict: explain what is wrong with the remaining plan and propose the change to the pending steps.
+If the review shows that the remaining plan itself is wrong (not just this step's implementation), write `{attempt_dir}/replan.md` instead of a verdict: explain what is wrong with the remaining plan and propose the change to the pending steps.
 
 Then finish your turn. When the review approves, specloop commits the step and starts the next one.

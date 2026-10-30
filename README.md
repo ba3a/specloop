@@ -29,6 +29,7 @@ Safety valves:
 - A spec or plan that looks too big for one plan → implement → review cycle triggers a warning (see [Large specs and plans](#large-specs-and-plans)).
 - Setting `SPECLOOP_DISABLED=1` makes every hook a no-op.
 - If the engine itself crashes, the hook logs to stderr and exits 0, so a crash never breaks your session.
+- An unreadable `state.json` is reported instead of ignored: Stop and the context hooks say that specloop is not enforcing anything, and `/sl-reset` clears it.
 
 ## Requirements
 
@@ -81,17 +82,57 @@ cd ~/tools/specloop && git pull
 
 An update replaces the engine, launcher, `defaults.json` and the shipped `phases/`. Your `config.json` and `overrides/` are never touched.
 
+### Git worktrees
+
+The kit is git-ignored, so a new `git worktree` does not get it. Run the installer once per worktree. If the project commits its hook settings, a worktree without the kit has the hooks but no `run.sh`: each hook fails with exit code 127, which Claude Code reports as a hook error and otherwise ignores, so nothing is enforced there.
+
 ## Commands
 
 | Command | What it does |
 |---------|--------------|
-| `/sl-spec <file>` | Load a spec; status `ready`. Clears the previous run's `run/` artifacts (plan, reviews). Claude summarizes the spec and waits. |
-| `/sl-feature <file>` | Load a spec in [feature mode](#feature-mode) (one commit per planned step). Also clears `run/`. |
-| `/sl-go` | Start, or resume after pause/stall. |
-| `/sl-pause` | Stop driving the session; keep the phase. |
-| `/sl-status` | Show the state: the raw state JSON in single mode, a step summary in feature mode. |
-| `/sl-advance` | Force-pass the current phase. |
-| `/sl-reset` | Delete the state and the `run/` artifacts. |
+| `/sl-spec <file>` | Load a spec; status `ready`. Clears the previous run's `run/` artifacts (plan, reviews). Refused while a workflow is `active`, `paused` or `stalled`; run `/sl-reset` first. Claude summarizes the spec and waits. |
+| `/sl-feature <file>` | Load a spec in [feature mode](#feature-mode) (one commit per planned step). Also clears `run/`, and is refused in the same cases. |
+| `/sl-go` | Start, or resume after pause/stall. The chat that types it becomes the [owner](#several-chats-in-one-project) of the workflow. |
+| `/sl-pause` | Stop driving the session; keep the phase. Works from any chat. |
+| `/sl-status` | Show the state: the raw state JSON in single mode, a step summary in feature mode. Works from any chat, and lists reviews that arrived too late to count. |
+| `/sl-advance` | Force-pass the current phase. Blocked in a chat that is not the owner while the workflow is `active`. |
+| `/sl-reset` | Delete the state and the `run/` artifacts. Blocked in a chat that is not the owner while the workflow is `active`. |
+
+Claude cannot run `/sl-spec`, `/sl-feature`, `/sl-go`, `/sl-advance`, `/sl-pause` or `/sl-reset` itself: their templates set `disable-model-invocation: true`, so taking over a workflow or force-passing a phase is always your decision.
+
+If specloop is busy (another process holds `state.lock`), a command prints one line asking you to retry and changes nothing.
+
+## Several chats in one project
+
+Hooks are configured per project, so they fire in every chat open in that folder. specloop keeps one workflow per checkout, and only one chat drives it.
+
+**Who drives.** The chat that last typed `/sl-go` is the workflow's owner, stored in `state.json` as `owner`. Only a typed command claims it: a prompt that merely mentions `/sl-go` does not, and neither do `/sl-spec` and `/sl-feature`. The owner stays across pause, stall and done; `/sl-reset` and loading a new spec remove it. With no owner, for example in a workflow started by an older version, every chat drives it as before until someone types `/sl-go`. `/sl-status` shows the owner in feature mode; in single mode it is in the state JSON.
+
+**What other chats see.** While the workflow is `active`, a chat that is not the owner is left alone:
+
+| Hook | In a chat that is not the owner |
+|------|---------------------------------|
+| Stop | Does nothing: no check, no iteration, no failure file. |
+| SessionStart | One line saying that another chat owns the workflow and how to take it over. No phase instructions. |
+| UserPromptSubmit | Adds no context. |
+| PreToolUse | Phase `allowEdits`, `feature.enforceDelegation` and `blockedCommandsUntilDone` do not apply. |
+
+**What stays blocked there, and why.** One checkout is still one working tree, so these apply in every chat:
+
+- specloop's own files (`state.json`, `config.json`, `defaults.json`, `engine.py`) cannot be edited.
+- `feature.blockedCommands` stay denied, because a `git checkout` or `git stash` in any chat would break the run.
+- Edits under `.claude/specloop/run/` are denied outside a subagent, so a stray review file cannot affect a gate.
+- `/sl-advance` and `/sl-reset` are blocked while `active`; the message names `/sl-go` and `/sl-pause`. A paused workflow whose chat is gone can still be advanced or reset from anywhere.
+
+**Takeover.** `/sl-go` in another chat replaces the owner. This is how you recover from a closed chat. It is also needed after `/clear`, which gives the chat a new session id; `--resume` and compaction keep it. The output starts with a line saying that this chat now drives the workflow. Stop any subagent still running in the previous chat: the takeover opens a new [review attempt](#review-attempts), so its result no longer counts. There is no heartbeat or timeout.
+
+**State files.** `state.json` and `run/steps.json` are replaced atomically, and every state change takes `state.lock` and reloads the file first, so two processes cannot overwrite each other and a `/sl-pause` is never lost. The lock is not held while a check or git runs. A Stop that finds its workflow changed during the check (paused, taken over, moved to another phase) drops the result. A pause during a step commit is kept: the commit stands, the next step is prepared and the workflow stays paused. If two Stops overlap, for example during a takeover, only one runs the check. `history` entries written by hooks carry `session`, the first 8 characters of the session id, and claims and takeovers are recorded there too.
+
+**Limits.**
+
+- This is not isolation. Two chats editing the same tracked files still collide, and `git add -A` in a step commit picks up new files from any chat. Use one `git worktree` per task if chats must not touch each other's work.
+- Claiming and blocking rely on `UserPromptSubmit` running before the command's shell line. Claude Code 2.1.309 does that. Claude Code 2.1.252 runs the shell line first and a block does not stop it, so there a takeover line appears only on the next `/sl-go`, and `/sl-advance` and `/sl-reset` are not blocked. Other versions were not tested.
+- A hook input without `session_id` counts as the owner, so older Claude Code versions keep working.
 
 ## Configuration
 
@@ -103,7 +144,7 @@ Files in `<project>/.claude/specloop/`:
 | `config.json` | **project** | Your overrides, deep-merged over `defaults.json`. |
 | `phases/<phase>.md` | kit (replaced on update) | Shipped phase instructions. |
 | `overrides/<phase>.md` | **project** | Your phase instructions; take precedence over `phases/`. |
-| `state.json`, `run/` | runtime | Current state, plan and review files. |
+| `state.json`, `state.lock`, `run/` | runtime | Current state, its lock, plan and review files. |
 
 Everything in this directory except `config.json` and `overrides/` is git-ignored.
 
@@ -146,9 +187,9 @@ Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of
 |--------------|--------|-------------|
 | `file` | `path` | the file exists and is non-empty |
 | `command` | `command` | the command exits 0 (run with `shell`, default `bash`, from the project root) |
-| `verdict` | `path`, `approve`, `reject`, `onReject` | the file contains `approve`. If it contains `reject`, the file is archived and the flow jumps to `onReject`. |
+| `verdict` | `path`, `approve`, `reject`, `onReject` | the file contains `approve`. If it contains `reject`, the flow jumps to `onReject`. |
 
-A phase with no check passes immediately. To remove a phase, set it to `null` and re-point the previous phase's `next`. For example, to skip review:
+A check's `path` may use `{attempt_dir}`. A phase with no check passes immediately. To remove a phase, set it to `null` and re-point the previous phase's `next`. For example, to skip review:
 
 ```json
 { "phases": { "implement": { "next": "done" }, "review": null } }
@@ -156,7 +197,17 @@ A phase with no check passes immediately. To remove a phase, set it to `null` an
 
 To add a phase, for example `docs` after `implement`, define it in `config.json`, point `implement.next` at it, and put the instructions in `overrides/docs.md`.
 
-In instruction files, `{spec}` becomes the spec path and `{run_dir}` becomes `.claude/specloop/run`.
+In instruction files, `{spec}` becomes the spec path, `{run_dir}` becomes `.claude/specloop/run`, and `{attempt_dir}` becomes the current attempt's directory.
+
+### Review attempts
+
+A review belongs to one attempt, so a result that arrives late never counts for the wrong step. `attempt` in the state goes up each time a phase with a `verdict` check is entered and on every takeover. A failed check or a pause and resume keeps it, so a subagent that is still running can finish.
+
+`{attempt_dir}` is `.claude/specloop/run/attempts/<step id or "single">-<attempt>`. The default `check.path` of both review phases is `{attempt_dir}/review.md`, and a replan request goes to `{attempt_dir}/replan.md`. A rejected attempt's review stays in its directory, and the phase brief lists the reviews of the current step.
+
+A file written into a closed attempt never affects the workflow, and `/sl-status` lists it, for example `late review for step 5 (attempt 1): CHANGES_REQUESTED, <path>`. A commit is never undone automatically; you decide what to do about a late rejection.
+
+`check.path` stays configurable. With a fixed path that does not use `{attempt_dir}`, a rejected review is renamed to `<name>-<iteration>` as before, and a file already there when the phase starts moves to `{attempt_dir}/late-review.md`.
 
 Whenever a check fails or a review requests changes, the full details (the complete check output or review text, not truncated) are written to `.claude/specloop/run/last-failure.md`. The file is removed when a phase passes and on `/sl-advance`.
 
@@ -168,9 +219,9 @@ Set `"delegate": true` on any phase (default `false`; no shipped phase enables i
 { "phases": { "implement": { "delegate": true } } }
 ```
 
-In a delegated phase the main session acts as an orchestrator. Instead of the bare phase instructions, `/sl-go`, the Stop hook and the session context give it an orchestration preamble (`phases/delegate.md`, overridable with `overrides/delegate.md`; `{brief}` marks where the brief goes). The preamble tells it to start exactly one subagent with a self-contained **phase brief**, not to read or edit files itself, and to finish its turn with a summary of at most 5 lines. The brief holds the rendered phase instructions and the files the subagent should read: the spec, `run/plan.md`, any `run/review*.md`, and `run/last-failure.md`. When a check fails, the Stop hook's message stays short and points at `run/last-failure.md` instead of including the full output.
+In a delegated phase the main session acts as an orchestrator. Instead of the bare phase instructions, `/sl-go`, the Stop hook and the session context give it an orchestration preamble (`phases/delegate.md`, overridable with `overrides/delegate.md`; `{brief}` marks where the brief goes). The preamble tells it to start exactly one subagent with a self-contained **phase brief**, not to read or edit files itself, to wait for a subagent that is already running instead of starting a second one, and to finish its turn with a summary of at most 5 lines. The brief holds the rendered phase instructions and the files the subagent should read: the spec, `run/plan.md`, the reviews of the current step, and `run/last-failure.md`. When a check fails, the Stop hook's message stays short and points at `run/last-failure.md` instead of including the full output.
 
-Gates still run only when the main session stops; specloop registers no `SubagentStop` hook. Note that a phase named `delegate` would share its instructions file with the preamble.
+Gates still run only when the main session stops; specloop registers no `SubagentStop` hook. A phase is not checked while its subagent runs: when Stop's `background_tasks` lists a `subagent`, `workflow` or `teammate`, in any phase, the Stop hook does nothing and costs no iteration. The subagent's completion wakes the chat, and the next Stop runs the gate. Shell tasks and monitors do not count, because a dev server must not hold a phase open forever. On a Claude Code version that does not send `background_tasks`, the check runs as usual. Note that a phase named `delegate` would share its instructions file with the preamble.
 
 ### Large specs and plans
 
@@ -242,9 +293,9 @@ Edits are restricted to `.claude/specloop/run/`. The gate passes when `steps.jso
 
 **Approval.** When the plan passes its gate, the run pauses. Review or edit `run/plan.md` and `run/steps.json`, then run `/sl-go`: it validates `steps.json` again (refusing with the errors if it is invalid), stores the approved copy in state as `approvedSteps`, and starts step 1.
 
-**Step cycle.** Each step runs through `feature.stepPhases`, starting at `feature.stepInitialPhase`. The default cycle mirrors single mode: `implement` (delegated, no edit restriction, checked with your test command from `phases.implement.check`), then `review` (delegated, edits limited to `run/`, verdict on `run/review.md`; `CHANGES_REQUESTED` goes back to `implement`). A step phase without a `check` reuses the check of the top-level phase with the same name. You can add phases (for example a per-step `lint`) or remove one with `null`, as in the top-level graph. Instructions come from `phases/step-<phase>.md` (`step-implement.md`, `step-review.md`), overridable in `overrides/`, with these placeholders on top of `{spec}` and `{run_dir}`: `{step_index}` (1-based), `{step_count}`, `{step_id}`, `{step_title}`, `{step_description}`, `{step_acceptance}` (a bullet list) and `{steps_file}`. `maxIterations` applies per step.
+**Step cycle.** Each step runs through `feature.stepPhases`, starting at `feature.stepInitialPhase`. The default cycle mirrors single mode: `implement` (delegated, no edit restriction, checked with your test command from `phases.implement.check`), then `review` (delegated, edits limited to `run/`, verdict on `{attempt_dir}/review.md`; `CHANGES_REQUESTED` goes back to `implement`). A step phase without a `check` reuses the check of the top-level phase with the same name. You can add phases (for example a per-step `lint`) or remove one with `null`, as in the top-level graph. Instructions come from `phases/step-<phase>.md` (`step-implement.md`, `step-review.md`), overridable in `overrides/`, with these placeholders on top of `{spec}` and `{run_dir}`: `{step_index}` (1-based), `{step_count}`, `{step_id}`, `{step_title}`, `{step_description}`, `{step_acceptance}` (a bullet list) and `{steps_file}`. `maxIterations` applies per step.
 
-When a step starts, the engine marks it `active`, resets the iteration counter, and moves the previous step's `run/review*.md` and `run/last-failure.md` into `run/steps/<id>/`. Status and commit changes are written both to `run/steps.json` and to `approvedSteps`.
+When a step starts, the engine marks it `active`, resets the iteration counter, and moves the previous step's `run/last-failure.md` (and any `run/review*.md` from a fixed `check.path`) into `run/steps/<id>/`. Reviews stay in `run/attempts/`. Status and commit changes are written both to `run/steps.json` and to `approvedSteps`.
 
 **Commits.** `commit` is a reserved pseudo-phase at the end of the step cycle (the default `review.next`). When a step reaches it, the Stop hook:
 
@@ -256,9 +307,9 @@ If the commit fails (for example a pre-commit hook rejects it), the step goes ba
 
 **Completion.** After the last step, the run is `done` and the final message lists every step as `<short sha> <title>` (or `(empty)`) with the branch name. Review the branch and open a pull request yourself: specloop never pushes, and `/sl-reset` never deletes the branch or its commits.
 
-**Replanning.** A step can reveal that the rest of the plan is wrong. During any step phase Claude may write `run/replan.md` explaining what is wrong with the remaining plan and proposing a change (the step instructions describe this). The Stop hook looks for it before running the phase check:
+**Replanning.** A step can reveal that the rest of the plan is wrong. During any step phase Claude may write `{attempt_dir}/replan.md` explaining what is wrong with the remaining plan and proposing a change (the step instructions describe this). The Stop hook looks for it before running the phase check:
 
-- `feature.replan: "stall"` (default): the run stalls. Read `run/replan.md`, optionally edit the pending or active steps in `run/steps.json`, then run `/sl-go`. The engine validates the file (schema plus the steps file protection rules against `approvedSteps`) and refuses with the errors if it fails, changing nothing. Otherwise it stores the new plan, archives the request to `run/replans/replan-N.md`, and restarts the current step at `feature.stepInitialPhase` with the iteration counter reset. If you removed the current step, the next pending step starts instead (or the run completes when none remain).
+- `feature.replan: "stall"` (default): the run stalls. Read the `replan.md` the message names, optionally edit the pending or active steps in `run/steps.json`, then run `/sl-go`. The engine validates the file (schema plus the steps file protection rules against `approvedSteps`) and refuses with the errors if it fails, changing nothing. Otherwise it stores the new plan, archives the request to `run/replans/replan-N.md`, and restarts the current step at `feature.stepInitialPhase` with the iteration counter reset. If you removed the current step, the next pending step starts instead (or the run completes when none remain).
 - `feature.replan: "auto"`: the engine enters `feature.replanPhase` (default `feature-replan`, defined in `feature.planPhases`, delegated, edits limited to `run/`, instructions in `phases/feature-replan.md`). A planning subagent rewrites only pending or active steps. The gate is the `steps` check (without `requireAllPending`) plus the steps file protection rules; when it passes, the engine continues as in the stall case. At most `feature.maxReplans` auto-replans run per run; a request beyond the cap stalls with a message saying so.
 
 The current step's uncommitted work stays in the working tree either way; the engine never stashes, resets or checks out. `/sl-advance` in the replan phase adopts the current `steps.json` if it passes the same checks.
@@ -274,6 +325,7 @@ The current step's uncommitted work stays in the working tree either way; the en
 spec: specs/big-feature.md
 branch: specloop/big-feature (base 1a2b3c4)
 phase: review, iteration 2
+owner: 3f2a9c1e (since 2026-10-30T07:03:47+00:00)
 steps (1/3 done):
   1  done     5d6e7f8  Add schema validation
   2  active   -        Wire the check
@@ -294,7 +346,7 @@ The single-mode size warnings do not apply in feature mode.
 | `feature.commitExclude` | `[".claude/specloop/"]` | Paths never included in step commits. |
 | `feature.commitMessage` | `"{type}: {step_title}\n\nspecloop step {step_index}/{step_count} ({step_id}) of {spec}"` | Commit message template; `{type}` is the step's `type` (default `feat`). |
 | `feature.pauseBetweenSteps` | `false` | Pause after each step's commit. |
-| `feature.replan` | `"stall"` | What a `run/replan.md` request does: `"stall"` for the user, or `"auto"` to run the replan phase. |
+| `feature.replan` | `"stall"` | What a `replan.md` request does: `"stall"` for the user, or `"auto"` to run the replan phase. |
 | `feature.replanPhase` | `"feature-replan"` | Phase (in `feature.planPhases`) that rewrites the remaining steps in `"auto"` mode. |
 | `feature.maxReplans` | `3` | Auto-replans allowed per run; later requests stall. |
 | `feature.enforceDelegation` | `false` | In delegated phases, deny the main session's edit tools outside `run/` (see [Hacks and limitations](#hacks-and-limitations)). |

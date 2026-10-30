@@ -38,6 +38,10 @@ class EngineTest(unittest.TestCase):
         with open(os.path.join(self.base, "run", name), "w") as f:
             f.write(text)
 
+    def write_attempt(self, name, text):
+        with open(os.path.join(workflow.attempt_path(self.root, self.state()), name), "w") as f:
+            f.write(text)
+
     def write_override(self, phase, text):
         os.makedirs(os.path.join(self.base, "overrides"), exist_ok=True)
         with open(os.path.join(self.base, "overrides", phase + ".md"), "w") as f:
@@ -82,7 +86,7 @@ class EngineTest(unittest.TestCase):
         out = workflow.handle_stop(self.root, {})
         self.assertIn("entering phase 'review'", out["reason"])
 
-        self.write_run("review.md", "Looks good.\nVERDICT: APPROVE")
+        self.write_attempt("review.md", "Looks good.\nVERDICT: APPROVE")
         out = workflow.handle_stop(self.root, {})
         self.assertNotIn("decision", out)
         self.assertEqual("done", self.state()["status"])
@@ -104,21 +108,21 @@ class EngineTest(unittest.TestCase):
         self.write_run("plan.md", "plan")
         workflow.handle_stop(self.root, {})
         workflow.handle_stop(self.root, {})
-        self.write_run("review.md", "Fix null check.\nVERDICT: CHANGES_REQUESTED")
+        self.write_attempt("review.md", "Fix null check.\nVERDICT: CHANGES_REQUESTED")
         out = workflow.handle_stop(self.root, {})
         self.assertEqual("block", out["decision"])
         self.assertIn("Fix null check", out["reason"])
         self.assertEqual("implement", self.state()["phase"])
         run = os.listdir(os.path.join(self.root, ".claude", "specloop", "run"))
         self.assertNotIn("review.md", run)
-        self.assertTrue(any(n.startswith("review-") for n in run))
+        self.assertTrue(os.path.exists(os.path.join(workflow.attempt_path(self.root, self.state()), "review.md")))
 
     def test_review_without_verdict_blocks(self):
         self.start()
         self.write_run("plan.md", "plan")
         workflow.handle_stop(self.root, {})
         workflow.handle_stop(self.root, {})
-        self.write_run("review.md", "Hmm.")
+        self.write_attempt("review.md", "Hmm.")
         out = workflow.handle_stop(self.root, {})
         self.assertIn("must contain", out["reason"])
         self.assertEqual("review", self.state()["phase"])
@@ -370,7 +374,10 @@ class EngineTest(unittest.TestCase):
     def test_init_removes_stale_run_directory(self):
         self.start()
         self.write_run("plan.md", "old plan")
-        self.write_run("review.md", "VERDICT: APPROVE")
+        self.write_attempt("review.md", "VERDICT: APPROVE")
+        for _ in range(3):
+            workflow.cmd_advance(self.root)
+        self.assertEqual("done", self.state()["status"])
         workflow.cmd_init(self.root, "spec.md")
         self.assertEqual([], os.listdir(os.path.join(self.base, "run")))
         workflow.cmd_go(self.root)
@@ -436,6 +443,7 @@ class EngineTest(unittest.TestCase):
         self.assertIn("pending", out["reason"])
         self.assertEqual("plan", self.state()["phase"])
 
+        workflow.cmd_reset(self.root)
         self.use_steps_check(require_all_pending=False)
         self.write_run("steps.json", json.dumps(data))
         self.assertIn("entering phase 'implement'", workflow.handle_stop(self.root, {})["reason"])
@@ -479,6 +487,7 @@ class EngineTest(unittest.TestCase):
                 self.set_test_command("exit 1")
             else:
                 self.set_config(config)
+            workflow.cmd_reset(self.root)
             workflow.cmd_init(self.root, "spec.md")
             state = self.state()
             state["status"] = "active"
@@ -548,12 +557,12 @@ class EngineTest(unittest.TestCase):
         self.write_run("plan.md", "plan")
         workflow.handle_stop(self.root, {})
         workflow.handle_stop(self.root, {})
-        self.write_run("review.md", "SECRET-DETAIL fix the null check.\nVERDICT: CHANGES_REQUESTED")
+        self.write_attempt("review.md", "SECRET-DETAIL fix the null check.\nVERDICT: CHANGES_REQUESTED")
         reason = workflow.handle_stop(self.root, {})["reason"]
         self.assertIn("Back to phase 'implement'", reason)
         self.assertIn(".claude/specloop/run/last-failure.md", reason)
         self.assertNotIn("SECRET-DETAIL", reason)
-        self.assertIn("- `.claude/specloop/run/review-3.md`", reason)
+        self.assertIn("- `.claude/specloop/run/attempts/single-1/review.md`", reason)
         self.assertIn("exactly one subagent", reason)
 
     def test_brief_lists_review_files_and_last_failure(self):
@@ -599,7 +608,7 @@ class EngineTest(unittest.TestCase):
         workflow.handle_stop(self.root, {})
         workflow.handle_stop(self.root, {})
         review = "Fix it.\n" + "detail " * 1000 + "\nVERDICT: CHANGES_REQUESTED"
-        self.write_run("review.md", review)
+        self.write_attempt("review.md", review)
         workflow.handle_stop(self.root, {})
         self.assertEqual(review, self.last_failure())
 
@@ -870,6 +879,10 @@ class FeatureModeTest(unittest.TestCase):
     def write_run(self, name, text):
         self.write(os.path.join(".claude", "specloop", "run", name), text)
 
+    def write_attempt(self, name, text):
+        attempt = os.path.relpath(workflow.attempt_path(self.root, self.state()), self.root)
+        self.write(os.path.join(attempt, name), text)
+
     def set_config(self, config):
         with open(os.path.join(self.base, "config.json"), "w") as f:
             json.dump(config, f)
@@ -940,9 +953,11 @@ class FeatureModeTest(unittest.TestCase):
 
     def test_existing_branch_gets_numeric_suffix(self):
         self.start()
+        workflow.cmd_reset(self.root)
         self.git("checkout", "-q", self.start_branch)
         self.start()
         self.assertEqual("specloop/my-big-feature-2", self.current_branch())
+        workflow.cmd_reset(self.root)
         self.git("checkout", "-q", self.start_branch)
         self.start()
         self.assertEqual("specloop/my-big-feature-3", self.state()["branch"])
@@ -1138,7 +1153,7 @@ class FeatureModeTest(unittest.TestCase):
         for rel, text in (files or {}).items():
             self.write(rel, text)
         workflow.handle_stop(self.root, {})  # implement -> review
-        self.write_run("review.md", "Review notes.\nVERDICT: %s" % verdict)
+        self.write_attempt("review.md", "Review notes.\nVERDICT: %s" % verdict)
         return workflow.handle_stop(self.root, {})  # review -> commit (or back to implement)
 
     def commit_count(self):
@@ -1171,7 +1186,7 @@ class FeatureModeTest(unittest.TestCase):
         self.assertIn("Step 1/2 committed", out["reason"])
         self.assertIn("Document it", out["reason"])
         self.assertEqual(2, self.state()["stepId"])
-        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "steps", "1", "review.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "attempts", "1-1", "review.md")))
         self.assertFalse(os.path.exists(os.path.join(self.base, "run", "review.md")))
 
         out = self.run_step({"README.txt": "docs\n"})
@@ -1270,7 +1285,7 @@ class FeatureModeTest(unittest.TestCase):
     def test_iterations_reset_per_step(self):
         self.approve()
         workflow.handle_stop(self.root, {})
-        self.write_run("review.md", "VERDICT: CHANGES_REQUESTED")
+        self.write_attempt("review.md", "VERDICT: CHANGES_REQUESTED")
         workflow.handle_stop(self.root, {})
         self.assertEqual(2, self.state()["iter"])
         self.run_step({"a.py": "a = 1\n"})
@@ -1388,6 +1403,7 @@ class FeatureModeTest(unittest.TestCase):
                 'iteration 0, branch=specloop/my-big-feature')
         self.assertTrue(out.startswith(step + "\n"), out[:200])
         self.assertTrue(self.context().startswith(step))
+        workflow.cmd_reset(self.root)
         workflow.cmd_init(self.root, "spec.md", mode="feature")
         self.assertEqual("[specloop] feature planning, phase=feature-plan, iteration 0, branch=-",
                          workflow.header(self.state()))
@@ -1410,6 +1426,7 @@ class FeatureModeTest(unittest.TestCase):
             "spec: spec.md",
             "branch: specloop/my-big-feature-2 (base %s)" % base,
             "phase: implement, iteration 0",
+            "owner: none (every chat drives this workflow)",
             "steps (1/2 done):",
             "  1  done    %s  Add steps.json schema validation" % sha,
             "  2  active  -        Document it",
@@ -1426,7 +1443,7 @@ class FeatureModeTest(unittest.TestCase):
 
     def request_replan(self):
         self.write("wip.py", "work = 'in progress'\n")
-        self.write_run("replan.md", "Step 2 is wrong: it should be split.\n")
+        self.write_attempt("replan.md", "Step 2 is wrong: it should be split.\n")
         return workflow.handle_stop(self.root, {})
 
     def assertWipSurvives(self):
@@ -1469,7 +1486,7 @@ class FeatureModeTest(unittest.TestCase):
         out = workflow.cmd_go(self.root)
         self.assertIn("steps[0] (id 1)", out)
         self.assertEqual(before, self.state_bytes())
-        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "replan.md")))
+        self.assertTrue(os.path.exists(workflow.replan_path(self.root, self.state())))
 
     def test_stall_resume_with_current_step_removed_starts_next_or_completes(self):
         self.approve(self.three_steps())
@@ -1492,7 +1509,7 @@ class FeatureModeTest(unittest.TestCase):
         out = self.request_replan()
         self.assertEqual("block", out["decision"])
         self.assertIn("feature-replan", out["reason"])
-        self.assertIn("- `.claude/specloop/run/replan.md`", out["reason"])
+        self.assertIn("- `.claude/specloop/run/attempts/1-0/replan.md`", out["reason"])
         self.assertIn("## Phase: feature-replan", out["reason"])
         state = self.state()
         self.assertEqual(("active", "feature-replan", 0, 1), (state["status"], state["phase"], state["iter"],
@@ -1549,9 +1566,9 @@ class FeatureModeTest(unittest.TestCase):
         self.assertEqual("Advanced", self.state()["approvedSteps"]["steps"][1]["title"])
 
     def test_step_instructions_mention_replan(self):
-        self.assertIn(".claude/specloop/run/replan.md", self.approve())
+        self.assertIn(".claude/specloop/run/attempts/1-0/replan.md", self.approve())
         self.write("a.py", "a = 1\n")
-        self.assertIn(".claude/specloop/run/replan.md", workflow.handle_stop(self.root, {})["reason"])
+        self.assertIn(".claude/specloop/run/attempts/1-1/replan.md", workflow.handle_stop(self.root, {})["reason"])
 
     # --- delegation enforcement --------------------------------------------------
 
@@ -1625,7 +1642,7 @@ class FeatureModeTest(unittest.TestCase):
         for name in ("a.py", "b.md"):
             self.write(name, "content of %s\n" % name)
             self.assertIn("entering phase 'review'", self.stop()["reason"])
-            self.write_run("review.md", "Fine.\nVERDICT: APPROVE\n")
+            self.write_attempt("review.md", "Fine.\nVERDICT: APPROVE\n")
             final = self.stop()
 
         self.assertIn("All 2 steps are finished on branch specloop/my-big-feature", final["systemMessage"])
@@ -1642,7 +1659,7 @@ class FeatureModeTest(unittest.TestCase):
 
     def test_replan_file_ignored_during_planning(self):
         self.start()
-        self.write_run("replan.md", "not yet")
+        self.write_attempt("replan.md", "not yet")
         self.pass_planning()
         self.assertTrue(self.state()["awaitingApproval"])
 
