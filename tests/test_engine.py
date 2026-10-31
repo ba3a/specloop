@@ -2868,17 +2868,16 @@ class UpdateCommandTest(UpdateNoticeHelpers, unittest.TestCase):
             self.assertIn(status, out)
             self.assertEqual(before, workflow.load_update_state(self.root), status)
 
-    def test_no_argument_reports_what_is_available_when_idle(self):
-        self.fx.bump_remote_version(self.NEWER)
-        out = self.update()
-        self.assertIn(self.NEWER + " is available", out)
-        self.assertEqual(self.installed, self.fx.read_version())
-
     def test_no_argument_with_a_finished_workflow_is_not_busy(self):
         self.start_workflow()
         self.set_status("done")
         self.fx.bump_remote_version(self.NEWER)
-        self.assertIn(self.NEWER + " is available", self.update())
+        self.assertIn("Updated %s -> %s" % (self.installed, self.NEWER), self.update())
+
+    def test_no_argument_without_a_newer_version_is_up_to_date(self):
+        kit = self.kit_snapshot()
+        self.assertIn("up to date", self.update())
+        self.assertEqual(kit, self.kit_snapshot())
 
     def test_uses_the_configured_prefix(self):
         self.write_local_config({"commandPrefix": "x-"})
@@ -2901,6 +2900,197 @@ class UpdateCommandTest(UpdateNoticeHelpers, unittest.TestCase):
         out = self.update("check")
         self.assertIn("unavailable", out)
         self.assertIn("no upstream branch", out)
+
+    # -- applying an update ----------------------------------------------------------------
+
+    def manifest_source(self, target=None):
+        path = os.path.join(target or self.root, ".claude", "specloop", "manifest.json")
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)["source"]
+
+    def installed_version(self):
+        with open(os.path.join(self.base, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip()
+
+    @contextlib.contextmanager
+    def recorded_git(self):
+        """Record the arguments of every git call the update code makes, and still run them."""
+        calls, original = [], workflow.update_git
+
+        def wrapper(path, timeout, *args):
+            calls.append(args)
+            return original(path, timeout, *args)
+
+        workflow.update_git = wrapper
+        try:
+            yield calls
+        finally:
+            workflow.update_git = original
+
+    def clone_path(self):
+        """The clone as the installer records it in the manifest, with forward slashes."""
+        return self.fx.clone.replace("\\", "/")
+
+    def assert_refused(self, out, *fragments):
+        self.assertIn("Not updated", out)
+        for fragment in fragments:
+            self.assertIn(fragment, out)
+        self.assertNotIn("[specloop] Updated", out)
+        self.assertNotIn("new Claude Code session", out)
+
+    def test_remote_ahead_fast_forwards_the_clone_and_reinstalls(self):
+        remote_head = self.fx.bump_remote_version(self.NEWER)
+        old_head = self.fx.head()
+        out = self.update()
+        self.assertEqual(remote_head, self.fx.head())
+        self.assertEqual(self.NEWER, self.fx.read_version())
+        self.assertEqual(self.NEWER, self.installed_version())
+        source = self.manifest_source()
+        self.assertEqual(remote_head, source["commit"])
+        self.assertEqual(self.NEWER, source["version"])
+        self.assertIn("Updated %s -> %s" % (self.installed, self.NEWER), out)
+        self.assertIn("Changes:", out)
+        self.assertIn(remote_head[:7] + " Release " + self.NEWER, out)
+        self.assertNotIn(old_head[:7], out.split("Changes:")[1])
+        self.assertIn("new Claude Code session", out)
+        self.assertEqual(self.NEWER, workflow.load_update_state(self.root)["installed"])
+        self.assertEqual("", self.fx.git(self.fx.clone, "status", "--porcelain"))
+
+    def test_the_log_is_limited_to_twenty_lines(self):
+        for patch in range(1, 23):
+            self.fx.bump_remote_version("9.0.%d" % patch)
+        out = self.update()
+        changes = out.split("Changes:\n")[1].splitlines()
+        releases = [line for line in changes if " Release 9.0." in line]
+        self.assertEqual(20, len(releases))
+        self.assertIn("Release 9.0.22", releases[0])
+        self.assertIn("... and 2 more", out)
+        self.assertEqual("9.0.22", self.installed_version())
+
+    def test_clone_only_ahead_reinstalls_without_a_merge(self):
+        clone_head = self.fx.bump_clone_version(self.NEWER)
+        with self.recorded_git() as calls:
+            out = self.update()
+        self.assertTrue(calls)
+        self.assertFalse([call for call in calls if call[0] == "merge"], calls)
+        self.assertEqual(clone_head, self.fx.head())
+        self.assertEqual(self.NEWER, self.installed_version())
+        self.assertEqual(clone_head, self.manifest_source()["commit"])
+        self.assertIn("Updated %s -> %s" % (self.installed, self.NEWER), out)
+        self.assertIn(clone_head[:7] + " Release " + self.NEWER, out)
+        self.assertIn("new Claude Code session", out)
+
+    def test_a_dirty_clone_is_refused_and_nothing_changes(self):
+        self.fx.bump_remote_version(self.NEWER)
+        with open(os.path.join(self.fx.clone, "scratch.txt"), "w", encoding="utf-8") as f:
+            f.write("work in progress")
+        kit, head = self.kit_snapshot(), self.fx.head()
+        self.assert_refused(self.update(), self.clone_path(), "uncommitted changes")
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(head, self.fx.head())
+        self.assertEqual(self.installed, self.fx.read_version())
+        self.assertEqual("?? scratch.txt", self.fx.git(self.fx.clone, "status", "--porcelain"))
+
+    def test_a_modified_tracked_file_counts_as_dirty(self):
+        self.fx.bump_remote_version(self.NEWER)
+        with open(os.path.join(self.fx.clone, "install.py"), "a", encoding="utf-8") as f:
+            f.write("\n# local edit\n")
+        kit, head = self.kit_snapshot(), self.fx.head()
+        self.assert_refused(self.update(), "uncommitted changes")
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(head, self.fx.head())
+
+    def test_a_local_commit_that_is_not_on_the_remote_is_refused(self):
+        self.fx.bump_remote_version(self.NEWER)
+        with open(os.path.join(self.fx.clone, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("local")
+        self.fx.git(self.fx.clone, "add", "notes.txt")
+        self.fx.git(self.fx.clone, "commit", "-q", "-m", "Local work")
+        kit, head = self.kit_snapshot(), self.fx.head()
+        self.assert_refused(self.update(), self.clone_path(), "fast-forward")
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(head, self.fx.head())
+        self.assertEqual(self.installed, self.fx.read_version())
+        self.assertEqual("", self.fx.git(self.fx.clone, "status", "--porcelain"))
+
+    def test_a_clone_on_another_branch_is_refused(self):
+        self.fx.bump_remote_version(self.NEWER)
+        self.fx.git(self.fx.clone, "checkout", "-q", "-b", "elsewhere")
+        kit, head = self.kit_snapshot(), self.fx.head()
+        self.assert_refused(self.update(), self.clone_path(), "elsewhere", gitfixture.BRANCH)
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(head, self.fx.head())
+        self.assertEqual("elsewhere", self.fx.git(self.fx.clone, "rev-parse", "--abbrev-ref", "HEAD"))
+
+    def test_a_failed_check_does_not_fast_forward_to_a_stale_remote_version(self):
+        self.record_remote_version()
+        shutil.rmtree(self.fx.remote, onerror=gitfixture._force_remove)
+        kit, head = self.kit_snapshot(), self.fx.head()
+        self.assert_refused(self.update(), "check")
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(head, self.fx.head())
+
+    def test_apply_update_refuses_while_busy(self):
+        self.fx.bump_remote_version(self.NEWER)
+        self.start_workflow()
+        kit, head = self.kit_snapshot(), self.fx.head()
+        ok, message = workflow.apply_update(self.root, workflow.load_config(self.root))
+        self.assertFalse(ok)
+        self.assertIn("/sl-reset", message)
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(head, self.fx.head())
+
+    def test_apply_update_without_a_newer_version_says_so(self):
+        ok, message = workflow.apply_update(self.root, workflow.load_config(self.root))
+        self.assertTrue(ok)
+        self.assertIn("up to date", message)
+
+    def test_a_skipped_version_is_not_applied(self):
+        self.record_remote_version()
+        self.update("skip")
+        kit = self.kit_snapshot()
+        self.assertIn("up to date", self.update())
+        self.assertEqual(kit, self.kit_snapshot())
+        self.assertEqual(self.installed, self.fx.read_version())
+
+    def test_the_recorded_install_options_are_repeated(self):
+        for args in (("--no-gitignore",), ("--scope", "local")):
+            fx = gitfixture.GitFixture()
+            self.addCleanup(fx.cleanup)
+            result = fx.run_install("--test-command", "exit 0", *args)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            fx.bump_remote_version(self.NEWER)
+            workflow.cmd_update_check(fx.target)
+            ok, message = workflow.apply_update(fx.target, workflow.load_config(fx.target))
+            self.assertTrue(ok, message)
+            claude = os.path.join(fx.target, ".claude")
+            self.assertEqual(self.NEWER, self.manifest_source(fx.target)["version"])
+            if args[0] == "--no-gitignore":
+                self.assertFalse(os.path.exists(os.path.join(fx.target, ".gitignore")))
+            else:
+                self.assertTrue(os.path.exists(os.path.join(claude, "settings.local.json")))
+                self.assertFalse(os.path.exists(os.path.join(claude, "settings.json")))
+                self.assertEqual("local", self.manifest_source(fx.target)["installArgs"]["scope"])
+
+    def test_a_failing_installer_is_reported(self):
+        self.fx.bump_clone_version(self.NEWER)
+        with open(os.path.join(self.fx.clone, "install.py"), "w", encoding="utf-8") as f:
+            f.write("import sys\nprint('installer exploded')\nsys.exit(3)\n")
+        out = self.update()
+        self.assertIn("installer failed (exit 3)", out)
+        self.assertIn("installer exploded", out)
+        self.assertNotIn("new Claude Code session", out)
+
+    def test_the_config_files_survive_an_update(self):
+        self.write_local_config({"update": {"intervalHours": 5}})
+        with open(os.path.join(self.base, "config.json"), encoding="utf-8") as f:
+            config = f.read()
+        self.fx.bump_remote_version(self.NEWER)
+        self.assertIn("[specloop] Updated", self.update())
+        with open(os.path.join(self.base, "config.json"), encoding="utf-8") as f:
+            self.assertEqual(config, f.read())
+        with open(self.local_config_path(), encoding="utf-8") as f:
+            self.assertEqual({"update": {"intervalHours": 5}}, json.load(f))
 
     def run_main(self, *args):
         os.environ["CLAUDE_PROJECT_DIR"] = self.root

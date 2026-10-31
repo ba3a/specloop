@@ -85,7 +85,8 @@ class GitFixture(object):
             self.configure(path)
 
     def clone_remote(self, dest):
-        self.git(self.root, "clone", "-q", self.remote, dest)
+        # No line-ending conversion on checkout (a global core.autocrlf=true would make the clone look modified).
+        self.git(self.root, "-c", "core.autocrlf=false", "clone", "-q", self.remote, dest)
         self.configure(dest)
 
     def _build(self):

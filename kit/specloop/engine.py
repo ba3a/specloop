@@ -2267,13 +2267,118 @@ def update_report(root, source, data, version):
 
 
 def check_now(root, config, source):
-    """Run the network check synchronously, ignoring intervalHours. Return (lines, version):
-    the report and the available version. version is None with a busy lock (lines say so)."""
+    """Run the network check synchronously, ignoring intervalHours. Return (lines, version, checked):
+    the report, the available version and whether the check ran (False with a busy lock; lines say so)."""
     if not run_update_check_locked(root, config):
-        return ["A background update check is running. Try again in a moment; nothing was changed."], None
+        return ["A background update check is running. Try again in a moment; nothing was changed."], None, False
     data = load_update_state(root)
     version = available_version(root, source, data)
-    return update_report(root, source, data, version), version
+    return update_report(root, source, data, version), version, True
+
+
+INSTALL_TIMEOUT_SEC = 180  # Upper limit for the clone's install.py run.
+UPDATE_LOG_LINES = 20  # Most git log lines printed after an update.
+
+
+def installer_args(source):
+    """Command line options that repeat the recorded install (manifest source.installArgs)."""
+    recorded = source.get("installArgs")
+    recorded = recorded if isinstance(recorded, dict) else {}
+    args = []
+    if recorded.get("scope") in ("project", "local"):
+        args += ["--scope", recorded["scope"]]
+    if recorded.get("gitignore") is False:
+        args.append("--no-gitignore")
+    return args
+
+
+def fast_forward_clone(config, source):
+    """Fast-forward the clone to its recorded upstream. Return None on success, else the reason it
+    was refused. Nothing is changed unless the result is None. Never stashes, switches branches,
+    merges or rebases."""
+    path, timeout = source["path"], update_timeout(config)
+    ref = "%s/%s" % (source["remote"], source["branch"])
+    ok, output, error = update_git(path, timeout, "status", "--porcelain")
+    if not ok:
+        return "cannot read the state of %s (%s). Nothing was changed." % (path, error)
+    if output:
+        return ("%s has uncommitted changes, so it was not updated. Commit, stash or discard them there, "
+                "then run %s again." % (path, cmd_name(config, "update")))
+    ok, output, error = update_git(path, timeout, "rev-parse", "--abbrev-ref", "HEAD")
+    if not ok:
+        return "cannot read the current branch of %s (%s). Nothing was changed." % (path, error)
+    if output != source["branch"]:
+        return ("%s is on branch %s, not %s, so it was not updated. Check out %s there, then run %s again." % (
+            path, output, source["branch"], source["branch"], cmd_name(config, "update")))
+    ok, _, error = update_git(path, timeout, "merge", "--ff-only", ref)
+    if not ok:
+        return ("%s cannot be fast-forwarded to %s (%s). It probably has commits that are not on the remote. "
+                "Nothing was changed; bring it up to date yourself, then run %s again." % (
+                    path, ref, error, cmd_name(config, "update")))
+    return None
+
+
+def update_changes(config, source, old_commit):
+    """Lines of `git log --oneline <old commit>..HEAD` of the clone, at most UPDATE_LOG_LINES; [] when unknown."""
+    timeout = update_timeout(config)
+    ok, new_commit, _ = update_git(source["path"], timeout, "rev-parse", "HEAD")
+    if not ok or not old_commit or old_commit == new_commit:
+        return []
+    ok, output, _ = update_git(source["path"], timeout, "log", "--oneline", "%s..%s" % (old_commit, new_commit))
+    lines = output.splitlines() if ok else []
+    if len(lines) > UPDATE_LOG_LINES:
+        lines = lines[:UPDATE_LOG_LINES] + ["... and %d more" % (len(lines) - UPDATE_LOG_LINES)]
+    return lines
+
+
+def apply_update(root, config):
+    """Update the kit from the recorded clone. Return (ok, message).
+
+    Refuses while a workflow is busy. When the last recorded remote version is ahead of the clone,
+    the clone is fast-forwarded first (see fast_forward_clone); then the clone's install.py is run
+    for this project with the recorded options."""
+    state = load_state(root)
+    if is_busy(state):
+        return False, ("[specloop] A workflow is busy (status %s), so the kit is not updated now. Let it finish, "
+                       "or run %s to end it, then run %s again." % (
+                           state.get("status"), cmd_name(config, "reset"), cmd_name(config, "update")))
+    source = read_manifest_source(root)
+    reason = update_unavailable(source)
+    if reason:
+        return False, "[specloop] Update checks are unavailable: %s." % reason.rstrip(".")
+    data = load_update_state(root)
+    installed = _read_version_file(_path(root, "VERSION"))
+    if available_version(root, source, data) is None:
+        return True, "[specloop] Already up to date (installed %s)." % (installed or "unknown")
+    clone_version = _read_version_file(os.path.join(source["path"], "VERSION"))
+    remote_version = parse_version(data.get("remote"))
+    if not os.path.isdir(source["path"]):
+        return False, "[specloop] Not updated: clone not found: %s" % source["path"]
+    if remote_version is not None and remote_version > (parse_version(clone_version) or (0, 0, 0)):
+        if data.get("error"):
+            return False, ("[specloop] Not updated: the last check of the remote failed (%s), so %s was not "
+                           "fast-forwarded. Nothing was changed." % (data["error"], source["path"]))
+        refusal = fast_forward_clone(config, source)
+        if refusal:
+            return False, "[specloop] Not updated: " + refusal
+    command = [sys.executable, os.path.join(source["path"], "install.py"), root] + installer_args(source)
+    try:
+        proc = run_limited(command, INSTALL_TIMEOUT_SEC, cwd=source["path"], merge_stderr=True)
+    except OSError as e:
+        return False, "[specloop] Not updated: the installer could not be started: %s" % e
+    output = proc.stdout.decode("utf-8", errors="replace").strip()
+    if proc.timed_out or proc.returncode != 0:
+        return False, ("[specloop] The installer %s in %s; the kit may be partly updated. Run it again by hand: "
+                       "%s\n%s" % ("timed out" if proc.timed_out else "failed (exit %s)" % proc.returncode,
+                                   source["path"], " ".join(command), tail(output, 800)))
+    new_version = _read_version_file(_path(root, "VERSION")) or "unknown"
+    merge_update_state(root, installed=new_version, clone=new_version)
+    lines = ["[specloop] Updated %s -> %s (from %s)." % (installed or "unknown", new_version, source["path"])]
+    changes = update_changes(config, source, source.get("commit"))
+    if changes:
+        lines += ["Changes:"] + ["  " + line for line in changes]
+    lines.append("Start a new Claude Code session so that changed commands and hooks are loaded.")
+    return True, "\n".join(lines)
 
 
 def set_update_mode_off(root):
@@ -2313,7 +2418,7 @@ def cmd_update(root, args):
     if reason:
         return "[specloop] Update checks are unavailable: %s." % reason.rstrip(".")
     if action == "check":
-        lines, _ = check_now(root, config, source)
+        lines = check_now(root, config, source)[0]
         return "\n".join(["[specloop] Update check:"] + lines)
     if action in ("skip", "never"):
         if action == "never":
@@ -2332,10 +2437,9 @@ def cmd_update(root, args):
             lines.append("Update checks are off: update.mode is \"off\" in %s. To turn them back on, set "
                          "update.mode to \"notify\" or \"auto\" there, or remove the key." % _rel("config.local.json"))
         return "\n".join(lines)
-    lines, version = check_now(root, config, source)
-    if version:
-        lines.append("[specloop] %s is available (installed %s). Applying updates is not available yet." % (
-            version, _read_version_file(_path(root, "VERSION"))))
+    lines, _, checked = check_now(root, config, source)
+    if checked:
+        lines.append(apply_update(root, config)[1])
     return "\n".join(["[specloop] Update:"] + lines)
 
 
