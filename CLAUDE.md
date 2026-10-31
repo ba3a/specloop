@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for developing specloop itself. User-facing documentation lives in `README.md`.
+Guidance for developing specloop itself. User-facing documentation lives in `docs/`; `README.md` is only the short introduction.
 
 ## What this repository is
 
@@ -25,6 +25,10 @@ kit/commands/*.md                     slash command templates; {{prefix}} is sub
                                       (spec, feature, go, pause, advance, status, reset, update)
                                       kit/commands/update.md is /sl-update (check, skip, never)
 tests/                                unittest suites for the engine, the installer and the docs
+README.md                             short introduction, at most 80 lines
+CHANGELOG.md                          release history (Keep a Changelog); repository root only, not installed
+docs/README.md                        documentation index: every page listed once, in four groups
+docs/<topic>.md                       one page per topic; the owner of the facts it describes
 ```
 
 Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,VERSION,manifest.json}` belong to the kit. `manifest.json` also records `source`: the clone that ran `install.py` (its path, version, remote, branch and `installArgs`, or `checkable: false` with a reason), which the update checker uses. `config.json` and `overrides/` belong to the project. `config.local.json` belongs to the person: a personal layer merged over `config.json`, git-ignored, and never created, changed or removed by the installer (the engine writes it only for `/sl-update never`). `state.json`, `state.lock`, `update.json`, `update.lock` and `run/` (including `run/attempts/`) are runtime state; `update.json` is the update checker's semaphore file.
@@ -47,7 +51,13 @@ python -m unittest tests.test_engine -v       # one suite
 - **Cross-platform.** Paths written into settings and commands use forward slashes and `$CLAUDE_PROJECT_DIR`. Hooks run through `sh`, which is Git Bash on Windows. Keep `.sh` files LF and `.cmd` files CRLF (see `.gitattributes`). On Windows, stage scripts with `git add --chmod=+x`.
 - **User-visible command names go through the prefix.** In the engine use `cmd_name(config, "go")`; in command templates use `/{{prefix}}go`. Never hard-code `/sl-go`.
 - Every behavior change gets a unit test in `tests/`. Tests build throwaway projects in temp directories and must not depend on the developer's machine. Use `exit 0` / `exit 1` as check commands.
-- Update `README.md` whenever options, config keys, commands or phases change. Bump `VERSION` (semver) for every release.
+- **Documentation and changelog.** `tests/test_docs.py` enforces most of this.
+  - Every behavior change updates the docs page that owns it, or adds a new page for a new feature. Each fact has one home; other pages link to it.
+  - A new page is added to `docs/README.md` under one of its groups (Getting started, Concepts, Features, Reference), starts with `[Documentation](README.md) › <Title>`, ends with a `## See also` section, and is linked from the pages it relates to; each of those pages links back.
+  - New config keys get a row in the table of the owning page and, for top-level keys, in `configuration.md`. New commands get an entry in `commands.md`. New phase files are mentioned in `phases.md`.
+  - `README.md` changes only when the pitch, the quick start or the list of main pages changes, and stays within 80 lines.
+  - Every user-visible change adds a `CHANGELOG.md` entry under `Unreleased` in the same commit. A release renames `Unreleased` to `## [x.y.z] - YYYY-MM-DD`, adds a new empty `Unreleased` section and bumps `VERSION` (semver) in the same commit. A documentation-only change does not bump `VERSION`.
+  - A reviewer checks the same list: a step that changes behavior without the matching docs and changelog change is not approved.
 
 ## Hook protocol reference
 
