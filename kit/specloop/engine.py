@@ -727,6 +727,36 @@ def update_notice_text(root, config, source, version):
                 version, _read_version_file(_path(root, "VERSION")), origin, update, update, update))
 
 
+def auto_update_notice(root, config, source, version):
+    """The auto mode of update_notice, called only at a safe point (the workflow is idle) for a
+    newer, not skipped `version`. Apply the update and return a one-line message saying what
+    changed. A major update is never applied: it gets the notify notice plus the reason. When
+    applying is refused or fails, the notify notice plus 'auto-update skipped: <reason>'. A
+    notice is shown once per intervalHours; applying is tried at every safe point."""
+    installed = _read_version_file(_path(root, "VERSION"))
+    if is_major_update(installed, version):
+        if not _announce_once(root, config, version):
+            return None
+        return "%s %s -> %s is a major update; run %s to apply it." % (
+            update_notice_text(root, config, source, version), installed, version, cmd_name(config, "update"))
+    try:
+        ok, message = apply_update(root, config)
+    except Exception as e:
+        print("[specloop] auto-update error: %s" % e, file=sys.stderr)
+        ok, message = False, "unexpected error: %s" % e
+    if ok:
+        new_version = _read_version_file(_path(root, "VERSION")) or version
+        return ("[specloop] Auto-updated %s -> %s. Start a new Claude Code session to load the new commands "
+                "and hooks." % (installed or "unknown", new_version))
+    if not _announce_once(root, config, version):
+        return None
+    reason = " ".join(message.split())
+    for prefix in ("[specloop]", "Not updated:"):
+        if reason.startswith(prefix):
+            reason = reason[len(prefix):].lstrip()
+    return "%s auto-update skipped: %s" % (update_notice_text(root, config, source, version), reason)
+
+
 def update_notice(root, config, state, spawn=True):
     """The notice side of the update checker: start the background check when it is due (only
     with `spawn`; SessionStart is the one place that does) and return the notice to show, or
@@ -744,8 +774,11 @@ def update_notice(root, config, state, spawn=True):
         return None
     notice = None
     version = available_version(root, source, data)
-    if version and not is_busy(state) and _announce_once(root, config, version):
-        notice = update_notice_text(root, config, source, version)
+    if version and not is_busy(state):
+        if update_mode(config) == "auto":
+            notice = auto_update_notice(root, config, source, version)
+        elif _announce_once(root, config, version):
+            notice = update_notice_text(root, config, source, version)
     # Spawned last: the check keeps what it reads from update.json, so it must see the announcement.
     if spawn and interval_elapsed(data.get("checkedAt"), update_interval(config)):
         spawn_update_check(root)

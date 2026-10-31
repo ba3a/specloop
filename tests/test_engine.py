@@ -3111,5 +3111,185 @@ class UpdateCommandTest(UpdateNoticeHelpers, unittest.TestCase):
         self.assertIn("installed: " + self.installed, out)
 
 
+@unittest.skipUnless(gitfixture.git_available(), "git not available")
+class AutoUpdateTest(UpdateNoticeHelpers, unittest.TestCase):
+    """update.mode "auto": SessionStart and workflow completion apply a safe update by themselves."""
+
+    def setUp(self):
+        self.save_env()
+        self.fx = gitfixture.GitFixture()
+        self.addCleanup(self.fx.cleanup)
+        self.root = self.fx.target
+        self.base = os.path.join(self.root, ".claude", "specloop")
+
+    def use_fixture(self, fx):
+        self.fx = fx
+        self.root = fx.target
+        self.base = os.path.join(self.root, ".claude", "specloop")
+
+    def install_and_publish(self, installed, available):
+        """Install `installed` from the clone, then publish `available` on the remote and record it."""
+        self.fx.bump_remote_version(installed)
+        self.fx.git(self.fx.clone, "pull", "-q", "--ff-only")
+        result = self.fx.run_install("--test-command", "exit 0")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.write_local_config({"update": {"mode": "auto"}})
+        self.fx.bump_remote_version(available)
+        workflow.cmd_update_check(self.root)
+        self.assertEqual(available, workflow.load_update_state(self.root).get("remote"))
+
+    def set_notify_in_shared_config(self):
+        path = os.path.join(self.base, "config.json")
+        with open(path, encoding="utf-8") as f:
+            config = json.load(f)
+        config["update"] = {"mode": "notify"}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+
+    def session_start(self):
+        saved = workflow.spawn_update_check
+        workflow.spawn_update_check = lambda root: self.spawns.append(root) or True
+        try:
+            return workflow.handle_context(self.root, "SessionStart")
+        finally:
+            workflow.spawn_update_check = saved
+
+    def installed_version(self):
+        with open(os.path.join(self.base, "VERSION"), encoding="utf-8") as f:
+            return f.read().strip()
+
+    def assert_changed_nothing(self, head, installed):
+        self.assertEqual(head, self.fx.head())
+        self.assertEqual(installed, self.installed_version())
+
+    def test_auto_in_the_local_config_overrides_notify_and_applies_a_minor_update(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        self.set_notify_in_shared_config()
+        self.assertEqual("auto", workflow.update_mode(workflow.load_config(self.root)))
+        message = self.session_start()["systemMessage"]
+        self.assertEqual("1.3.0", self.installed_version())
+        self.assertEqual("1.3.0", self.fx.read_version())
+        self.assertEqual(self.fx.git(self.fx.remote, "rev-parse", "HEAD"), self.fx.head())
+        self.assertIn("1.2.0 -> 1.3.0", message)
+        self.assertIn("new Claude Code session", message)
+        self.assertNotIn("\n", message)
+        self.assertNotIn("skipped", message)
+        self.assertEqual("1.3.0", workflow.load_update_state(self.root)["installed"])
+        self.assertIsNone(self.session_start())
+
+    def test_notify_mode_does_not_apply(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        self.write_local_config({})
+        self.set_notify_in_shared_config()
+        head = self.fx.head()
+        self.assertIn("1.3.0 is available", self.session_start()["systemMessage"])
+        self.assert_changed_nothing(head, "1.2.0")
+
+    def test_major_updates_are_only_announced(self):
+        for installed, available in (("0.2.0", "0.3.0"), ("1.2.0", "2.0.0")):
+            fx = gitfixture.GitFixture()
+            self.addCleanup(fx.cleanup)
+            self.use_fixture(fx)
+            self.install_and_publish(installed, available)
+            head = self.fx.head()
+            message = self.session_start()["systemMessage"]
+            self.assertIn(available + " is available", message)
+            self.assertIn("%s -> %s is a major update; run /sl-update to apply it" % (installed, available),
+                          message)
+            self.assertNotIn("auto-update skipped", message)
+            self.assert_changed_nothing(head, installed)
+            self.assertEqual("", self.fx.git(self.fx.clone, "status", "--porcelain"))
+
+    def test_a_dirty_clone_changes_nothing_and_shows_the_reason(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        with open(os.path.join(self.fx.clone, "scratch.txt"), "w", encoding="utf-8") as f:
+            f.write("work in progress")
+        head = self.fx.head()
+        message = self.session_start()["systemMessage"]
+        self.assertIn("1.3.0 is available", message)
+        self.assertIn("auto-update skipped: ", message)
+        self.assertIn("uncommitted changes", message.split("auto-update skipped: ", 1)[1])
+        self.assert_changed_nothing(head, "1.2.0")
+        self.assertEqual("?? scratch.txt", self.fx.git(self.fx.clone, "status", "--porcelain"))
+
+    def test_a_local_commit_that_is_not_on_the_remote_changes_nothing_and_shows_the_reason(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        with open(os.path.join(self.fx.clone, "notes.txt"), "w", encoding="utf-8") as f:
+            f.write("local")
+        self.fx.git(self.fx.clone, "add", "notes.txt")
+        self.fx.git(self.fx.clone, "commit", "-q", "-m", "Local work")
+        head = self.fx.head()
+        message = self.session_start()["systemMessage"]
+        self.assertIn("auto-update skipped: ", message)
+        self.assertIn("fast-forward", message.split("auto-update skipped: ", 1)[1])
+        self.assert_changed_nothing(head, "1.2.0")
+        self.assertEqual("", self.fx.git(self.fx.clone, "status", "--porcelain"))
+
+    def test_a_skipped_reason_is_announced_once_but_applying_is_retried(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        scratch = os.path.join(self.fx.clone, "scratch.txt")
+        with open(scratch, "w", encoding="utf-8") as f:
+            f.write("work in progress")
+        self.assertIn("auto-update skipped", self.session_start()["systemMessage"])
+        self.assertIsNone(self.session_start())
+        os.remove(scratch)
+        self.assertIn("1.2.0 -> 1.3.0", self.session_start()["systemMessage"])
+        self.assertEqual("1.3.0", self.installed_version())
+
+    def test_a_skipped_version_is_never_applied(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        workflow.cmd_update(self.root, ["skip"])
+        head = self.fx.head()
+        self.assertIsNone(self.session_start())
+        self.assert_changed_nothing(head, "1.2.0")
+
+    def test_nothing_is_applied_while_a_workflow_is_busy(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        self.start_workflow()
+        head = self.fx.head()
+        for status in ("active", "ready", "stalled", "paused"):
+            self.set_status(status)
+            output = self.session_start()
+            self.assertNotIn("systemMessage", output or {}, status)
+            self.assert_changed_nothing(head, "1.2.0")
+        self.assertNotIn("announced", workflow.load_update_state(self.root))
+
+    def test_completion_applies_the_update(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        self.start_workflow()
+        self.set_status("done")
+        out = workflow.add_completion_notice(self.root, {"systemMessage": "All done."})
+        self.assertTrue(out["systemMessage"].startswith("All done.\n\n"))
+        self.assertIn("1.2.0 -> 1.3.0", out["systemMessage"])
+        self.assertEqual("1.3.0", self.installed_version())
+
+    def test_a_failure_while_applying_is_logged_and_the_hook_still_exits_0(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        saved, stderr = workflow.apply_update, io.StringIO()
+
+        def explode(root, config):
+            raise RuntimeError("boom")
+        workflow.apply_update = explode
+        try:
+            with contextlib.redirect_stderr(stderr):
+                message = self.session_start()["systemMessage"]
+        finally:
+            workflow.apply_update = saved
+        self.assertIn("auto-update skipped: unexpected error: boom", message)
+        self.assertIn("boom", stderr.getvalue())
+        self.assertEqual("1.2.0", self.installed_version())
+
+    def test_mode_off_and_ci_apply_nothing(self):
+        self.install_and_publish("1.2.0", "1.3.0")
+        head = self.fx.head()
+        os.environ["CI"] = "1"
+        self.addCleanup(os.environ.pop, "CI", None)
+        self.assertIsNone(self.session_start())
+        del os.environ["CI"]
+        self.write_local_config({"update": {"mode": "off"}})
+        self.assertIsNone(self.session_start())
+        self.assert_changed_nothing(head, "1.2.0")
+
+
 if __name__ == "__main__":
     unittest.main()
