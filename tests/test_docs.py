@@ -19,8 +19,22 @@ class DocsTest(unittest.TestCase):
         missing = [k for k in keys if "`%s`" % k not in readme]
         self.assertEqual([], missing, "config keys missing from README.md")
 
-    def test_version_is_0_2_1(self):
-        self.assertEqual("0.2.1", read("VERSION").strip())
+    def test_version_is_0_3_0(self):
+        self.assertEqual("0.3.0", read("VERSION").strip())
+
+    def test_readme_documents_local_config_and_updates(self):
+        readme = read("README.md")
+        for needle in ("config.local.json", "## Updates", "`/sl-update`", "/sl-update check", "/sl-update skip",
+                       "/sl-update never", "update.json", "update.lock", "`CI`", "SPECLOOP_DISABLED",
+                       "intervalHours", "timeoutSec", "safe point", "major", "fork", "--keep-config",
+                       "install.py <project>", "`off`", "`notify`", "`auto`"):
+            self.assertIn(needle, readme)
+
+    def test_guide_describes_installed_update_files(self):
+        guide = read("CLAUDE.md")
+        for needle in ("config.local.json", "update.json", "update.lock", "manifest.json", "source",
+                       "kit/commands/update.md"):
+            self.assertIn(needle, guide)
 
     def test_multi_chat_behaviour_is_documented(self):
         readme, guide = read("README.md"), read("CLAUDE.md")

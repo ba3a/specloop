@@ -80,7 +80,7 @@ cd ~/tools/specloop && git pull
 ./install.sh ~/code/my-project
 ```
 
-An update replaces the engine, launcher, `defaults.json` and the shipped `phases/`. Your `config.json` and `overrides/` are never touched.
+An update replaces the engine, launcher, `defaults.json` and the shipped `phases/`. Your `config.json`, `config.local.json` and `overrides/` are never touched. Instead of doing this by hand, you can let specloop [check for updates and apply them](#updates).
 
 An override written for 0.2.0 or earlier may still send a review to `{run_dir}/review.md` or a replan request to `{run_dir}/replan.md`. The gate no longer reads those files, so the phase would never pass. `/sl-go` prints a warning naming each such file in use. Change it to `{review_file}` for a review and `{attempt_dir}/replan.md` for a replan request.
 
@@ -99,8 +99,9 @@ The kit is git-ignored, so a new `git worktree` does not get it. Run the install
 | `/sl-status` | Show the state: the raw state JSON in single mode, a step summary in feature mode. Works from any chat, and lists reviews that arrived too late to count. |
 | `/sl-advance` | Force-pass the current phase. Blocked in a chat that is not the owner while the workflow is `active`. |
 | `/sl-reset` | Delete the state and the `run/` artifacts. Blocked in a chat that is not the owner while the workflow is `active`. |
+| `/sl-update [check\|skip\|never]` | Check for a newer kit and apply it, or only report (`check`), or silence a version (`skip`, `never`). Refused while a workflow is busy. See [Updates](#updates). |
 
-Claude cannot run `/sl-spec`, `/sl-feature`, `/sl-go`, `/sl-advance`, `/sl-pause` or `/sl-reset` itself: their templates set `disable-model-invocation: true`, so taking over a workflow or force-passing a phase is always your decision.
+Claude cannot run `/sl-spec`, `/sl-feature`, `/sl-go`, `/sl-advance`, `/sl-pause`, `/sl-reset` or `/sl-update` itself: their templates set `disable-model-invocation: true`, so taking over a workflow or force-passing a phase is always your decision.
 
 If specloop is busy (another process holds `state.lock`), a command prints one line asking you to retry and changes nothing.
 
@@ -144,9 +145,12 @@ Files in `<project>/.claude/specloop/`:
 |------|-------|---------|
 | `defaults.json` | kit (replaced on update) | Default settings and phase graph. |
 | `config.json` | **project** | Your overrides, deep-merged over `defaults.json`. |
+| `config.local.json` | **person** | Your personal overrides, deep-merged over `config.json`. Git-ignored. See [Personal configuration](#personal-configuration-configlocaljson). |
 | `phases/<phase>.md` | kit (replaced on update) | Shipped phase instructions. |
 | `overrides/<phase>.md` | **project** | Your phase instructions; take precedence over `phases/`. |
 | `state.json`, `state.lock`, `run/` | runtime | Current state, its lock, plan and review files. |
+| `update.json`, `update.lock` | runtime | Result of the last update check and the lock of a running check. See [Updates](#updates). |
+| `manifest.json` | kit | What the installer wrote, including `source`, the clone the kit was installed from. |
 
 Everything in this directory except `config.json` and `overrides/` is git-ignored.
 
@@ -181,6 +185,20 @@ Top-level keys (the `feature` block is described under [Feature mode](#feature-m
 | `update` | `mode` `"notify"`, `intervalHours` 24, `timeoutSec` 20 | Update checks for the kit: `mode` is `"off"`, `"notify"` or `"auto"`; `intervalHours` is the minimum time between network checks; `timeoutSec` limits each git call. Checks are off when `CI` is set or `SPECLOOP_DISABLED=1`. |
 | `phases` | `plan` → `implement` → `review` | The single-mode phase graph; see below. |
 | `feature` | see [Feature mode](#feature-mode) | Feature-mode settings and phase graphs. |
+
+### Personal configuration: config.local.json
+
+`config.json` is shared with your team through git. For settings that are yours alone, for example how you want updates handled, create `.claude/specloop/config.local.json`. It takes any key that `config.json` takes, with the same structure:
+
+```json
+{ "update": { "mode": "auto" }, "maxIterations": 30 }
+```
+
+The effective configuration is `defaults.json`, then `config.json`, then `config.local.json`, deep-merged in that order, so a later file wins key by key, nested keys included. A missing file is the same as an empty one. A file that cannot be read or is not valid JSON is ignored, with a warning on stderr.
+
+- It is git-ignored: the managed `.gitignore` block covers everything in `.claude/specloop/` except `config.json` and `overrides/`.
+- The installer never creates, changes or removes it. `--force` recreates `config.json` only, and `--uninstall --keep-config` keeps it together with `config.json` and `overrides/`.
+- specloop itself writes to it only for `/sl-update never`, which sets `update.mode` to `"off"` and keeps your other keys.
 
 ### Phase graph
 
@@ -255,6 +273,9 @@ Set a key to `null` to disable that check, or the whole block to disable all of 
 |----------|--------|
 | `SPECLOOP_DISABLED=1` | All hooks become no-ops. |
 | `SPECLOOP_PYTHON=/path/to/python` | Interpreter for the launcher and installer (skips auto-detection). |
+| `CI` (any value) | Update checks behave as `off`. Headless runs must not modify themselves. |
+
+Settings that are yours belong in [`config.local.json`](#personal-configuration-configlocaljson), not in environment variables; the variables above describe the environment, not a preference.
 
 ## Feature mode
 
@@ -376,6 +397,51 @@ The single-mode size warnings do not apply in feature mode.
   - read-only phases such as review (and planning), which already edit only `run/`, cannot be forced into a subagent at all: the main session can still read the code and write the review itself;
   - edits made through Bash (for example `sed -i` or `>` redirects) are not covered;
   - `agent_type` alone is not trusted, because it is also present in the main conversation of a session started with `--agent`; in-process teammates carry an `agent_id` and are treated like subagents.
+
+## Updates
+
+specloop can tell you when a newer kit is available and, if you ask for it, install it. It checks the clone that ran `install.py` and the remote branch that clone tracks. No repository URL is built in: a fork's clone tracks the fork, so a fork follows its own upstream, not the original repository. Only a higher `VERSION` counts as an update.
+
+**Modes.** Set `update.mode`, preferably in your own [`config.local.json`](#personal-configuration-configlocaljson):
+
+| `update.mode` | Meaning |
+|---------------|---------|
+| `off` | No checks, no git calls, no notices. |
+| `notify` (default) | Check, then show a notice at a safe point. You run `/sl-update` to apply it. |
+| `auto` | Check, then apply the update at a safe point and print one line saying what changed. Falls back to the `notify` notice, with the reason, when an automatic update is not safe. |
+
+The checks are also off when the environment variable `CI` is set or `SPECLOOP_DISABLED=1`, whatever the configuration says.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `update.mode` | `"notify"` | `off`, `notify` or `auto`, as above. |
+| `update.intervalHours` | `24` | Minimum time between network checks. The same version is also announced at most once per interval. |
+| `update.timeoutSec` | `20` | Timeout for each git call of a check. A check lock older than twice this is stale and is replaced. |
+
+**How a check works.** At every SessionStart specloop compares the `VERSION` of the clone with the installed one (one file read, no network): this finds an update you pulled but did not install into this project. When `intervalHours` have passed since the last network check, it also starts `engine.py update-check` as a detached background process, so SessionStart returns at once. That process takes `update.lock`, runs `git fetch` in the clone with the timeout, and writes the result to `update.json` (the semaphore file: time of the check, installed, clone and remote versions, the remote commit, a skipped version, and `error` if the check failed). A failed check is not retried before the next interval, and its error appears only in `/sl-update` and `/sl-status`, never as a session notice. Both files are runtime state: git-ignored, and kept by `/sl-reset`. The result of a background check is used at the next safe point.
+
+**Safe points.** The kit is never changed, and no notice is shown, while a workflow is busy: a state file exists and its status is not `done` (so `active`, `paused`, `stalled` and a feature plan awaiting approval all count). A newer engine may read an old state differently, and in feature mode it would change the rules in the middle of a branch. The safe points are:
+
+1. SessionStart while no workflow is busy. The notice is a message to you and does not enter Claude's context.
+2. The completion of a workflow: the notice is added to the final message.
+3. `/sl-update`, which you can run whenever no workflow is busy.
+
+A notice looks like `[specloop] 0.4.0 is available (installed 0.3.0, from github.com/you/specloop main). Run /sl-update to update.` and mentions `skip` and `never`.
+
+**Major versions are never applied automatically.** When the available version has a higher major number than the installed one, `auto` only notifies and says that `/sl-update` is needed. While the major number is `0`, a higher minor number counts as major too (`0.3.0` to `0.4.0`), because semver treats `0.y` as unstable. Updates do not migrate `state.json` or `config.json`.
+
+**`/sl-update`.**
+
+| Form | What it does |
+|------|--------------|
+| `/sl-update` | Check now, ignoring `intervalHours`, and apply a newer version. Refused while a workflow is busy; the message names the command that ends or resets it. |
+| `/sl-update check` | Check now and report. Changes nothing. |
+| `/sl-update skip` | Remember the newest available version as skipped. It is never announced or auto-applied again; a later version is handled as usual. |
+| `/sl-update never` | Does what `skip` does and sets `update.mode` to `"off"` in `config.local.json`. The output says how to turn checks back on: set `update.mode` there, or remove the key. |
+
+Applying an update fast-forwards the clone (a fast-forward-only merge of `<remote>/<branch>`), runs the clone's `install.py` for this project with the options recorded at install time, prints the old and new versions and up to 20 `git log` lines, and tells you to start a new session so that changed hooks and commands are loaded. It refuses, and changes nothing, when the clone has uncommitted changes, is not on the recorded branch, or cannot be fast-forwarded (a fork with local commits, for example). It never pulls with a merge or rebase, stashes, or switches branches in the clone.
+
+**Enabling checks on an old install.** A kit installed by a version before 0.3.0 does not record where it came from, so it cannot check for updates, and the notice says so. Rerun the installer once from the clone, `install.py <project>`, to record the source. The same limit applies when the clone is not a git work tree (a downloaded zip) or its current branch has no upstream; the installer prints one line saying why.
 
 ## Uninstall
 

@@ -22,11 +22,12 @@ kit/specloop/phases/*.md              shipped phase instructions (replaced on up
   step-implement.md, step-review.md     feature-mode step cycle
   delegate.md                           orchestration preamble for delegated phases ({brief})
 kit/commands/*.md                     slash command templates; {{prefix}} is substituted on install
-                                      (spec, feature, go, pause, advance, status, reset)
+                                      (spec, feature, go, pause, advance, status, reset, update)
+                                      kit/commands/update.md is /sl-update (check, skip, never)
 tests/                                unittest suites for the engine, the installer and the docs
 ```
 
-Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,VERSION,manifest.json}` belong to the kit. `config.json` and `overrides/` belong to the project. `state.json`, `state.lock` and `run/` (including `run/attempts/`) are runtime state.
+Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,VERSION,manifest.json}` belong to the kit. `manifest.json` also records `source`: the clone that ran `install.py` (its path, version, remote, branch and `installArgs`, or `checkable: false` with a reason), which the update checker uses. `config.json` and `overrides/` belong to the project. `config.local.json` belongs to the person: a personal layer merged over `config.json`, git-ignored, and never created, changed or removed by the installer (the engine writes it only for `/sl-update never`). `state.json`, `state.lock`, `update.json`, `update.lock` and `run/` (including `run/attempts/`) are runtime state; `update.json` is the update checker's semaphore file.
 
 ## Commands
 
