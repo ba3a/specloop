@@ -2245,6 +2245,54 @@ def feature_status(root, state):
     return "\n".join(lines)
 
 
+def relative_age(stamp):
+    """'checked 5m ago', 'checked 3h ago' or 'checked 2d ago' for an ISO time; 'never checked' when
+    it is missing or invalid. A time in the future counts as just now."""
+    try:
+        seconds = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).total_seconds()
+    except (TypeError, ValueError):
+        return "never checked"
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return "checked %dm ago" % minutes
+    if minutes < 24 * 60:
+        return "checked %dh ago" % (minutes // 60)
+    return "checked %dd ago" % (minutes // (24 * 60))
+
+
+def update_status_line(root, config):
+    """The 'update: ...' line of /status. Reads local files only, makes no git calls and never
+    raises."""
+    try:
+        if update_mode(config) == "off":
+            return "update: off"
+        source = read_manifest_source(root)
+        reason = update_unavailable(source)
+        if reason:
+            return "update: unavailable (%s)" % reason.rstrip(".")
+        data = load_update_state(root)
+        age = relative_age(data.get("checkedAt"))
+        version = available_version(root, source, data)
+        if version:
+            installed = _read_version_file(_path(root, "VERSION")) or "unknown"
+            return "update: installed %s, available %s (%s)" % (installed, version, age)
+        if data.get("error"):
+            return "update: last check failed (%s)" % str(data["error"]).strip().rstrip(".")
+        return "update: up to date (%s)" % age
+    except Exception as e:
+        return "update: unknown (%s)" % e
+
+
+def status_output(root):
+    """What `engine.py status` prints: the workflow state, then the update line."""
+    output = cmd_status(root)
+    try:
+        config = load_config(root)
+    except Exception as e:
+        return "%s\nupdate: unknown (%s)" % (output, e)
+    return "%s\n%s" % (output, update_status_line(root, config))
+
+
 def cmd_reset(root):
     # state.json is deleted unread, so that reset also clears a file nothing can parse.
     with FileLock(_path(root, STATE_LOCK), STATE_LOCK_STALE_SEC):
@@ -2536,7 +2584,7 @@ def main(argv):
         "go": lambda: cmd_go(root),
         "pause": lambda: cmd_pause(root),
         "advance": lambda: cmd_advance(root),
-        "status": lambda: cmd_status(root),
+        "status": lambda: status_output(root),
         "reset": lambda: cmd_reset(root),
         "update": lambda: cmd_update(root, args),
     }

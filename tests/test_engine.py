@@ -2688,6 +2688,138 @@ class UpdateNoticeGitTest(UpdateNoticeHelpers, unittest.TestCase):
         self.assertNotIn("could not be run", output["systemMessage"])
 
 
+class UpdateStatusTest(UpdateNoticeHelpers, unittest.TestCase):
+    """The 'update:' line of /status. The clone is a directory with a VERSION file."""
+
+    def setUp(self):
+        self.save_env()
+        self.root = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        self.clone = os.path.join(self.root, "clone")
+        shutil.copytree(KIT, self.base)
+        os.makedirs(self.clone)
+        self.bump_clone("0.2.0")
+        with open(os.path.join(self.base, "VERSION"), "w", encoding="utf-8") as f:
+            f.write("0.2.0\n")
+        with open(os.path.join(self.base, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"commands": []}, f)
+        self.write_manifest_source({"path": self.clone, "remote": "origin", "branch": "main", "checkable": True,
+                                    "url": "https://example.invalid/kit.git", "version": "0.2.0"})
+
+    def bump_clone(self, version):
+        with open(os.path.join(self.clone, "VERSION"), "w", encoding="utf-8") as f:
+            f.write(version + "\n")
+
+    def line(self):
+        with self.recording():
+            line = workflow.update_status_line(self.root, workflow.load_config(self.root))
+        self.assertEqual([], self.git_calls)
+        self.assertEqual([], self.spawns)
+        return line
+
+    def run_status(self):
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+        out = io.StringIO()
+        try:
+            with self.recording(), contextlib.redirect_stdout(out):
+                code = workflow.main(["status"])
+        finally:
+            del os.environ["CLAUDE_PROJECT_DIR"]
+        self.assertEqual(0, code)
+        self.assertEqual([], self.git_calls)
+        return out.getvalue().rstrip("\n")
+
+    def test_available_version_with_its_age(self):
+        self.edit_update_state(checkedAt=self.fresh(hours_ago=3), remote="0.3.0")
+        self.assertEqual("update: installed 0.2.0, available 0.3.0 (checked 3h ago)", self.line())
+
+    def test_available_version_from_the_clone(self):
+        self.bump_clone("0.4.0")
+        self.edit_update_state(checkedAt=self.fresh(hours_ago=50))
+        self.assertEqual("update: installed 0.2.0, available 0.4.0 (checked 2d ago)", self.line())
+
+    def test_up_to_date(self):
+        self.edit_update_state(checkedAt=self.fresh(), remote="0.2.0")
+        self.assertEqual("update: up to date (checked 0m ago)", self.line())
+
+    def test_up_to_date_without_a_check_says_never_checked(self):
+        self.assertEqual("update: up to date (never checked)", self.line())
+
+    def test_skipped_version_counts_as_up_to_date(self):
+        self.edit_update_state(checkedAt=self.fresh(hours_ago=1), remote="0.3.0", skipped="0.3.0")
+        self.assertEqual("update: up to date (checked 1h ago)", self.line())
+
+    def test_off_by_mode_and_in_ci(self):
+        self.edit_update_state(checkedAt=self.fresh(), remote="0.3.0")
+        self.write_local_config({"update": {"mode": "off"}})
+        self.assertEqual("update: off", self.line())
+        os.remove(os.path.join(self.base, "config.local.json"))
+        os.environ["CI"] = "1"
+        self.assertEqual("update: off", self.line())
+
+    def test_unavailable_for_a_source_that_is_not_checkable(self):
+        self.write_manifest_source({"path": self.clone, "version": "0.2.0", "checkable": False,
+                                    "reason": "not a git work tree"})
+        self.assertEqual("update: unavailable (not a git work tree)", self.line())
+
+    def test_unavailable_for_an_old_install(self):
+        self.write_manifest_source(None)
+        line = self.line()
+        self.assertTrue(line.startswith("update: unavailable ("), line)
+        self.assertIn("reinstall", line)
+
+    def test_last_check_failed(self):
+        self.edit_update_state(checkedAt=self.fresh(), error="git fetch timed out")
+        self.assertEqual("update: last check failed (git fetch timed out)", self.line())
+
+    def test_newer_version_wins_over_an_old_error(self):
+        self.edit_update_state(checkedAt=self.fresh(hours_ago=1), remote="0.3.0", error="git fetch timed out")
+        self.assertIn("available 0.3.0", self.line())
+
+    def test_unreadable_update_file_gives_up_to_date(self):
+        with open(os.path.join(self.base, "update.json"), "w", encoding="utf-8") as f:
+            f.write("{not json")
+        self.assertEqual("update: up to date (never checked)", self.line())
+
+    def test_never_raises(self):
+        with mock.patch.object(workflow, "load_update_state", side_effect=RuntimeError("boom")):
+            self.assertEqual("update: unknown (boom)", self.line())
+
+    def test_relative_age_units(self):
+        for hours, minutes, expected in ((0, 5, "checked 5m ago"), (0, 59, "checked 59m ago"),
+                                         (1, 0, "checked 1h ago"), (23, 0, "checked 23h ago"),
+                                         (24, 0, "checked 1d ago"), (24 * 10, 0, "checked 10d ago")):
+            stamp = (datetime.now(timezone.utc) - timedelta(hours=hours, minutes=minutes, seconds=5)).isoformat()
+            self.assertEqual(expected, workflow.relative_age(stamp))
+        self.assertEqual("never checked", workflow.relative_age(None))
+        self.assertEqual("never checked", workflow.relative_age("garbage"))
+        future = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        self.assertEqual("checked 0m ago", workflow.relative_age(future))
+
+    def test_main_status_without_a_workflow_prints_the_line(self):
+        self.edit_update_state(checkedAt=self.fresh(hours_ago=3), remote="0.3.0")
+        self.assertEqual("No workflow state.\nupdate: installed 0.2.0, available 0.3.0 (checked 3h ago)",
+                         self.run_status())
+
+    def test_main_status_in_single_mode_prints_the_state_then_the_line(self):
+        self.start_workflow()
+        self.edit_update_state(checkedAt=self.fresh(), remote="0.2.0")
+        text = self.run_status()
+        body, _, last = text.rpartition("\n")
+        self.assertEqual("update: up to date (checked 0m ago)", last)
+        self.assertEqual(workflow.load_state(self.root), json.loads(body))
+
+    def test_main_status_in_feature_mode_prints_the_summary_then_the_line(self):
+        self.start_workflow()
+        state = workflow.load_state(self.root)
+        state["mode"] = "feature"
+        workflow.save_state(self.root, state)
+        self.write_local_config({"update": {"mode": "off"}})
+        expected = workflow.cmd_status(self.root) + "\nupdate: off"
+        self.assertEqual(expected, self.run_status())
+
+
 class SpawnUpdateCheckTest(unittest.TestCase):
 
     def setUp(self):
