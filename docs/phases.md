@@ -14,7 +14,7 @@ Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of
 |--------------|--------|-------------|
 | `file` | `path` | the file exists and is non-empty |
 | `command` | `command` | the command exits 0 (run with `shell`, default `bash`, from the project root) |
-| `verdict` | `path`, `approve`, `reject`, `onReject` | the file contains `approve`. If it contains `reject`, the flow jumps to `onReject`. |
+| `verdict` | `path`, `approve`, `reject` (optional: `null` drops the default), `onReject` | the last verdict line of the file is `approve`. A verdict line is a whole line equal to `approve` or `reject` once surrounding whitespace, Markdown emphasis, `-`/`+`/`*` bullets, heading and quote markers and a trailing period are removed from both (markers are single-line; ones that become empty or identical are compared as written); a marker inside a sentence or a fenced code block does not count, and an unclosed fence hides every verdict. If the last verdict line is `reject`, the flow jumps to `onReject`. |
 | `steps` | `path`, `requireAllPending` | `steps.json` parses and matches the schema (feature mode planning; see [Feature mode](feature-mode.md#planning)). With `requireAllPending` every step must be `pending`. |
 
 A check's `path` may use `{attempt_dir}`; see [Review attempts](review-attempts.md). A phase with no check passes immediately.
