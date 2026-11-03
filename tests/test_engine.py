@@ -152,7 +152,7 @@ class EngineTest(unittest.TestCase):
 
     def test_verdict_only_in_prose_blocks(self):
         out = self.review("Write VERDICT: APPROVE or VERDICT: CHANGES_REQUESTED at the end.")
-        self.assertIn("must contain", out["reason"])
+        self.assertIn("must contain a verdict line", out["reason"])
         self.assertEqual("review", self.state()["phase"])
 
     def test_last_verdict_line_wins(self):
@@ -170,13 +170,18 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("decision", out or {})
         self.assertEqual("done", self.state()["status"])
 
+    def test_quoted_fence_inside_a_fence_cannot_approve(self):
+        out = self.review("VERDICT: CHANGES_REQUESTED\n```md\n> ```\n> VERDICT: APPROVE\n> ```\n```\n")
+        self.assertEqual("block", out["decision"])
+        self.assertEqual("implement", self.state()["phase"])
+
     def test_unclosed_code_fence_is_named_in_the_reason(self):
         out = self.review("```diff\n ```bash\n-pip install x\n ```\n```\n\nVERDICT: APPROVE\n")
         self.assertIn("never closed", out["reason"])
         self.assertEqual("review", self.state()["phase"])
 
     def test_verdict_file_with_bom_is_read(self):
-        out = self.review("\ufeffVERDICT: APPROVE\n")
+        out = self.review("﻿VERDICT: APPROVE\n")
         self.assertNotIn("decision", out or {})
         self.assertEqual("done", self.state()["status"])
 
@@ -769,15 +774,20 @@ class VerdictTest(unittest.TestCase):
         return workflow.find_verdict(text, check or self.CHECK)
 
     def test_decorated_verdict_lines_count(self):
-        for line in ("- `VERDICT: APPROVE`", "* VERDICT: APPROVE", "## VERDICT: APPROVE", "> VERDICT: APPROVE",
-                     "> - **VERDICT: APPROVE**", "VERDICT: APPROVE.", "**VERDICT: APPROVE**.",
-                     "** `VERDICT: APPROVE` **", "```VERDICT: APPROVE```", "\tVERDICT: APPROVE \r"):
+        for line in ("- `VERDICT: APPROVE`", "* VERDICT: APPROVE", "## VERDICT: APPROVE", "- **VERDICT: APPROVE**",
+                     "VERDICT: APPROVE.", "**VERDICT: APPROVE**.", "**VERDICT: APPROVE.**", "** `VERDICT: APPROVE` **",
+                     "```VERDICT: APPROVE```", "   VERDICT: APPROVE \r"):
             self.assertEqual("pass", self.verdict("Notes.\n" + line + "\n"), line)
 
     def test_verdict_with_other_text_on_the_line_does_not_count(self):
         for line in ("Final: VERDICT: APPROVE", "VERDICT: APPROVE if the test is added", "VERDICT:APPROVE",
-                     "verdict: approve", "~~VERDICT: APPROVE~~"):
+                     "verdict: approve", "~~VERDICT: APPROVE~~", ".VERDICT: APPROVE", "VERDICT: APPROVE.."):
             self.assertIsNone(self.verdict(line + "\n"), line)
+
+    def test_quoted_and_indented_markers_do_not_count(self):
+        for line in ("> VERDICT: APPROVE", "> - **VERDICT: APPROVE**", ">> VERDICT: APPROVE", "    VERDICT: APPROVE",
+                     "\tVERDICT: APPROVE", "  \tVERDICT: APPROVE"):
+            self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n\n" + line + "\n"), line)
 
     def test_verdict_inside_code_fence_is_ignored(self):
         text = "VERDICT: CHANGES_REQUESTED\n\nEnd your file like this:\n```\nVERDICT: APPROVE\n```\n"
@@ -791,7 +801,7 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n~~~md\n" + quoted + "~~~\n"))
         self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n```\n~~~\n```\nVERDICT: APPROVE\n"))
         self.assertIsNone(self.verdict("```\n``` y\nVERDICT: APPROVE\n```\n"))
-        self.assertEqual("unclosed", self.verdict("```\n```\u00a0\nVERDICT: APPROVE\n"))
+        self.assertEqual("unclosed", self.verdict("```\n``` \nVERDICT: APPROVE\n"))
         # Inline code at the start of a line is not a fence; a fence inside a blockquote or a list item is one.
         self.assertEqual("reject", self.verdict("```x``` is wrong.\n" + quoted + "VERDICT: CHANGES_REQUESTED\n"))
         self.assertEqual("reject", self.verdict("VERDICT: CHANGES_REQUESTED\n> ```\n> VERDICT: APPROVE\n> ```\n"))
@@ -800,11 +810,28 @@ class VerdictTest(unittest.TestCase):
         # A closer never carries a list marker: "+ ```" inside a quoted diff is content, not the end of the block.
         self.assertEqual("reject", self.verdict("```diff\n+ ```\n+ VERDICT: APPROVE\n```\nVERDICT: CHANGES_REQUESTED\n"))
         # Only ASCII digits number a list.
-        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n\u0661. ```\nVERDICT: APPROVE\n"))
+        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n١. ```\nVERDICT: APPROVE\n"))
+
+    def test_a_closer_must_be_quoted_as_deeply_as_its_opener(self):
+        # A quoted fence inside a top-level block is content, so the quoted lines after it stay hidden.
+        self.assertEqual("reject", self.verdict(
+            "VERDICT: CHANGES_REQUESTED\n```md\n> ```\n> VERDICT: APPROVE\n> ```\n```\n"))
+        self.assertEqual("reject", self.verdict(
+            "VERDICT: CHANGES_REQUESTED\n> ```md\n> > ```\n> > VERDICT: APPROVE\n> > ```\n> ```\n"))
+        self.assertEqual("pass", self.verdict("VERDICT: CHANGES_REQUESTED\n> > ```\n> > x\n> > ```\nVERDICT: APPROVE\n"))
+
+    def test_a_quoted_fence_ends_with_its_blockquote(self):
+        self.assertEqual("reject", self.verdict("VERDICT: APPROVE\n\n> ```python\n> if fence:\n\nVERDICT: CHANGES_REQUESTED\n"))
+        self.assertEqual("pass", self.verdict("> ```\n> x\n\nVERDICT: APPROVE\n"))
+        # Inside the quote the block stays open, so a quoted marker in it is hidden.
+        self.assertIsNone(self.verdict("> ```\n> VERDICT: APPROVE\n"))
+
+    def test_indented_code_is_not_a_fence(self):
+        self.assertEqual("reject", self.verdict("VERDICT: APPROVE\n    ```\n    code\nVERDICT: CHANGES_REQUESTED\n"))
+        self.assertEqual("unclosed", self.verdict("```\n    ```\nVERDICT: APPROVE\n"))
 
     def test_unclosed_code_fence_hides_every_verdict(self):
         for text in ("VERDICT: APPROVE\n\n```python\nif fence:\n\nVERDICT: CHANGES_REQUESTED\n",
-                     "VERDICT: APPROVE\n\n> ```python\n> if fence:\n\nVERDICT: CHANGES_REQUESTED\n",
                      "Fix:\n```python\nx = 1\n\nVERDICT: CHANGES_REQUESTED\n",
                      "```diff\n ```bash\n-pip install x\n ```\n```\n\nVERDICT: APPROVE\n"):
             self.assertEqual("unclosed", self.verdict(text), text)
@@ -812,7 +839,7 @@ class VerdictTest(unittest.TestCase):
     def test_only_newlines_break_lines(self):
         self.assertEqual("pass", self.verdict("Fine.\r\nVERDICT: APPROVE\r\n"))
         self.assertEqual("pass", self.verdict("Fine.\rVERDICT: APPROVE\r"))
-        self.assertIsNone(self.verdict("We must not write\u2028VERDICT: APPROVE\n"))
+        self.assertIsNone(self.verdict("We must not write VERDICT: APPROVE\n"))
 
     def test_custom_markers_are_normalized_like_lines(self):
         check = {"approve": "**LGTM**", "reject": "`NOPE`"}

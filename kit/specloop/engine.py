@@ -73,10 +73,12 @@ OWNER_ONLY_COMMANDS = ("advance", "reset")
 IN_FLIGHT_TASKS = ("subagent", "workflow", "teammate")
 COMMIT_PENDING = object()
 STALE_PATHS = ("{run_dir}/" + REVIEW_FILE, "{run_dir}/" + REPLAN_FILE)
-VERDICT_PREFIX = re.compile(r"^(?:\s|>|#+(?=\s)|[-+*](?=\s))+")  # Markdown quote, heading and list markers
-VERDICT_WRAP = " \t`*_."  # whitespace, emphasis and a trailing period around a verdict
-CODE_FENCE = re.compile(r"(?:[ \t>]|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t]))*(`{3,}|~{3,})(.*)$")  # opener: run, info
-FENCE_CLOSE = re.compile(r"[ \t>]*(`{3,}|~{3,})[ \t]*$")  # closer: a bare run, never behind a list marker
+VERDICT_PREFIX = re.compile(r"^(?:\s|#+(?=\s)|[-+*](?=\s))+")  # Markdown heading and list markers
+VERDICT_WRAP = " \t`*_"  # whitespace and emphasis around a verdict
+INDENTED_CODE = re.compile(r"^(?: {4}| {0,3}\t)")  # four columns of indentation: an indented code block
+QUOTE_PREFIX = re.compile(r"(?: {0,3}>)*")  # blockquote markers at the start of a line
+CODE_FENCE = re.compile(r"((?:[ \t>]|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t]))*)(`{3,}|~{3,})(.*)$")  # opener
+FENCE_CLOSE = re.compile(r"((?: {0,3}>)*) {0,3}(`{3,}|~{3,})[ \t]*$")  # closer: a bare run, never behind a list marker
 LINE_BREAK = re.compile(r"\r\n|\r|\n")
 
 
@@ -1099,37 +1101,51 @@ def check_path(check, state):
 
 def verdict_line(line):
     """Reduce a review line (or a configured marker) to its bare text: "- `VERDICT: APPROVE`." -> "VERDICT: APPROVE"."""
-    return VERDICT_PREFIX.sub("", line.strip()).strip(VERDICT_WRAP)
+    text = VERDICT_PREFIX.sub("", line.strip()).strip(VERDICT_WRAP)
+    if text.endswith("."):
+        text = text[:-1].strip(VERDICT_WRAP)
+    return text
+
+
+def quote_depth(line):
+    """Number of blockquote markers that start the line."""
+    return QUOTE_PREFIX.match(line).group().count(">")
 
 
 def code_fence(line):
-    """Return the fence run when the line opens a fenced code block, else None (CommonMark: a backtick
+    """Return (run, quote depth) when the line opens a fenced code block, else None (CommonMark: a backtick
     fence may not have a backtick in its info string, that is inline code)."""
     match = CODE_FENCE.match(line)
-    if not match or (match.group(1)[0] == "`" and "`" in match.group(2)):
+    if not match or (match.group(2)[0] == "`" and "`" in match.group(3)):
         return None
-    return match.group(1)
+    return match.group(2), match.group(1).count(">")
 
 
 def find_verdict(text, check):
     """Return 'pass', 'reject', 'unclosed' or None from the verdict lines of a review.
 
     A verdict line is a whole line whose bare text (see verdict_line) equals check["approve"] or the
-    optional check["reject"]; lines inside fenced code blocks are skipped. So a marker quoted inside a
-    sentence or a code block never counts. The last verdict line wins, so a reviewer who changes their
-    mind is read correctly. A fence still open at the end hides the rest of the file: 'unclosed'."""
+    optional check["reject"]. Lines inside fenced code blocks, indented code and blockquotes are not verdict
+    lines, so a marker quoted in a sentence, an example or a quotation never counts. The last verdict line
+    wins, so a reviewer who changes their mind is read correctly. A fence still open at the end hides the rest
+    of the file: 'unclosed'."""
     approve, reject, bare = verdict_line(check["approve"]), verdict_line(check.get("reject") or ""), verdict_line
     if not approve or approve == reject or (check.get("reject") and not reject):
         # Markers that are nothing but decoration: compare them as written.
         approve, reject, bare = check["approve"].strip(), (check.get("reject") or "").strip(), str.strip
-    verdict, fence = None, ""
+    verdict, fence = None, None  # fence: (run, quote depth) of the open block
     for line in LINE_BREAK.split(text):  # not str.splitlines: Markdown breaks lines only on \n and \r
-        if fence:  # only a bare run of the same character, at least as long, closes the block
+        if fence and quote_depth(line) < fence[1]:
+            fence = None  # the blockquote that held the block ended, and the block with it
+        if fence:  # only a bare run of the same character, at least as long and as deeply quoted, closes it
             close = FENCE_CLOSE.match(line)
-            if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= len(fence):
-                fence = ""
+            if (close and close.group(1).count(">") == fence[1] and close.group(2)[0] == fence[0][0]
+                    and len(close.group(2)) >= len(fence[0])):
+                fence = None
             continue
-        fence = code_fence(line) or ""
+        if INDENTED_CODE.match(line):
+            continue
+        fence = code_fence(line)
         if fence:
             continue
         line = bare(line)
