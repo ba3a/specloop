@@ -19,4 +19,5 @@ specs/
 .claude/commands/sl-reset.md
 .claude/commands/sl-spec.md
 .claude/commands/sl-status.md
+.claude/commands/sl-update.md
 # <<< specloop
