@@ -14,10 +14,18 @@ Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of
 |--------------|--------|-------------|
 | `file` | `path` | the file exists and is non-empty |
 | `command` | `command` | the command exits 0 (run with `shell`, default `bash`, from the project root) |
-| `verdict` | `path`, `approve`, `reject` (optional: `null` drops the default), `onReject` | the last verdict line of the file is `approve`. A verdict line is a whole line equal to `approve` or `reject` once surrounding whitespace, Markdown emphasis, `-`/`+`/`*` bullets, heading and quote markers and a trailing period are removed from both (markers are single-line; ones that become empty or identical are compared as written); a marker inside a sentence or a fenced code block does not count, and an unclosed fence hides every verdict. If the last verdict line is `reject`, the flow jumps to `onReject`. |
+| `verdict` | `path`, `approve`, `reject` (optional), `onReject` | the last [verdict line](#verdict-lines) of the file is `approve`. If it is `reject`, the flow jumps to `onReject`. |
 | `steps` | `path`, `requireAllPending` | `steps.json` parses and matches the schema (feature mode planning; see [Feature mode](feature-mode.md#planning)). With `requireAllPending` every step must be `pending`. |
 
 A check's `path` may use `{attempt_dir}`; see [Review attempts](review-attempts.md). A phase with no check passes immediately.
+
+### Verdict lines
+
+A `verdict` check reads only whole lines. A verdict line is a line that equals `approve` or `reject` once surrounding whitespace, Markdown emphasis, a `-`, `+` or `*` bullet, a heading marker and one trailing period are removed. So `` - `VERDICT: APPROVE`. `` counts, while `Final: VERDICT: APPROVE` does not. When several verdict lines are present, the last one wins.
+
+A marker never counts inside a fenced code block, an indented code block (four or more columns of indentation) or a blockquote, so a review can quote an example verdict safely. Fences follow Markdown rules: a block closes only on a bare run of the same character, at least as long and quoted as deeply as the opener, and a fence inside a blockquote ends with the blockquote. If a fence is still open at the end of the file, no verdict line counts and the check fails with a message saying so; put a snippet that contains ```` ``` ```` inside a ```` ```` ```` fence.
+
+`reject` is optional: `null` drops the default, and the check then fails until the file approves. The markers get the same normalization as lines; markers that become empty or identical are compared as written. The file is read as UTF-8, with or without a byte order mark.
 
 ## Adding and removing phases
 
