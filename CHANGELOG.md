@@ -12,6 +12,10 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 - The documentation moved from one long `README.md` into focused pages under [`docs/`](docs/README.md). The README is now a short introduction. Old README anchors such as `README.md#feature-mode` no longer exist; use the page for the topic, for example [Feature mode](docs/feature-mode.md). Behaviour is unchanged.
 
+### Fixed
+
+- A `verdict` check no longer approves a review that only mentions `VERDICT: APPROVE`, for example inside a sentence, a code block or a quotation, while requesting changes. The check now reads whole verdict lines and the last one wins; a marker in a fenced or indented code block or a blockquote does not count. `reject` is optional. See [Verdict lines](docs/phases.md#verdict-lines).
+
 ## [0.3.0] - 2026-10-31
 
 ### Added
