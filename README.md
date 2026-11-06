@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/png/lockup-dark.png">
+    <img src="assets/brand/png/lockup.png" alt="specloop" width="420">
+  </picture>
+</p>
+
 # specloop
 
 A spec-driven **plan → implement → review** loop for [Claude Code](https://claude.com/claude-code), built only from hooks and slash commands. You hand it a specification, and Claude is walked through the phases; a phase only completes when its check passes. It runs inside your normal Claude Code session, so it uses your subscription: no API keys, no separate orchestrator.
