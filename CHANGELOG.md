@@ -4,6 +4,10 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- A logo. The README shows it, and the logo, favicons and social preview image are in [`assets/brand/`](assets/brand/README.md).
+
 ### Changed
 
 - The documentation moved from one long `README.md` into focused pages under [`docs/`](docs/README.md). The README is now a short introduction. Old README anchors such as `README.md#feature-mode` no longer exist; use the page for the topic, for example [Feature mode](docs/feature-mode.md). Behaviour is unchanged.
