@@ -17,7 +17,11 @@ Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of
 | `verdict` | `path`, `approve`, `reject`, `onReject` | the file contains `approve`. If it contains `reject`, the flow jumps to `onReject`. |
 | `steps` | `path`, `requireAllPending` | `steps.json` parses and matches the schema (feature mode planning; see [Feature mode](feature-mode.md#planning)). With `requireAllPending` every step must be `pending`. |
 
-A check's `path` may use `{attempt_dir}`; see [Review attempts](review-attempts.md). A phase with no check passes immediately. After the check passes, the phase's [quality gates](quality-gates.md) run.
+A check's `path` may use `{attempt_dir}`; see [Review attempts](review-attempts.md). A phase with no check passes immediately.
+
+## Quality gates after the check
+
+When the check passes, the [quality gates](quality-gates.md#running-gates) that name the phase in their `phases` list run, in declared order. The phase passes only if every `block` gate passes; otherwise the stop is blocked as for a failed check, with every failed gate in one message. A failed check ends the stop before any gate runs, and planning phases never run gates.
 
 ## Adding and removing phases
 
@@ -37,7 +41,7 @@ In instruction files, `{spec}` becomes the spec path, `{run_dir}` becomes `.clau
 
 ## `run/last-failure.md`
 
-Whenever a check fails or a review requests changes, the full details (the complete check output or review text, not truncated) are written to `.claude/specloop/run/last-failure.md`. The file is removed when a phase passes and on `/sl-advance`.
+Whenever a check or a quality gate fails or a review requests changes, the full details (the complete check output, every failed gate's output or the review text, not truncated) are written to `.claude/specloop/run/last-failure.md`. The file is removed when a phase passes and on `/sl-advance`.
 
 ## See also
 

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KIT = os.path.join(os.path.dirname(HERE), "kit", "specloop")
@@ -396,6 +397,264 @@ class GoRefusesTest(QualityProject):
         self.assertIn("quality configuration is invalid", out)
         self.assertEqual(before, self.state_bytes())
         self.assertNotIn("branch", workflow.load_state(self.root))
+
+
+def lines(prefix, count):
+    """A shell command that prints `count` numbered lines."""
+    return "for i in $(seq 1 %d); do echo %s-$i; done" % (count, prefix)
+
+
+class GateRunTest(QualityProject):
+    """Gates run after a phase's check passes, in single mode."""
+
+    def configure(self, gates, quality=None, **top):
+        config = dict(top, quality=dict(quality or {}, gates=gates))
+        self.set_config(config)
+
+    def start_implement(self):
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        with open(self.run_path("plan.md"), "w") as f:
+            f.write("- [ ] step")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'implement'", out["reason"])
+
+    def state(self):
+        return workflow.load_state(self.root)
+
+    def run_path(self, *parts):
+        return os.path.join(self.base, "run", *parts)
+
+    def exists(self, name):
+        return os.path.exists(os.path.join(self.root, name))
+
+    def read(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_failing_block_gate_keeps_implement(self):
+        self.configure({"tests": {"command": "echo boom-output; exit 1"}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("boom-output", out["reason"])
+        self.assertIn("Quality gates failed: tests", out["reason"])
+        state = self.state()
+        self.assertEqual("implement", state["phase"])
+        self.assertEqual("fail", state["qualityResults"]["tests"]["result"])
+        self.assertEqual(1, state["qualityResults"]["tests"]["exitCode"])
+
+    def test_passing_gate_enters_review_and_records_result(self):
+        self.configure({"tests": {"command": "exit 0"}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+        result = self.state()["qualityResults"]["tests"]
+        self.assertEqual("pass", result["result"])
+        self.assertEqual(0, result["exitCode"])
+        self.assertEqual("implement", result["phase"])
+        self.assertIsNone(result["stepId"])
+        self.assertIsInstance(result["durationSec"], (int, float))
+        self.assertGreaterEqual(result["durationSec"], 0)
+        self.assertTrue(result["finishedAt"])
+        self.assertFalse(os.path.exists(self.run_path("last-failure.md")))
+
+    def test_all_failures_reported_in_one_message_with_one_iteration(self):
+        self.configure({"lint": {"command": "echo lint-output; exit 1", "hint": "Fix lint properly."},
+                        "tests": {"command": "echo tests-output; exit 2", "hint": "Do not skip tests."}})
+        self.start_implement()
+        before = self.state()["iter"]
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        for text in ("Quality gates failed: lint, tests", "lint-output", "tests-output", "Fix lint properly.",
+                     "Do not skip tests.", "exit code 2"):
+            self.assertIn(text, out["reason"])
+        state = self.state()
+        self.assertEqual(before + 1, state["iter"])
+        self.assertEqual(["fail", "fail"], [state["qualityResults"][n]["result"] for n in ("lint", "tests")])
+
+    def test_first_line_names_every_failed_gate_in_a_delegated_phase(self):
+        self.configure({"lint": {"command": "exit 1"}, "tests": {"command": "exit 1"}},
+                       phases={"implement": {"delegate": True}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("not complete yet: Quality gates failed: lint, tests. Full details", out["reason"])
+
+    def test_fail_fast_stops_at_the_first_failing_block_gate(self):
+        self.configure({"lint": {"command": "exit 1"}, "tests": {"command": "echo ran > marker; exit 0"}},
+                       {"failFast": True})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertFalse(self.exists("marker"))
+        self.assertEqual(["lint"], list(self.state()["qualityResults"]))
+        self.assertFalse(os.path.exists(self.run_path("quality", "tests.log")))
+
+    def test_fail_fast_continues_after_a_failing_warn_gate(self):
+        self.configure({"style": {"command": "exit 1", "level": "warn"},
+                        "tests": {"command": "echo ran > marker; exit 0"}}, {"failFast": True})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertTrue(self.exists("marker"))
+
+    def test_without_fail_fast_every_gate_runs(self):
+        self.configure({"lint": {"command": "exit 1"}, "tests": {"command": "echo ran > marker; exit 0"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        self.assertTrue(self.exists("marker"))
+        self.assertEqual("pass", self.state()["qualityResults"]["tests"]["result"])
+
+    def test_failing_warn_gate_does_not_block_and_is_reported(self):
+        self.configure({"style": {"command": "echo style-output; exit 1", "level": "warn", "hint": "Style hint."},
+                        "tests": {"command": "exit 0"}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertIn("style", out["reason"])
+        self.assertIn("warn", out["reason"])
+        self.assertIn("quality/style.log", out["reason"])
+        self.assertEqual("review", self.state()["phase"])
+        self.assertEqual("warn", self.state()["qualityResults"]["style"]["result"])
+
+    def test_warn_gate_is_listed_beside_a_blocking_failure(self):
+        self.configure({"style": {"command": "echo style-output; exit 1", "level": "warn"},
+                        "tests": {"command": "exit 1"}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("Quality gates failed: tests\n", out["reason"])
+        self.assertIn("style-output", out["reason"])
+
+    def test_repeated_failures_stall_at_max_iterations(self):
+        self.configure({"tests": {"command": "exit 1"}}, maxIterations=3)
+        self.start_implement()
+        self.assertEqual(1, self.state()["iter"])  # the plan phase used one
+        self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("stalled after 3 iterations in phase 'implement'", out["systemMessage"])
+        self.assertEqual("stalled", self.state()["status"])
+        self.assertEqual(3, self.state()["iter"])
+
+    def test_logs_and_last_failure_hold_the_full_output(self):
+        self.configure({"lint": {"command": lines("lint", 400) + "; exit 1"},
+                        "tests": {"command": lines("tests", 400) + "; echo on-stderr >&2; exit 1"}},
+                       maxOutputChars=600)
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        lint_log = self.read(self.run_path("quality", "lint.log"))
+        tests_log = self.read(self.run_path("quality", "tests.log"))
+        self.assertIn("lint-1\n", lint_log)
+        self.assertIn("lint-400", lint_log)
+        self.assertIn("tests-1\n", tests_log)
+        self.assertIn("on-stderr", tests_log)
+        failure = self.read(self.run_path("last-failure.md"))
+        for text in ("Quality gates failed: lint, tests", "lint-1\n", "lint-400", "tests-1\n", "tests-400"):
+            self.assertIn(text, failure)
+        self.assertNotIn("lint-1\n", out["reason"])
+        self.assertIn("tests-400", out["reason"])
+
+    def test_details_stay_within_max_output_chars(self):
+        self.configure({"lint": {"command": lines("lint", 400) + "; exit 1", "hint": "h" * 50},
+                        "tests": {"command": lines("tests", 400) + "; exit 1"}}, maxOutputChars=500)
+        self.start_implement()
+        outcome = workflow.evaluate_gate(self.root, self.config(), self.state())
+        self.assertEqual("fail", outcome["result"])
+        self.assertLessEqual(len(outcome["details"]), 500)
+        self.assertTrue(outcome["details"].startswith("Quality gates failed: lint, tests\n"))
+        self.assertIn("lint-400", outcome["details"])
+        self.assertIn("tests-400", outcome["details"])
+
+    def test_log_is_replaced_on_each_run(self):
+        with open(os.path.join(self.root, "message"), "w") as f:
+            f.write("first-run\n")
+        self.configure({"tests": {"command": "cat message; exit 1"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        with open(os.path.join(self.root, "message"), "w") as f:
+            f.write("second-run\n")
+        workflow.handle_stop(self.root, {})
+        log = self.read(self.run_path("quality", "tests.log"))
+        self.assertIn("second-run", log)
+        self.assertNotIn("first-run", log)
+
+    def test_result_is_dropped_when_the_gate_mark_changes(self):
+        self.configure({"tests": {"command": "echo dropped-output; exit 1"}})
+        self.start_implement()
+        before = self.state()
+        original = workflow.run_limited
+
+        def pause_then_run(*args, **kwargs):
+            workflow.cmd_pause(self.root)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(workflow, "run_limited", side_effect=pause_then_run):
+            self.assertIsNone(workflow.handle_stop(self.root, {}))
+        after = self.state()
+        self.assertEqual("paused", after["status"])
+        self.assertEqual(before["iter"], after["iter"])
+        self.assertEqual(before["phase"], after["phase"])
+        self.assertEqual(before["history"], after["history"])
+        self.assertNotIn("qualityResults", after)
+        self.assertNotIn("gate", after)
+        self.assertFalse(os.path.exists(self.run_path("last-failure.md")))
+        self.assertIn("dropped-output", self.read(self.run_path("quality", "tests.log")))
+
+    def test_phase_check_runs_first_and_gates_skip_when_it_fails(self):
+        self.configure({"tests": {"command": "echo ran > marker; exit 0"}},
+                       phases={"implement": {"check": {"type": "command", "command": "echo check-output; exit 1"}}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("check-output", out["reason"])
+        self.assertFalse(self.exists("marker"))
+        self.assertNotIn("qualityResults", self.state())
+
+    def test_gates_run_after_a_passing_phase_check(self):
+        self.configure({"tests": {"command": "test -f checked"}},
+                       phases={"implement": {"check": {"type": "command", "command": "echo > checked"}}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual("pass", self.state()["qualityResults"]["tests"]["result"])
+
+    def test_gate_runs_only_in_its_phases(self):
+        self.configure({"docs": {"command": "echo ran > marker; exit 1", "phases": ["docs"]}},
+                       phases={"implement": {"next": "docs"}, "docs": {"next": "review"}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'docs'", out["reason"])
+        self.assertFalse(self.exists("marker"))
+        self.assertNotIn("qualityResults", self.state())
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("Quality gates failed: docs", out["reason"])
+        self.assertTrue(self.exists("marker"))
+        self.assertEqual("docs", self.state()["qualityResults"]["docs"]["phase"])
+
+    def test_plan_phase_never_runs_gates(self):
+        self.configure({"tests": {"command": "echo ran > marker; exit 1", "phases": ["plan"]}},
+                       phases={"plan": {"allowEdits": None}})
+        self.start_implement()
+        self.assertFalse(self.exists("marker"))
+        self.assertNotIn("qualityResults", self.state())
+
+    def test_malformed_gate_at_stop_fails_without_raising(self):
+        self.start_implement()  # /sl-go refuses invalid gates, so they change after the run started
+        self.configure({"nocommand": {"hint": "x"}, "badtimeout": {"command": "exit 0", "timeoutSec": "soon"},
+                        "../escape": {"command": "echo ran > marker; exit 1"}})
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: nocommand, badtimeout, ../escape", out["reason"])
+        self.assertIn("the gate has no command", out["reason"])
+        self.assertIn("timeoutSec is not a positive number", out["reason"])
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "escape.log")))
+        self.assertEqual(["badtimeout.log", "nocommand.log"], sorted(os.listdir(self.run_path("quality"))))
+
+    def test_empty_gates_block_behaves_as_before(self):
+        self.configure({})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("Phase 'implement' passed (no check configured). Now entering phase 'review'", out["reason"])
+        self.assertNotIn("qualityResults", self.state())
+        self.assertFalse(os.path.exists(self.run_path("quality")))
 
 
 if __name__ == "__main__":

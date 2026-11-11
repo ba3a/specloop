@@ -37,6 +37,22 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 | `timeoutSec` | `checkTimeoutSec` | Limit for this gate's command, a positive number of seconds. |
 | `hint` | none | Text added to the failure message, for example how to fix a finding properly. |
 
+## Running gates
+
+On a Stop, after the phase's `check` passes, the engine runs every gate whose `phases` list names the current phase, in declared order. Planning phases (`plan`, `feature-plan`, `feature-replan`) never run gates, and a failed `check` stops the Stop before any gate runs. Each gate runs its `command` with `shell` from the project root, with stderr merged into stdout, for at most its `timeoutSec`. No lock is held while gates run.
+
+- Exit code `0` is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, and so does a gate that times out or cannot be run; its log says why.
+- With `failFast: false` every gate runs, so all failures are reported at once. With `failFast: true` the first failing `block` gate ends the run: later gates do not run and keep their previous results. A failing `warn` gate never ends the run.
+- The phase passes only if every `block` gate passes. Failing `warn` gates are named, with their log paths, in the message that announces the next phase.
+
+## Failure reporting
+
+A failed gate run counts as one failed check, however many gates failed: the stop is blocked, the phase stays current, the iteration counter rises by one, and `maxIterations` stalls the run as for any check.
+
+The message starts with one line that names every failed gate, for example `Quality gates failed: lint, tests`, so a [delegated phase](delegation.md), which shows only that line, still names them all. Then it lists each failed gate with its `hint` and the end of its output, followed by failing `warn` gates; the whole message stays within `maxOutputChars`. The complete text, with every gate's full output, goes to `run/last-failure.md` (see [Phases](phases.md#runlast-failuremd)).
+
+Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail` or `warn`), `exitCode`, `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
+
 ## Changing gates in config.local.json
 
 `gates` is an object, not a list, so the deep merge of [`config.local.json`](configuration.md#personal-configuration-configlocaljson) works per gate and per key. Set one key to change it, or set a gate to `null` to remove it for yourself:

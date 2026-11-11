@@ -1532,6 +1532,165 @@ def quality_errors_message(config, errors):
         "\n".join("- " + e for e in errors), _rel("config.json"), _rel("config.local.json"), cmd_name(config, "go")))
 
 
+QUALITY_DIR = "quality"
+TRUNCATED = "...(truncated)...\n"
+
+
+def planning_phase(config, state):
+    """True in a planning or replanning phase, where gates never run."""
+    if in_replan(config, state):
+        return True
+    return not in_step(state) if is_feature(state) else state["phase"] == "plan"
+
+
+def selected_gates(config, state):
+    """(name, gate) for every gate that holds the current phase, in declared order."""
+    if planning_phase(config, state):
+        return []
+    phase = state["phase"]
+    selected = []
+    for name, gate in quality_gates(config).items():
+        phases = gate.get("phases", DEFAULT_GATE_PHASES) if isinstance(gate, dict) else None
+        if isinstance(phases, list) and phase in phases:
+            selected.append((name, gate))
+    return selected
+
+
+def gate_log_path(root, name):
+    return os.path.join(run_dir(root), QUALITY_DIR, name + ".log")
+
+
+def run_quality_gate(root, config, state, name, gate):
+    """Run one gate with no lock. Return (record, output): the record goes to state.qualityResults, the complete
+    output to run/quality/<name>.log. Never raises: a definition that cannot run counts as a failed run."""
+    timeout = gate.get("timeoutSec", config.get("checkTimeoutSec", 900))
+    command = gate.get("command")
+    started = time.monotonic()
+    exit_code, timed_out = None, False
+    if not isinstance(command, str) or not command.strip():
+        raw = b"[specloop] the gate has no command\n"
+    elif not _is_number(timeout) or timeout <= 0:
+        raw = ("[specloop] the gate's timeoutSec is not a positive number: %r\n" % (timeout,)).encode("utf-8")
+    else:
+        try:
+            proc = run_limited([resolve_shell(config), "-c", command], timeout, cwd=root, merge_stderr=True)
+            raw, exit_code, timed_out = proc.stdout, proc.returncode, proc.timed_out
+            if timed_out:
+                raw += ("\n[specloop] timed out after %s seconds\n" % timeout).encode("utf-8")
+        except (OSError, ValueError) as e:
+            raw = ("[specloop] the command could not be run: %s\n" % e).encode("utf-8")
+    duration = time.monotonic() - started
+    if GATE_NAME.fullmatch(name):
+        try:
+            os.makedirs(os.path.dirname(gate_log_path(root, name)), exist_ok=True)
+            with open(gate_log_path(root, name), "wb") as f:
+                f.write(raw)
+        except OSError as e:
+            print("[specloop] could not write the log of gate '%s': %s" % (name, e), file=sys.stderr)
+    if exit_code == 0:
+        result = "pass"
+    else:
+        result = "warn" if gate.get("level", "block") == "warn" else "fail"
+    record = {"name": name, "result": result, "exitCode": exit_code, "durationSec": round(duration, 2),
+              "phase": state["phase"], "stepId": state.get("stepId"), "finishedAt": now()}
+    if timed_out:
+        record["timedOut"] = True
+    return record, raw.decode("utf-8", errors="replace")
+
+
+def _gate_exit(record):
+    if record.get("timedOut"):
+        return "timed out"
+    if record["exitCode"] is None:
+        return "could not be run"
+    return "exit code %d" % record["exitCode"]
+
+
+def _shares(lengths, budget):
+    """Split budget over texts of the given lengths: short texts take what they need, long ones share the rest."""
+    shares = [0] * len(lengths)
+    remaining = max(budget, 0)
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    for done, i in enumerate(order):
+        shares[i] = min(lengths[i], remaining // (len(order) - done))
+        remaining -= shares[i]
+    return shares
+
+
+def _clip_tail(text, size):
+    if len(text) <= size:
+        return text
+    return TRUNCATED + text[len(text) - (size - len(TRUNCATED)):] if size > len(TRUNCATED) else ""
+
+
+def gate_failure(config, runs):
+    """(details, full) for a gate run with failed block gates. `runs` is a list of (record, output). The first
+    line names every failed gate; details stay within maxOutputChars, full holds every output complete."""
+    gates = quality_gates(config)
+    failed = [(r, o) for r, o in runs if r["result"] == "fail"]
+    warned = [(r, o) for r, o in runs if r["result"] == "warn"]
+    first = "Quality gates failed: %s\n" % ", ".join(r["name"] for r, _ in failed)
+    first += "The complete output of each gate is in %s.\n" % _rel("run", QUALITY_DIR, "<gate>.log")
+    sections = []
+    for record, output in failed + warned:
+        if record["result"] == "warn":
+            title = "\n### %s (%s; a warning, it does not block)\n" % (record["name"], _gate_exit(record))
+        else:
+            title = "\n### %s (%s)\n" % (record["name"], _gate_exit(record))
+        hint = (gates.get(record["name"]) or {}).get("hint")
+        if isinstance(hint, str) and hint:
+            title += "Hint: %s\n" % hint
+        sections.append((title, output.rstrip("\n")))
+    full = first + "".join(title + output + "\n" for title, output in sections)
+    limit = config.get("maxOutputChars", 4000)
+    fixed = len(first) + sum(len(title) + 1 for title, _ in sections)
+    shares = _shares([len(output) for _, output in sections], limit - fixed)
+    details = first + "".join(title + _clip_tail(output, share) + "\n"
+                              for (title, output), share in zip(sections, shares))
+    return details[:limit], full
+
+
+def gate_pass_details(details, runs):
+    """The check's details plus a note on the gates that passed and those that only warned."""
+    passed = [r["name"] for r, _ in runs if r["result"] == "pass"]
+    warned = ["%s (%s, see %s)" % (r["name"], _gate_exit(r), _rel("run", QUALITY_DIR, r["name"] + ".log"))
+              for r, _ in runs if r["result"] == "warn"]
+    notes = []
+    if passed:
+        notes.append("quality gates passed: %s" % ", ".join(passed))
+    if warned:
+        notes.append("quality gate warnings: %s" % ", ".join(warned))
+    return "; ".join([details] + notes)
+
+
+def run_quality_gates(root, config, state, outcome):
+    """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record."""
+    selected = selected_gates(config, state)
+    if not selected:
+        return outcome
+    fail_fast = quality_block(config).get("failFast") is True
+    runs = []
+    for name, gate in selected:
+        record, output = run_quality_gate(root, config, state, name, gate)
+        runs.append((record, output))
+        if fail_fast and record["result"] == "fail":
+            break
+    records = [record for record, _ in runs]
+    if any(record["result"] == "fail" for record in records):
+        details, full = gate_failure(config, runs)
+        return {"result": "fail", "details": details, "full": full, "quality": records}
+    return dict(outcome, details=gate_pass_details(outcome["details"], runs), quality=records)
+
+
+def record_quality(state, records):
+    """Store the last result of each gate that ran in state.qualityResults."""
+    results = state.get("qualityResults")
+    results = results if isinstance(results, dict) else {}
+    for record in records:
+        results[record["name"]] = {key: value for key, value in record.items() if key != "name"}
+    state["qualityResults"] = results
+
+
 # --- feature mode ----------------------------------------------------------------
 
 def git(root, config, *args, raw=False):
@@ -1921,7 +2080,7 @@ def release_gate(root):
 
 
 def evaluate_gate(root, config, state):
-    """Steps file checks, phase check and replan validation. Holds no lock and records nothing."""
+    """Steps file checks, phase check, quality gates and replan validation. Holds no lock and records nothing."""
     replanning = in_replan(config, state)
     if in_step(state) and not replanning and os.path.exists(replan_path(root, state)):
         return {"result": "replan"}
@@ -1931,6 +2090,10 @@ def evaluate_gate(root, config, state):
         return {"result": "fail", "details": head(violation, limit), "full": violation}
     result, details, full = check_phase(root, config, phase_graph(config, state)[state["phase"]], state)
     outcome = {"result": result, "details": details, "full": full}
+    if result == "pass":
+        outcome = run_quality_gates(root, config, state, outcome)
+        if outcome["result"] != "pass":
+            return outcome
     if result == "pass" and replanning:
         data, errors = replan_candidate(root, state)
         if errors:
@@ -1999,6 +2162,8 @@ def apply_gate(root, config, state, outcome, hook_input):
     if outcome["result"] == "replan":
         return request_replan(root, config, state, session)
     result, details, full = outcome["result"], outcome["details"], outcome["full"]
+    if outcome.get("quality"):
+        record_quality(state, outcome["quality"])
     phase = state["phase"]
     graph = phase_graph(config, state)
     state["iter"] = state.get("iter", 0) + 1
