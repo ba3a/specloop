@@ -8,6 +8,7 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 - The `quality` configuration block for quality gates: named commands such as a linter or the test suite, in declared order, that a gate set to `null` in `config.local.json` removes. `/sl-go` validates the block and refuses to start or resume while it has errors, listing every one. See [Quality gates](docs/quality-gates.md).
 - Quality gates run after a phase's `check` passes, by default in `implement`. A failing `block` gate keeps the phase and uses one iteration, however many gates failed; one message lists every failed gate with its hint and the end of its output. `quality.failFast` stops at the first failing `block` gate, and a failing `warn` gate is reported without blocking. Each gate's output goes to `run/quality/<gate>.log` and its last result to `qualityResults` in `state.json`. See [Quality gates](docs/quality-gates.md#running-gates).
+- A broken quality gate pauses the run instead of failing the phase: exit code 126 or 127, a timeout, a command that cannot be started, or a gate made invalid after `/sl-go`. The pause uses no iteration, records the gate and the reason in `pausedFor` in `state.json`, and tells you to run `/sl-go` to retry or `/sl-advance` to skip the phase. See [Quality gates](docs/quality-gates.md#broken-gates).
 
 ### Changed
 

@@ -41,7 +41,7 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 
 On a Stop, after the phase's `check` passes, the engine runs every gate whose `phases` list names the current phase, in declared order. Planning phases (`plan`, `feature-plan`, `feature-replan`) never run gates, and a failed `check` stops the Stop before any gate runs. Each gate runs its `command` with `shell` from the project root, with stderr merged into stdout, for at most its `timeoutSec`. No lock is held while gates run.
 
-- Exit code `0` is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, and so does a gate that times out or cannot be run; its log says why.
+- Exit code `0` is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, except 126 and 127, which make it [broken](#broken-gates).
 - With `failFast: false` every gate runs, so all failures are reported at once. With `failFast: true` the first failing `block` gate ends the run: later gates do not run and keep their previous results. A failing `warn` gate never ends the run.
 - The phase passes only if every `block` gate passes. Failing `warn` gates are named, with their log paths, in the message that announces the next phase.
 
@@ -51,7 +51,25 @@ A failed gate run counts as one failed check, however many gates failed: the sto
 
 The message starts with one line that names every failed gate, for example `Quality gates failed: lint, tests`, so a [delegated phase](delegation.md), which shows only that line, still names them all. Then it lists each failed gate with its `hint` and the end of its output, followed by failing `warn` gates; the whole message stays within `maxOutputChars`. The complete text, with every gate's full output, goes to `run/last-failure.md` (see [Phases](phases.md#runlast-failuremd)).
 
-Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail` or `warn`), `exitCode`, `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
+Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail`, `warn` or `broken`, with a `reason` when broken), `exitCode`, `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
+
+## Broken gates
+
+A gate is `broken` when it cannot give an answer, so neither the agent nor a retry of the same code can fix it:
+
+- its command exits with 126 or 127, the shell's codes for "not executable" and "not found", for example a tool that is not installed;
+- it runs longer than its `timeoutSec` and is killed with every process it started;
+- its command cannot be started at all, for example because the `shell` does not exist;
+- its definition is invalid when the Stop hook runs it. `/sl-go` validates the block (see [Validation](#validation)), but `config.json` or `config.local.json` may change afterwards. A gate that is not an object, or whose `phases` is not a list of phase names, counts in every phase that runs gates. An invalid key of the block itself, such as `failFast`, makes every gate of the phase broken, and a `quality` or `gates` value that is not an object pauses the run in every such phase.
+
+Any other exit code is an ordinary failure, even when its cause is a missing plugin or a broken build script: a Gradle wrapper that exits 1 fails the gate, and the agent handles it.
+
+A broken gate, at level `block` or `warn`, pauses the run instead of failing the phase. The status becomes `paused`, `state.json` records the first broken gate and its reason under `pausedFor`, for example `{"gate": "detekt", "reason": "command not found (exit 127)"}`, and the gate's last result is `broken` with the same `reason`. No iteration is used and nothing is written to `run/last-failure.md`. The stop is not blocked: the message is for you, and it names each broken gate with its reason. Invalid definitions are all reported at once and no gate command runs. A gate that breaks while running ends the run of gates; later gates do not run and keep their previous results.
+
+Fix the gate or install its tool, then:
+
+- `/sl-go` resumes the run and clears `pausedFor`. The next stop runs every gate of the phase again.
+- `/sl-advance` skips the phase, as it does from any pause, and clears `pausedFor`. The run stays paused until `/sl-go`.
 
 ## Changing gates in config.local.json
 
@@ -65,7 +83,7 @@ A gate that only you define is added after the shared ones.
 
 ## Validation
 
-`/sl-go` checks the merged `quality` block before it starts or resumes a run. It reports every problem it finds and changes nothing until they are fixed: an unknown key or a wrong type, an unknown `steps`, `level` or `legacy` value, an invalid gate name or regular expression, a phase in `phases` that does not exist or sets `allowEdits`, and a project that is not a git work tree while a gate uses `{changed_files}`, `{changed_files_file}` or `forbid`.
+`/sl-go` checks the merged `quality` block before it starts or resumes a run. It reports every problem it finds and changes nothing until they are fixed. The Stop hook checks the gates it runs again and treats an invalid one as [broken](#broken-gates). The problems are: an unknown key or a wrong type, an unknown `steps`, `level` or `legacy` value, an invalid gate name or regular expression, a phase in `phases` that does not exist or sets `allowEdits`, and a project that is not a git work tree while a gate uses `{changed_files}`, `{changed_files_file}` or `forbid`.
 
 ## See also
 

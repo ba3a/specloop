@@ -1,12 +1,15 @@
 """Tests for quality gates: the `quality` configuration block and its validation."""
 
+import contextlib
 import copy
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -404,8 +407,8 @@ def lines(prefix, count):
     return "for i in $(seq 1 %d); do echo %s-$i; done" % (count, prefix)
 
 
-class GateRunTest(QualityProject):
-    """Gates run after a phase's check passes, in single mode."""
+class GateProject(QualityProject):
+    """Helpers for tests that run gates in a workflow. Holds no tests itself."""
 
     def configure(self, gates, quality=None, **top):
         config = dict(top, quality=dict(quality or {}, gates=gates))
@@ -431,6 +434,10 @@ class GateRunTest(QualityProject):
     def read(self, path):
         with open(path, encoding="utf-8") as f:
             return f.read()
+
+
+class GateRunTest(GateProject):
+    """Gates run after a phase's check passes, in single mode."""
 
     def test_failing_block_gate_keeps_implement(self):
         self.configure({"tests": {"command": "echo boom-output; exit 1"}})
@@ -636,18 +643,6 @@ class GateRunTest(QualityProject):
         self.assertFalse(self.exists("marker"))
         self.assertNotIn("qualityResults", self.state())
 
-    def test_malformed_gate_at_stop_fails_without_raising(self):
-        self.start_implement()  # /sl-go refuses invalid gates, so they change after the run started
-        self.configure({"nocommand": {"hint": "x"}, "badtimeout": {"command": "exit 0", "timeoutSec": "soon"},
-                        "../escape": {"command": "echo ran > marker; exit 1"}})
-        out = workflow.handle_stop(self.root, {})
-        self.assertEqual("block", out["decision"])
-        self.assertIn("Quality gates failed: nocommand, badtimeout, ../escape", out["reason"])
-        self.assertIn("the gate has no command", out["reason"])
-        self.assertIn("timeoutSec is not a positive number", out["reason"])
-        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "escape.log")))
-        self.assertEqual(["badtimeout.log", "nocommand.log"], sorted(os.listdir(self.run_path("quality"))))
-
     def test_empty_gates_block_behaves_as_before(self):
         self.configure({})
         self.start_implement()
@@ -655,6 +650,250 @@ class GateRunTest(QualityProject):
         self.assertIn("Phase 'implement' passed (no check configured). Now entering phase 'review'", out["reason"])
         self.assertNotIn("qualityResults", self.state())
         self.assertFalse(os.path.exists(self.run_path("quality")))
+
+
+class BrokenGateTest(GateProject):
+    """A gate that cannot give an answer pauses the run and uses no iteration."""
+
+    def assertPaused(self, out, gate, reason=None):
+        self.assertNotIn("decision", out)
+        state = self.state()
+        self.assertEqual("paused", state["status"])
+        self.assertEqual(gate, state["pausedFor"].get("gate"))
+        if reason is not None:
+            self.assertEqual(reason, state["pausedFor"]["reason"])
+        if gate is not None:
+            self.assertEqual("broken", state["qualityResults"][gate]["result"])
+            self.assertEqual(state["pausedFor"]["reason"], state["qualityResults"][gate]["reason"])
+        return state
+
+    def stop_broken(self, gates, gate, reason=None, **top):
+        self.configure(gates, **top)
+        self.start_implement()
+        before = self.state()
+        out = workflow.handle_stop(self.root, {})
+        state = self.assertPaused(out, gate, reason)
+        self.assertEqual(before["iter"], state["iter"])
+        self.assertEqual("implement", state["phase"])
+        self.assertFalse(os.path.exists(self.run_path("last-failure.md")))
+        self.assertEqual("broken", state["history"][-1]["result"])
+        return out, state
+
+    def test_exit_127_pauses_the_run(self):
+        out, _ = self.stop_broken({"detekt": {"command": "exit 127"}}, "detekt", "command not found (exit 127)")
+        self.assertEqual(127, self.state()["qualityResults"]["detekt"]["exitCode"])
+
+    def test_missing_tool_is_broken(self):
+        self.stop_broken({"detekt": {"command": "no-such-tool-specloop --check"}}, "detekt",
+                         "command not found (exit 127)")
+
+    def test_exit_126_is_broken(self):
+        self.stop_broken({"lint": {"command": "exit 126"}}, "lint", "command not executable (exit 126)")
+
+    def test_timeout_is_broken(self):
+        started = time.monotonic()
+        _, state = self.stop_broken({"slow": {"command": "sleep 30", "timeoutSec": 1}}, "slow",
+                                    "timed out after 1 seconds")
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertTrue(state["qualityResults"]["slow"]["timedOut"])
+
+    def test_os_error_is_broken(self):
+        missing = os.path.join(self.root, "no-such-shell")
+        with mock.patch.object(workflow, "resolve_shell", return_value=missing):
+            _, state = self.stop_broken({"tests": {"command": "exit 0"}}, "tests")
+        self.assertIn("could not be run", state["pausedFor"]["reason"])
+
+    def test_exit_1_is_an_ordinary_failure(self):
+        self.configure({"tests": {"command": "exit 1"}})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        state = self.state()
+        self.assertEqual("active", state["status"])
+        self.assertNotIn("pausedFor", state)
+        self.assertEqual("fail", state["qualityResults"]["tests"]["result"])
+
+    def test_broken_warn_gate_pauses_too(self):
+        self.stop_broken({"style": {"command": "exit 127", "level": "warn"}}, "style")
+
+    def test_pause_message_names_gate_reason_and_commands(self):
+        out, _ = self.stop_broken({"detekt": {"command": "exit 127", "hint": "Run detekt properly."}}, "detekt")
+        message = out["systemMessage"]
+        for text in ("detekt", "command not found (exit 127)", "/sl-go", "/sl-advance", "no iteration"):
+            self.assertIn(text, message)
+        self.assertNotIn("Keep working", message)
+        self.assertNotIn("Run detekt properly.", message)
+
+    def test_pause_message_uses_the_command_prefix(self):
+        out, _ = self.stop_broken({"detekt": {"command": "exit 127"}}, "detekt", commandPrefix="x-")
+        self.assertIn("/x-go", out["systemMessage"])
+        self.assertIn("/x-advance", out["systemMessage"])
+
+    def test_broken_gate_wins_over_a_failing_gate(self):
+        _, state = self.stop_broken({"lint": {"command": "exit 1"}, "detekt": {"command": "exit 127"}}, "detekt")
+        self.assertEqual("fail", state["qualityResults"]["lint"]["result"])
+
+    def test_gates_after_a_broken_gate_do_not_run(self):
+        self.stop_broken({"detekt": {"command": "exit 127"}, "tests": {"command": "echo ran > marker"}}, "detekt")
+        self.assertFalse(self.exists("marker"))
+        self.assertNotIn("tests", self.state()["qualityResults"])
+
+    def test_broken_gate_in_a_delegated_phase_pauses(self):
+        self.stop_broken({"detekt": {"command": "exit 127"}}, "detekt", phases={"implement": {"delegate": True}})
+
+    def test_go_resumes_and_the_next_stop_runs_the_gates_again(self):
+        self.stop_broken({"detekt": {"command": "test -f tool || exit 127; echo ran >> runs"}}, "detekt")
+        out = workflow.cmd_go(self.root)
+        self.assertIn("phase=implement", out)
+        state = self.state()
+        self.assertEqual("active", state["status"])
+        self.assertNotIn("pausedFor", state)
+        with open(os.path.join(self.root, "tool"), "w") as f:
+            f.write("")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual("pass", self.state()["qualityResults"]["detekt"]["result"])
+        self.assertTrue(self.exists("runs"))
+
+    def test_go_after_a_pause_that_is_still_broken_pauses_again(self):
+        self.stop_broken({"detekt": {"command": "exit 127"}}, "detekt")
+        iter_before = self.state()["iter"]
+        workflow.cmd_go(self.root)
+        self.assertPaused(workflow.handle_stop(self.root, {}), "detekt")
+        self.assertEqual(iter_before, self.state()["iter"])
+
+    def test_advance_skips_the_phase_and_clears_paused_for(self):
+        self.stop_broken({"detekt": {"command": "exit 127"}}, "detekt")
+        out = workflow.cmd_advance(self.root)
+        self.assertIn("Advanced to phase 'review'", out)
+        state = self.state()
+        self.assertNotIn("pausedFor", state)
+        self.assertEqual("paused", state["status"])
+        workflow.cmd_go(self.root)
+        self.assertEqual("active", self.state()["status"])
+
+    def test_gate_made_invalid_after_go_is_broken(self):
+        self.configure({"lint": {"command": "echo ran > marker"}})
+        self.start_implement()
+        self.configure({"lint": {"command": "echo ran > marker", "level": "fatal"}})
+        out = workflow.handle_stop(self.root, {})
+        state = self.assertPaused(out, "lint")
+        self.assertIn("invalid definition", state["pausedFor"]["reason"])
+        self.assertIn("quality.gates.lint.level", state["pausedFor"]["reason"])
+        self.assertFalse(self.exists("marker"))
+
+    def test_invalid_definitions_are_all_reported_and_nothing_runs(self):
+        self.start_implement()  # /sl-go refuses invalid gates, so they change after the run started
+        self.configure({"ok": {"command": "echo ran > marker"}, "nocommand": {"hint": "x"},
+                        "badtimeout": {"command": "exit 0", "timeoutSec": "soon"},
+                        "../escape": {"command": "echo ran > marker; exit 1"}})
+        out = workflow.handle_stop(self.root, {})
+        self.assertPaused(out, "nocommand")
+        for text in ("nocommand", "badtimeout", "../escape", "command is required", "timeoutSec"):
+            self.assertIn(text, out["systemMessage"])
+        self.assertFalse(self.exists("marker"))
+        self.assertNotIn("ok", self.state()["qualityResults"])
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "escape.log")))
+        self.assertEqual(["badtimeout.log", "nocommand.log"], sorted(os.listdir(self.run_path("quality"))))
+
+    def test_gate_that_is_not_an_object_is_broken(self):
+        self.start_implement()
+        self.configure({"lint": "exit 0"})
+        self.assertPaused(workflow.handle_stop(self.root, {}), "lint")
+
+    def test_gate_with_unreadable_phases_is_broken(self):
+        self.start_implement()
+        self.configure({"lint": {"command": "exit 0", "phases": "implement"}})
+        self.assertPaused(workflow.handle_stop(self.root, {}), "lint")
+
+    def test_invalid_block_key_breaks_the_selected_gates(self):
+        self.start_implement()
+        self.configure({"lint": {"command": "exit 0"}}, {"failFast": "yes"})
+        state = self.assertPaused(workflow.handle_stop(self.root, {}), "lint")
+        self.assertIn("quality.failFast", state["pausedFor"]["reason"])
+
+    def test_gates_that_are_not_an_object_pause_the_run(self):
+        self.start_implement()
+        self.set_config({"quality": {"gates": ["lint"]}})
+        out = workflow.handle_stop(self.root, {})
+        state = self.assertPaused(out, None)
+        self.assertIn("quality.gates must be an object", state["pausedFor"]["reason"])
+        self.assertIn("/sl-go", out["systemMessage"])
+
+    def test_quality_that_is_not_an_object_pauses_the_run(self):
+        self.start_implement()
+        self.set_config({"quality": None})
+        state = self.assertPaused(workflow.handle_stop(self.root, {}), None)
+        self.assertIn("quality must be an object", state["pausedFor"]["reason"])
+
+    def test_planning_phase_ignores_a_malformed_block(self):
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.set_config({"quality": {"gates": ["lint"]}})
+        with open(self.run_path("plan.md"), "w") as f:
+            f.write("- [ ] step")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'implement'", out["reason"])
+
+    def test_dropped_when_the_gate_mark_changes(self):
+        self.configure({"detekt": {"command": "exit 127"}})
+        self.start_implement()
+        original = workflow.run_limited
+
+        def reset_then_run(*args, **kwargs):
+            workflow.cmd_pause(self.root)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(workflow, "run_limited", side_effect=reset_then_run):
+            self.assertIsNone(workflow.handle_stop(self.root, {}))
+        state = self.state()
+        self.assertNotIn("pausedFor", state)
+        self.assertNotIn("qualityResults", state)
+
+
+class MalformedConfigHooksTest(GateProject):
+    """No shape of the quality block makes a hook entry point fail."""
+
+    SHAPES = [
+        {"quality": None}, {"quality": ["x"]}, {"quality": "gates"}, {"quality": {"gates": ["lint"]}},
+        {"quality": {"gates": "lint"}}, {"quality": {"gates": {"lint": "exit 0"}}},
+        {"quality": {"gates": {"lint": ["exit 0"]}}}, {"quality": {"gates": {"lint": 5}}},
+        {"quality": {"gates": {"lint": {"command": 5, "phases": "implement", "hint": 3, "level": []}}}},
+        {"quality": {"gates": {"lint": {"command": "exit 0", "phases": [None], "timeoutSec": {}}}}},
+        {"quality": {"gates": {"lint": {"command": "exit 0", "metric": "x", "forbid": "y", "protect": 1}}}},
+        {"quality": {"timeoutSec": "x", "failFast": [], "legacy": {}, "gates": {"lint": {"command": "exit 0"}}}},
+    ]
+
+    def run_main(self, *argv, stdin="{}"):
+        old_stdin, sys.stdin = sys.stdin, io.StringIO(stdin)
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = workflow.main(list(argv))
+        finally:
+            sys.stdin = old_stdin
+            del os.environ["CLAUDE_PROJECT_DIR"]
+        return code, out.getvalue(), err.getvalue()
+
+    def test_hook_entry_points_exit_0_without_errors(self):
+        self.start_implement()
+        state = self.state_bytes()
+        pretool = json.dumps({"tool_name": "Edit", "tool_input": {"file_path": os.path.join(self.root, "a.txt")}})
+        for shape in self.SHAPES:
+            with self.subTest(shape=shape):
+                with open(os.path.join(self.base, "state.json"), "wb") as f:
+                    f.write(state)
+                self.set_config(shape)
+                for argv, stdin in ((["context", "SessionStart"], "{}"), (["context", "UserPromptSubmit"], "{}"),
+                                    (["pretool"], pretool), (["stop"], "{}")):
+                    code, out, err = self.run_main(*argv, stdin=stdin)
+                    self.assertEqual(0, code, argv)
+                    self.assertNotIn("Traceback", err, argv)
+                    self.assertNotIn("hook error", err, argv)
+                    if out.strip():
+                        json.loads(out)
+                self.assertEqual("paused", self.state()["status"])
 
 
 if __name__ == "__main__":

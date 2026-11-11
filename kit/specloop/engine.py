@@ -1315,7 +1315,9 @@ FORBID_KEYS = ("pattern", "glob", "message")
 GATE_STEPS = ("each", "last")
 GATE_LEVELS = ("block", "warn")
 LEGACY_MODES = ("baseline", "ratchet")
-SHELL_EXIT_CODES = (126, 127)  # "not executable" and "not found": a gate exiting so is broken, never passed
+# Shell conventions for "not executable" and "not found": a gate exiting so is broken, never passed.
+SHELL_EXIT_REASONS = {126: "command not executable (exit 126)", 127: "command not found (exit 127)"}
+SHELL_EXIT_CODES = tuple(sorted(SHELL_EXIT_REASONS))
 CHANGED_FILES_PLACEHOLDERS = ("{changed_files}", "{changed_files_file}")
 DEFAULT_GATE_PHASES = ["implement"]
 
@@ -1493,38 +1495,87 @@ def validate_quality(root, config):
         return ["quality could not be validated: %s" % (str(e) or e.__class__.__name__)]
 
 
-def _validate_quality(root, config):
+def unreadable_quality(config):
+    """Why no gate can be read from the quality block, or None when the gates can be listed."""
     if not isinstance(config, dict) or "quality" not in config:
-        return []
-    block = config["quality"]
-    if not isinstance(block, dict):
-        return ["quality must be an object"]
+        return None
+    if not isinstance(config["quality"], dict):
+        return "quality must be an object"
+    if not isinstance(config["quality"].get("gates", {}), dict):
+        return "quality.gates must be an object that maps gate names to gates"
+    return None
+
+
+def _quality_key_errors(block):
+    """Errors of the quality block's own keys other than `gates`."""
     errors = ["quality has an unknown key %r" % key for key in block if key not in QUALITY_KEYS]
     if "timeoutSec" in block and not (_is_int(block["timeoutSec"]) and block["timeoutSec"] > 0):
         errors.append("quality.timeoutSec must be a positive integer")
     if "failFast" in block and not isinstance(block["failFast"], bool):
         errors.append("quality.failFast must be true or false")
-    default_legacy = block.get("legacy", "baseline")
-    if default_legacy not in LEGACY_MODES:
+    if block.get("legacy", "baseline") not in LEGACY_MODES:
         errors.append("quality.legacy must be one of %s" % ", ".join('"%s"' % a for a in LEGACY_MODES))
-    gates = block.get("gates", {})
-    if not isinstance(gates, dict):
-        errors.append("quality.gates must be an object that maps gate names to gates")
-        return errors
+    return errors
+
+
+def _named_gate_errors(name, gate, block, definitions):
+    """Errors of one gate including its name, and whether it needs git."""
+    errors = []
+    if not (isinstance(name, str) and GATE_NAME.fullmatch(name)):
+        errors.append("gate name %r must match [A-Za-z0-9][A-Za-z0-9_-]* (it becomes a file name)" % name)
+    gate_errors, needs_git = _validate_gate("quality.gates.%s" % name, gate, block.get("legacy", "baseline"),
+                                            definitions)
+    return errors + gate_errors, needs_git
+
+
+def _git_errors(names):
+    return ["quality.gates.%s uses {changed_files}, {changed_files_file} or forbid, which need a git work tree, "
+            "but the project is not one" % name for name in names]
+
+
+def _validate_quality(root, config):
+    if not isinstance(config, dict) or "quality" not in config:
+        return []
+    block = config["quality"]
+    if not isinstance(block, dict):
+        return [unreadable_quality(config)]
+    errors = _quality_key_errors(block)
+    if unreadable_quality(config):
+        return errors + [unreadable_quality(config)]
     definitions = _phase_definitions(config)
     git_users = []
     for name, gate in quality_gates(config).items():
-        where = "quality.gates.%s" % name
-        if not (isinstance(name, str) and GATE_NAME.fullmatch(name)):
-            errors.append("gate name %r must match [A-Za-z0-9][A-Za-z0-9_-]* (it becomes a file name)" % name)
-        gate_errors, needs_git = _validate_gate(where, gate, default_legacy, definitions)
+        gate_errors, needs_git = _named_gate_errors(name, gate, block, definitions)
         errors.extend(gate_errors)
         if needs_git:
             git_users.append(name)
     if git_users and not is_git_work_tree(root, config):
-        errors.extend("quality.gates.%s uses {changed_files}, {changed_files_file} or forbid, which need a git "
-                      "work tree, but the project is not one" % name for name in git_users)
+        errors.extend(_git_errors(git_users))
     return errors
+
+
+def gate_definition_errors(root, config, selected):
+    """{name: errors} for the selected gates whose definition is invalid now. The config may have changed since
+    /sl-go validated it, so the Stop hook checks again; errors of the block's own keys count for every gate.
+    Never raises."""
+    try:
+        block = quality_block(config)
+        common = _quality_key_errors(block)
+        definitions = _phase_definitions(config)
+        problems, git_users = collections.OrderedDict(), []
+        for name, gate in selected:
+            errors, needs_git = _named_gate_errors(name, gate, block, definitions)
+            if needs_git:
+                git_users.append(name)
+            if common or errors:
+                problems[name] = common + errors
+        if git_users and not is_git_work_tree(root, config):
+            for name, error in zip(git_users, _git_errors(git_users)):
+                problems.setdefault(name, []).append(error)
+        return problems
+    except Exception as e:  # validation must never break a hook
+        reason = "could not be validated: %s" % (str(e) or e.__class__.__name__)
+        return collections.OrderedDict((name, [reason]) for name, _ in selected)
 
 
 def quality_errors_message(config, errors):
@@ -1544,14 +1595,15 @@ def planning_phase(config, state):
 
 
 def selected_gates(config, state):
-    """(name, gate) for every gate that holds the current phase, in declared order."""
+    """(name, gate) for every gate that holds the current phase, in declared order. A gate that is not an object
+    or whose `phases` is not a list of names holds every phase, so it comes out broken instead of being skipped."""
     if planning_phase(config, state):
         return []
     phase = state["phase"]
     selected = []
     for name, gate in quality_gates(config).items():
         phases = gate.get("phases", DEFAULT_GATE_PHASES) if isinstance(gate, dict) else None
-        if isinstance(phases, list) and phase in phases:
+        if not _string_list(phases) or phase in phases:
             selected.append((name, gate))
     return selected
 
@@ -1560,42 +1612,79 @@ def gate_log_path(root, name):
     return os.path.join(run_dir(root), QUALITY_DIR, name + ".log")
 
 
+def write_gate_log(root, name, raw):
+    """Replace run/quality/<name>.log. A name that is not a valid gate name gets no file. Never raises."""
+    if not (isinstance(name, str) and GATE_NAME.fullmatch(name)):
+        return
+    try:
+        os.makedirs(os.path.dirname(gate_log_path(root, name)), exist_ok=True)
+        with open(gate_log_path(root, name), "wb") as f:
+            f.write(raw)
+    except OSError as e:
+        print("[specloop] could not write the log of gate '%s': %s" % (name, e), file=sys.stderr)
+
+
+def gate_record(state, name, result, exit_code, duration, **extra):
+    return dict({"name": name, "result": result, "exitCode": exit_code, "durationSec": round(duration, 2),
+                 "phase": state["phase"], "stepId": state.get("stepId"), "finishedAt": now()}, **extra)
+
+
 def run_quality_gate(root, config, state, name, gate):
-    """Run one gate with no lock. Return (record, output): the record goes to state.qualityResults, the complete
-    output to run/quality/<name>.log. Never raises: a definition that cannot run counts as a failed run."""
+    """Run one valid gate with no lock. Return (record, output): the record goes to state.qualityResults, the
+    complete output to run/quality/<name>.log. Never raises. A gate that cannot give an answer (exit code 126 or
+    127, a timeout, a command that cannot be started) is `broken`, and its record says why in `reason`."""
     timeout = gate.get("timeoutSec", config.get("checkTimeoutSec", 900))
-    command = gate.get("command")
     started = time.monotonic()
-    exit_code, timed_out = None, False
-    if not isinstance(command, str) or not command.strip():
-        raw = b"[specloop] the gate has no command\n"
-    elif not _is_number(timeout) or timeout <= 0:
-        raw = ("[specloop] the gate's timeoutSec is not a positive number: %r\n" % (timeout,)).encode("utf-8")
+    exit_code, timed_out, reason = None, False, None
+    if not _is_number(timeout) or timeout <= 0:
+        reason = "timeoutSec is not a positive number: %r" % (timeout,)
+        raw = ("[specloop] %s\n" % reason).encode("utf-8")
     else:
         try:
-            proc = run_limited([resolve_shell(config), "-c", command], timeout, cwd=root, merge_stderr=True)
+            proc = run_limited([resolve_shell(config), "-c", gate["command"]], timeout, cwd=root, merge_stderr=True)
             raw, exit_code, timed_out = proc.stdout, proc.returncode, proc.timed_out
             if timed_out:
-                raw += ("\n[specloop] timed out after %s seconds\n" % timeout).encode("utf-8")
+                reason = "timed out after %s seconds" % timeout
+            else:
+                reason = SHELL_EXIT_REASONS.get(exit_code)
+            if reason:
+                raw += ("\n[specloop] %s\n" % reason).encode("utf-8")
         except (OSError, ValueError) as e:
-            raw = ("[specloop] the command could not be run: %s\n" % e).encode("utf-8")
+            reason = "the command could not be run: %s" % e
+            raw = ("[specloop] %s\n" % reason).encode("utf-8")
     duration = time.monotonic() - started
-    if GATE_NAME.fullmatch(name):
-        try:
-            os.makedirs(os.path.dirname(gate_log_path(root, name)), exist_ok=True)
-            with open(gate_log_path(root, name), "wb") as f:
-                f.write(raw)
-        except OSError as e:
-            print("[specloop] could not write the log of gate '%s': %s" % (name, e), file=sys.stderr)
-    if exit_code == 0:
+    write_gate_log(root, name, raw)
+    if reason:
+        result = "broken"
+    elif exit_code == 0:
         result = "pass"
     else:
         result = "warn" if gate.get("level", "block") == "warn" else "fail"
-    record = {"name": name, "result": result, "exitCode": exit_code, "durationSec": round(duration, 2),
-              "phase": state["phase"], "stepId": state.get("stepId"), "finishedAt": now()}
+    record = gate_record(state, name, result, exit_code, duration)
+    if reason:
+        record["reason"] = reason
     if timed_out:
         record["timedOut"] = True
     return record, raw.decode("utf-8", errors="replace")
+
+
+def invalid_gate_record(root, state, name, errors):
+    """The broken record of a gate whose definition is invalid; its command does not run."""
+    reason = "invalid definition: %s" % "; ".join(errors)
+    write_gate_log(root, name, ("[specloop] the gate did not run: %s\n" % reason).encode("utf-8"))
+    return gate_record(state, name, "broken", None, 0, reason=reason)
+
+
+def broken_outcome(records, paused_for):
+    """The outcome of a Stop whose gates could not give an answer. `records` are every gate that ran or was
+    judged; the details name each broken gate and its reason."""
+    broken = [r for r in records if r["result"] == "broken"]
+    if broken:
+        lines = ["Quality gate '%s' is broken: %s" % (r["name"], r["reason"]) for r in broken]
+    else:
+        lines = ["The quality configuration is broken: %s" % paused_for["reason"]]
+    details = "\n".join(lines)
+    return {"result": "broken", "details": details, "full": details, "quality": records, "pausedFor": paused_for}
 
 
 def _gate_exit(record):
@@ -1664,15 +1753,29 @@ def gate_pass_details(details, runs):
 
 
 def run_quality_gates(root, config, state, outcome):
-    """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record."""
+    """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record.
+
+    Definitions are checked first: an invalid gate is broken and no command runs. The first gate that breaks
+    while running ends the run of gates, because the run pauses and every gate runs again after /sl-go."""
+    if planning_phase(config, state):
+        return outcome
+    unreadable = unreadable_quality(config)
+    if unreadable:
+        return broken_outcome([], {"reason": "invalid quality configuration: %s" % unreadable})
     selected = selected_gates(config, state)
     if not selected:
         return outcome
+    invalid = gate_definition_errors(root, config, selected)
+    if invalid:
+        records = [invalid_gate_record(root, state, name, errors) for name, errors in invalid.items()]
+        return broken_outcome(records, {"gate": records[0]["name"], "reason": records[0]["reason"]})
     fail_fast = quality_block(config).get("failFast") is True
     runs = []
     for name, gate in selected:
         record, output = run_quality_gate(root, config, state, name, gate)
         runs.append((record, output))
+        if record["result"] == "broken":
+            return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]})
         if fail_fast and record["result"] == "fail":
             break
     records = [record for record, _ in runs]
@@ -2165,6 +2268,8 @@ def apply_gate(root, config, state, outcome, hook_input):
     if outcome.get("quality"):
         record_quality(state, outcome["quality"])
     phase = state["phase"]
+    if result == "broken":
+        return pause_for_broken_gate(config, state, session, outcome)
     graph = phase_graph(config, state)
     state["iter"] = state.get("iter", 0) + 1
     add_history(state, session, phase=phase, result=result, iter=state["iter"])
@@ -2230,6 +2335,18 @@ def apply_gate(root, config, state, outcome, hook_input):
             reason = "Phase '%s' is not complete yet. %s\n\nKeep working on phase '%s'.\n\n%s" % (
                 phase, details, phase, phase_instructions(root, config, state))
     return block_or_stall(root, config, state, phase, reason)
+
+
+def pause_for_broken_gate(config, state, session, outcome):
+    """A gate could not give an answer: pause with no iteration used and no failure for the agent to act on.
+    The message is for the user."""
+    phase = state["phase"]
+    state.update(status="paused", pausedFor=outcome["pausedFor"])
+    add_history(state, session, phase=phase, result="broken", iter=state.get("iter", 0))
+    return {"systemMessage": (
+        "[specloop] %s\nThe workflow is paused in phase '%s'; no iteration was used. Fix the gate or install "
+        "its tool, then run %s to run the gates again, or run %s to skip the phase." % (
+            outcome["details"], phase, cmd_name(config, "go"), cmd_name(config, "advance")))}
 
 
 def block_or_stall(root, config, state, phase, reason):
@@ -2495,6 +2612,7 @@ def cmd_go(root):
 def resume(root, config, state, plan, replan):
     """Everything cmd_go changes in the state, on the reloaded state. Return the command's output."""
     state.pop("gate", None)  # left behind by a killed Stop hook, it would hold every later check back
+    state.pop("pausedFor", None)  # a broken gate runs again on the next stop
     if plan is not None:
         approve_plan(root, config, state, plan)
     if replan is not None and adopt_replan(root, config, state, replan) == "done":
@@ -2553,6 +2671,7 @@ def cmd_advance(root):
     def apply(current):
         if not current or current["phase"] == DONE:
             raise Unchanged("Nothing to advance.")
+        current.pop("pausedFor", None)  # skipping the phase skips its broken gate
         if in_replan(config, current) and replan is not None:
             add_history(current, None, phase=current["phase"], result="skipped")
             if adopt_replan(root, config, current, replan) == "done":
