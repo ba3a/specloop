@@ -25,6 +25,8 @@ kit/commands/*.md                     slash command templates; {{prefix}} is sub
                                       (spec, feature, go, pause, advance, status, reset, update)
                                       kit/commands/update.md is /sl-update (check, skip, never)
 tests/                                unittest suites for the engine, the installer and the docs
+tests/run_parallel.py                 runs the suites on several worker processes
+tests/gitfixture.py                   git repositories for update tests: built once per process, copied per test
 README.md                             short introduction, at most 80 lines
 CHANGELOG.md                          release history (Keep a Changelog); repository root only, not installed
 docs/README.md                        documentation index: every page listed once, in four groups
@@ -36,7 +38,8 @@ Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,
 ## Commands
 
 ```bash
-python -m unittest discover -s tests          # run all tests
+python tests/run_parallel.py                  # run all tests on every CPU core (-j N, --durations N)
+python -m unittest discover -s tests          # run all tests in one process
 python -m unittest tests.test_engine -v       # one suite
 ./install.sh /path/to/sandbox-project         # manual end-to-end check
 ```

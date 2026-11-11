@@ -10,7 +10,14 @@ Builds, in a temporary directory:
 GIT_CEILING_DIRECTORIES is set while the fixture is alive so git never discovers a
 repository outside the temporary directory, and every repository gets a local identity,
 so nothing depends on the developer's machine. No test touches the network.
+
+The repositories are built once per process, in a template directory removed at exit, and each
+fixture copies them. Building them with git for every test is slow: every command is a new
+process, and an on-access virus scanner inspects each new object file when git first reads it.
+The template is packed, so a copy holds a few files instead of one per object.
 """
+
+import atexit
 
 import os
 import shutil
@@ -45,9 +52,21 @@ def copy_kit_source(dest):
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
 
+_template = None  # The fixture whose repositories every other fixture copies.
+
+
+def template():
+    """Return the template fixture, building it on first use."""
+    global _template
+    if _template is None:
+        _template = GitFixture(_is_template=True)
+        atexit.register(shutil.rmtree, _template.root, onerror=_force_remove)
+    return _template
+
+
 class GitFixture(object):
 
-    def __init__(self):
+    def __init__(self, _is_template=False):
         self.root = os.path.realpath(tempfile.mkdtemp())
         self._ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
         os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self.root)
@@ -56,7 +75,11 @@ class GitFixture(object):
         self.work = os.path.join(self.root, "work")
         self.target = os.path.join(self.root, "target")
         try:
-            self._build()
+            if _is_template:
+                self._build()
+                self._restore_ceiling()
+            else:
+                self._copy_template()
         except Exception:
             self.cleanup()
             raise
@@ -101,6 +124,18 @@ class GitFixture(object):
         shutil.rmtree(seed, onerror=_force_remove)
         self.clone_remote(self.clone)
         self.init_repo(self.target)
+        for repo in (self.remote, self.clone):
+            self.git(repo, "gc", "-q")
+
+    def _copy_template(self):
+        source = template()
+        for name in ("remote", "clone", "target"):
+            shutil.copytree(getattr(source, name), getattr(self, name))
+        self._point_at_remote(self.clone)
+
+    def _point_at_remote(self, repo):
+        """Make a copy of the template's clone track this fixture's remote."""
+        self.git(repo, "config", "remote.origin.url", self.remote)
 
     def head(self, repo=None):
         return self.git(repo or self.clone, "rev-parse", "HEAD")
@@ -118,9 +153,9 @@ class GitFixture(object):
     def bump_remote_version(self, version):
         """Commit a new VERSION in the bare repository through a second clone; return the commit."""
         if not os.path.isdir(self.work):
-            self.clone_remote(self.work)
-        else:
-            self.git(self.work, "pull", "-q", "--ff-only")
+            shutil.copytree(template().clone, self.work)
+            self._point_at_remote(self.work)
+        self.git(self.work, "pull", "-q", "--ff-only")
         commit = self._commit_version(self.work, version)
         self.git(self.work, "push", "-q", "origin", BRANCH)
         return commit
@@ -137,11 +172,14 @@ class GitFixture(object):
                               env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, universal_newlines=True, **kwargs)
 
-    def cleanup(self):
+    def _restore_ceiling(self):
         if self._ceiling is None:
             os.environ.pop("GIT_CEILING_DIRECTORIES", None)
         else:
             os.environ["GIT_CEILING_DIRECTORIES"] = self._ceiling
+
+    def cleanup(self):
+        self._restore_ceiling()
         shutil.rmtree(self.root, onerror=_force_remove)
 
 

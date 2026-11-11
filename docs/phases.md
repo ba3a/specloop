@@ -17,7 +17,7 @@ Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of
 | `verdict` | `path`, `approve`, `reject`, `onReject` | the file contains `approve`. If it contains `reject`, the flow jumps to `onReject`. |
 | `steps` | `path`, `requireAllPending` | `steps.json` parses and matches the schema (feature mode planning; see [Feature mode](feature-mode.md#planning)). With `requireAllPending` every step must be `pending`. |
 
-A check's `path` may use `{attempt_dir}`; see [Review attempts](review-attempts.md). A phase with no check passes immediately.
+A check's `path` may use `{attempt_dir}`; see [Review attempts](review-attempts.md). A phase with no check passes immediately. After the check passes, the phase's [quality gates](quality-gates.md) run.
 
 ## Adding and removing phases
 
@@ -45,3 +45,4 @@ Whenever a check fails or a review requests changes, the full details (the compl
 - [Review attempts](review-attempts.md): `{attempt_dir}`, `{review_file}` and late reviews.
 - [Delegating a phase](delegation.md): the `delegate` flag and the phase brief.
 - [Feature mode](feature-mode.md): the step phases and the `commit` pseudo-phase.
+- [Quality gates](quality-gates.md): named checks that a phase runs after its `check`.

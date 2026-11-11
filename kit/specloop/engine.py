@@ -1304,6 +1304,234 @@ def late_reviews(root, config, state):
     return lines
 
 
+# --- quality gates ---------------------------------------------------------------
+
+GATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+QUALITY_KEYS = ("timeoutSec", "failFast", "legacy", "gates")
+GATE_KEYS = ("command", "phases", "steps", "level", "timeoutSec", "hint", "passExitCodes", "metric", "legacy",
+             "changedGlob", "protect", "forbid")
+METRIC_KEYS = ("pattern", "json", "file", "min", "max")
+FORBID_KEYS = ("pattern", "glob", "message")
+GATE_STEPS = ("each", "last")
+GATE_LEVELS = ("block", "warn")
+LEGACY_MODES = ("baseline", "ratchet")
+SHELL_EXIT_CODES = (126, 127)  # "not executable" and "not found": a gate exiting so is broken, never passed
+CHANGED_FILES_PLACEHOLDERS = ("{changed_files}", "{changed_files_file}")
+DEFAULT_GATE_PHASES = ["implement"]
+
+
+def quality_block(config):
+    block = (config or {}).get("quality") if isinstance(config, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def quality_gates(config):
+    """The merged gates in declared order. A gate set to null (for example in config.local.json) is removed."""
+    gates = quality_block(config).get("gates")
+    if not isinstance(gates, dict):
+        return collections.OrderedDict()
+    return collections.OrderedDict((name, gate) for name, gate in gates.items() if gate is not None)
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _string_list(value):
+    return isinstance(value, list) and all(_non_empty_string(item) for item in value)
+
+
+def _regex_error(pattern):
+    """None when `pattern` compiles, else the reason."""
+    try:
+        re.compile(pattern)
+    except Exception as e:  # re.error, but also RecursionError or OverflowError on hostile input
+        return str(e) or e.__class__.__name__
+    return None
+
+
+def _phase_definitions(config):
+    """(where, name, definition) for every phase a gate may name: `phases` and `feature.stepPhases`."""
+    found = []
+    for where, graph in (("phases", config.get("phases")),
+                         ("feature.stepPhases", (config.get("feature") or {}).get("stepPhases")
+                          if isinstance(config.get("feature"), dict) else None)):
+        if isinstance(graph, dict):
+            found.extend((where, name, phase) for name, phase in graph.items() if phase)
+    return found
+
+
+def _validate_metric(where, metric):
+    if not isinstance(metric, dict):
+        return ["%s.metric must be an object" % where]
+    errors = ["%s.metric has an unknown key %r" % (where, key) for key in metric if key not in METRIC_KEYS]
+    sources = [key for key in ("pattern", "json") if key in metric]
+    if len(sources) != 1:
+        errors.append("%s.metric needs exactly one of 'pattern' and 'json'" % where)
+    if "pattern" in metric:
+        pattern = metric["pattern"]
+        if not _non_empty_string(pattern):
+            errors.append("%s.metric.pattern must be a non-empty string" % where)
+        else:
+            reason = _regex_error(pattern)
+            if reason:
+                errors.append("%s.metric.pattern is not a valid regular expression: %s" % (where, reason))
+            elif re.compile(pattern).groups < 1:
+                errors.append("%s.metric.pattern needs a group that captures the number" % where)
+    if "json" in metric and not _non_empty_string(metric["json"]):
+        errors.append("%s.metric.json must be a non-empty dotted key path" % where)
+    if "file" in metric and not _non_empty_string(metric["file"]):
+        errors.append("%s.metric.file must be a non-empty string" % where)
+    limits = [key for key in ("min", "max") if key in metric]
+    if not limits:
+        errors.append("%s.metric needs at least one of 'min' and 'max'" % where)
+    for key in limits:
+        if not _is_number(metric[key]):
+            errors.append("%s.metric.%s must be a number" % (where, key))
+    return errors
+
+
+def _validate_forbid(where, forbid):
+    if not isinstance(forbid, list):
+        return ["%s.forbid must be a list" % where]
+    errors = []
+    for i, entry in enumerate(forbid):
+        at = "%s.forbid[%d]" % (where, i)
+        if isinstance(entry, dict):
+            errors.extend("%s has an unknown key %r" % (at, key) for key in entry if key not in FORBID_KEYS)
+            pattern = entry.get("pattern")
+            if "glob" in entry and not _string_list(entry["glob"]):
+                errors.append("%s.glob must be a list of non-empty strings" % at)
+            if "message" in entry and not isinstance(entry["message"], str):
+                errors.append("%s.message must be a string" % at)
+            at += ".pattern"
+        else:
+            pattern = entry
+        if not _non_empty_string(pattern):
+            errors.append("%s must be a non-empty string (a regular expression)" % at)
+            continue
+        reason = _regex_error(pattern)
+        if reason:
+            errors.append("%s is not a valid regular expression: %s" % (at, reason))
+    return errors
+
+
+def _validate_gate_phases(where, phases, definitions):
+    if not _string_list(phases):
+        return ["%s.phases must be a list of phase names" % where]
+    errors = []
+    for name in phases:
+        matches = [(graph, phase) for graph, phase_name, phase in definitions if phase_name == name]
+        if not matches:
+            errors.append("%s.phases names %r, which is in neither phases nor feature.stepPhases" % (where, name))
+        for graph, phase in matches:
+            if isinstance(phase, dict) and phase.get("allowEdits"):
+                errors.append("%s.phases names %r, but %s.%s sets allowEdits, so the agent could not fix a "
+                              "failure there" % (where, name, graph, name))
+    return errors
+
+
+def _validate_gate(where, gate, default_legacy, definitions):
+    """Errors of one gate, and whether it needs git ({changed_files} or forbid)."""
+    if not isinstance(gate, dict):
+        return ["%s must be an object" % where], False
+    errors = ["%s has an unknown key %r" % (where, key) for key in gate if key not in GATE_KEYS]
+    command = gate.get("command")
+    if not _non_empty_string(command):
+        errors.append("%s.command is required and must be a non-empty string" % where)
+    errors.extend(_validate_gate_phases(where, gate.get("phases", DEFAULT_GATE_PHASES), definitions))
+    for key, allowed in (("steps", GATE_STEPS), ("level", GATE_LEVELS), ("legacy", LEGACY_MODES)):
+        if key in gate and gate[key] not in allowed:
+            errors.append("%s.%s must be one of %s" % (where, key, ", ".join('"%s"' % a for a in allowed)))
+    if "timeoutSec" in gate and not (_is_int(gate["timeoutSec"]) and gate["timeoutSec"] > 0):
+        errors.append("%s.timeoutSec must be a positive integer" % where)
+    if "hint" in gate and not isinstance(gate["hint"], str):
+        errors.append("%s.hint must be a string" % where)
+    if "passExitCodes" in gate:
+        codes = gate["passExitCodes"]
+        if not (isinstance(codes, list) and codes and all(_is_int(c) for c in codes)):
+            errors.append("%s.passExitCodes must be a non-empty list of integers" % where)
+        elif any(c in SHELL_EXIT_CODES for c in codes):
+            errors.append("%s.passExitCodes may not contain 126 or 127 (the shell's 'not executable' and "
+                          "'not found')" % where)
+    for key in ("changedGlob", "protect"):
+        if key in gate and not _string_list(gate[key]):
+            errors.append("%s.%s must be a list of non-empty strings" % (where, key))
+    if "forbid" in gate:
+        errors.extend(_validate_forbid(where, gate["forbid"]))
+    metric = gate.get("metric")
+    if "metric" in gate:
+        errors.extend(_validate_metric(where, metric))
+    legacy = gate.get("legacy", default_legacy)
+    if legacy == "ratchet":
+        if not isinstance(metric, dict):
+            if "legacy" in gate:
+                errors.append('%s sets legacy "ratchet", which needs a metric with exactly one of \'min\' and '
+                              '\'max\'' % where)
+        elif ("min" in metric) == ("max" in metric):
+            errors.append('%s uses legacy "ratchet", so its metric needs exactly one of \'min\' (higher is '
+                          'better) and \'max\' (lower is better)' % where)
+    needs_git = (isinstance(command, str) and any(p in command for p in CHANGED_FILES_PLACEHOLDERS)) or \
+        bool(gate.get("forbid"))
+    return errors, needs_git
+
+
+def is_git_work_tree(root, config):
+    ok, out = git(root, config, "rev-parse", "--is-inside-work-tree")
+    return ok and out == "true"
+
+
+def validate_quality(root, config):
+    """Validate the merged `quality` block. Return a list of error strings (empty means valid); never raises."""
+    try:
+        return _validate_quality(root, config)
+    except Exception as e:  # validation must never break a hook or a command
+        return ["quality could not be validated: %s" % (str(e) or e.__class__.__name__)]
+
+
+def _validate_quality(root, config):
+    if not isinstance(config, dict) or "quality" not in config:
+        return []
+    block = config["quality"]
+    if not isinstance(block, dict):
+        return ["quality must be an object"]
+    errors = ["quality has an unknown key %r" % key for key in block if key not in QUALITY_KEYS]
+    if "timeoutSec" in block and not (_is_int(block["timeoutSec"]) and block["timeoutSec"] > 0):
+        errors.append("quality.timeoutSec must be a positive integer")
+    if "failFast" in block and not isinstance(block["failFast"], bool):
+        errors.append("quality.failFast must be true or false")
+    default_legacy = block.get("legacy", "baseline")
+    if default_legacy not in LEGACY_MODES:
+        errors.append("quality.legacy must be one of %s" % ", ".join('"%s"' % a for a in LEGACY_MODES))
+    gates = block.get("gates", {})
+    if not isinstance(gates, dict):
+        errors.append("quality.gates must be an object that maps gate names to gates")
+        return errors
+    definitions = _phase_definitions(config)
+    git_users = []
+    for name, gate in quality_gates(config).items():
+        where = "quality.gates.%s" % name
+        if not (isinstance(name, str) and GATE_NAME.fullmatch(name)):
+            errors.append("gate name %r must match [A-Za-z0-9][A-Za-z0-9_-]* (it becomes a file name)" % name)
+        gate_errors, needs_git = _validate_gate(where, gate, default_legacy, definitions)
+        errors.extend(gate_errors)
+        if needs_git:
+            git_users.append(name)
+    if git_users and not is_git_work_tree(root, config):
+        errors.extend("quality.gates.%s uses {changed_files}, {changed_files_file} or forbid, which need a git "
+                      "work tree, but the project is not one" % name for name in git_users)
+    return errors
+
+
+def quality_errors_message(config, errors):
+    return ("Not started: the quality configuration is invalid:\n%s\n\nFix it in %s (or %s), then run %s again." % (
+        "\n".join("- " + e for e in errors), _rel("config.json"), _rel("config.local.json"), cmd_name(config, "go")))
+
+
 # --- feature mode ----------------------------------------------------------------
 
 def git(root, config, *args, raw=False):
@@ -2066,6 +2294,9 @@ def cmd_go(root):
     if state["status"] == "done":
         return "Workflow already done. Run %s and %s to start a new one." % (
             cmd_name(config, "reset"), cmd_name(config, "spec"))
+    errors = validate_quality(root, config)
+    if errors:
+        return quality_errors_message(config, errors)
     plan, replan = None, None
     if is_feature(state):
         if state.get("branch"):

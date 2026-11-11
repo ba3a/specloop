@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>specloop — write the spec, go make tea</title>
+<meta name="description" content="specloop turns Claude Code into a spec-driven plan → implement → review loop. Hand it a spec, walk away, come back to a reviewed branch with one commit per step.">
+<meta property="og:title" content="specloop — write the spec, go make tea">
+<meta property="og:description" content="A spec-driven plan → implement → review loop for Claude Code. Hooks and slash commands, your subscription, no API keys.">
+<meta property="og:image" content="logo/png/og.png">
+<link rel="icon" href="logo/favicon.ico" sizes="any">
+<link rel="icon" href="logo/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="logo/png/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root {
+  --bg: #fbfaf7;
+  --bg-alt: #f2efe8;
+  --fg: #1d1b18;
+  --muted: #6b665d;
+  --line: #e2ddd2;
+  --accent: #c2521c;
+  --accent-soft: #f6e3d6;
+  --ok: #2f7d4f;
+  --term-bg: #17161a;
+  --term-fg: #e9e6df;
+  --term-muted: #8a857b;
+  --term-ok: #7fd19b;
+  --term-warn: #f2b45c;
+  --term-accent: #f08a50;
+  --radius: 14px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #121114;
+    --bg-alt: #1a191d;
+    --fg: #ece9e2;
+    --muted: #a19c92;
+    --line: #2c2a30;
+    --accent: #f08a50;
+    --accent-soft: #2e1f17;
+    --ok: #7fd19b;
+    --term-bg: #0b0a0d;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #121114;
+  --bg-alt: #1a191d;
+  --fg: #ece9e2;
+  --muted: #a19c92;
+  --line: #2c2a30;
+  --accent: #f08a50;
+  --accent-soft: #2e1f17;
+  --ok: #7fd19b;
+  --term-bg: #0b0a0d;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 17px/1.6 Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--accent); }
+code, pre, .mono { font-family: "JetBrains Mono", ui-monospace, Consolas, monospace; }
+code { font-size: .9em; background: var(--bg-alt); padding: .1em .35em; border-radius: 5px; }
+
+.wrap { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+section { padding: 88px 0; border-top: 1px solid var(--line); }
+section.alt { background: var(--bg-alt); }
+h1, h2, h3 { line-height: 1.15; letter-spacing: -.02em; margin: 0 0 .5em; }
+h1 { font-size: clamp(38px, 6vw, 68px); font-weight: 800; }
+h2 { font-size: clamp(28px, 4vw, 42px); font-weight: 800; }
+h3 { font-size: 20px; font-weight: 600; }
+.eyebrow { font: 600 13px/1 "JetBrains Mono", monospace; text-transform: uppercase; letter-spacing: .12em; color: var(--accent); margin-bottom: 16px; }
+.lead { font-size: clamp(18px, 2.2vw, 21px); color: var(--muted); max-width: 640px; }
+.muted { color: var(--muted); }
+
+/* nav */
+nav { position: sticky; top: 0; z-index: 10; background: color-mix(in srgb, var(--bg) 88%, transparent); backdrop-filter: blur(8px); border-bottom: 1px solid var(--line); }
+nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 60px; }
+.logo { display: inline-flex; align-items: center; gap: 10px; font: 600 18px "JetBrains Mono", monospace; color: var(--fg); text-decoration: none; }
+.logo img { width: 32px; height: 32px; }
+.logo span { color: var(--accent); }
+nav .links { display: flex; gap: 22px; align-items: center; font-size: 15px; }
+nav .links a { color: var(--muted); text-decoration: none; }
+nav .links a:hover { color: var(--fg); }
+@media (max-width: 640px) { nav .links a:not(.btn) { display: none; } }
+
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; border-radius: 10px; font-weight: 600; text-decoration: none; border: 1px solid var(--line); color: var(--fg); background: var(--bg); transition: transform .15s; }
+.btn:hover { transform: translateY(-1px); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+nav .btn { padding: 7px 14px; font-size: 14px; }
+
+/* hero */
+.hero { padding: 72px 0 88px; border-top: 0; }
+.hero-grid { display: grid; grid-template-columns: 1fr; gap: 48px; align-items: center; }
+@media (min-width: 960px) { .hero-grid { grid-template-columns: 1.05fr 1fr; } }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.cta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+.badges { display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 28px; font-size: 14px; color: var(--muted); }
+.badges span::before { content: "✓ "; color: var(--ok); font-weight: 600; }
+
+/* terminal */
+.term { background: var(--term-bg); color: var(--term-fg); border-radius: var(--radius); box-shadow: 0 30px 60px -20px rgba(0,0,0,.35); overflow: hidden; font-size: 13.5px; line-height: 1.65; }
+.term .bar { display: flex; gap: 7px; padding: 12px 14px; background: rgba(255,255,255,.04); }
+.term .bar i { width: 11px; height: 11px; border-radius: 50%; background: #3a383f; }
+.term .bar b { margin-left: 10px; font: 500 12px Inter, sans-serif; color: var(--term-muted); }
+.term pre { margin: 0; padding: 18px 20px 22px; overflow-x: auto; white-space: pre; min-height: 330px; }
+.term .p { color: var(--term-accent); }
+.term .m { color: var(--term-muted); }
+.term .g { color: var(--term-ok); }
+.term .w { color: var(--term-warn); }
+.cursor { display: inline-block; width: 8px; height: 1.1em; background: var(--term-fg); vertical-align: text-bottom; animation: blink 1s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* problem */
+.chat { max-width: 560px; display: grid; gap: 10px; margin: 32px 0 0; }
+.msg { padding: 10px 14px; border-radius: 12px; max-width: 85%; font-size: 15px; }
+.msg.you { justify-self: end; background: var(--accent-soft); }
+.msg.ai { background: var(--bg-alt); border: 1px solid var(--line); }
+section.alt .msg.ai { background: var(--bg); }
+.two { display: grid; grid-template-columns: 1fr; gap: 48px; }
+@media (min-width: 900px) { .two { grid-template-columns: 1fr 1fr; align-items: start; } }
+
+/* loop diagram */
+.loop { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-top: 40px; counter-reset: ph; }
+.card { background: var(--bg); border: 1px solid var(--line); border-radius: var(--radius); padding: 24px; }
+section.alt .card { background: var(--bg); }
+.card .gate { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line); font-size: 14px; color: var(--muted); }
+.card .gate b { color: var(--fg); }
+.phase-name { font: 600 14px "JetBrains Mono", monospace; color: var(--accent); }
+.flow-note { margin-top: 20px; font-size: 15px; color: var(--muted); }
+
+/* timeline */
+.timeline { list-style: none; padding: 0; margin: 40px 0 0; border-left: 2px solid var(--line); }
+.timeline li { position: relative; padding: 0 0 28px 28px; }
+.timeline li::before { content: ""; position: absolute; left: -7px; top: 6px; width: 12px; height: 12px; border-radius: 50%; background: var(--bg); border: 2px solid var(--accent); }
+.timeline li.you::before { background: var(--accent); }
+.timeline time { font: 600 14px "JetBrains Mono", monospace; color: var(--muted); display: block; }
+
+/* features */
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-top: 40px; }
+.grid .card h3 { margin-bottom: 6px; }
+.grid .card p { margin: 0; color: var(--muted); font-size: 15.5px; }
+.ico { font-size: 22px; margin-bottom: 10px; }
+
+/* code blocks */
+.code { background: var(--term-bg); color: var(--term-fg); border-radius: var(--radius); padding: 18px 20px; overflow-x: auto; font-size: 13.5px; line-height: 1.65; margin: 0; }
+.code .m { color: var(--term-muted); }
+.code .g { color: var(--term-ok); }
+.code .p { color: var(--term-accent); }
+.code .w { color: var(--term-warn); }
+
+/* dogfood */
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 16px; margin: 40px 0; }
+.stat { border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; background: var(--bg); }
+.stat b { display: block; font-size: 36px; font-weight: 800; letter-spacing: -.02em; color: var(--accent); }
+.stat span { font-size: 14px; color: var(--muted); }
+.callout { border-left: 4px solid var(--accent); background: var(--accent-soft); padding: 18px 22px; border-radius: 0 var(--radius) var(--radius) 0; margin-top: 32px; }
+
+/* faq */
+details { border-bottom: 1px solid var(--line); padding: 18px 0; }
+details summary { cursor: pointer; font-weight: 600; list-style: none; }
+details summary::after { content: "+"; float: right; color: var(--accent); font-weight: 400; }
+details[open] summary::after { content: "–"; }
+details p { margin: 10px 0 0; color: var(--muted); }
+
+/* final */
+.final { text-align: center; }
+.final .lead { margin: 0 auto; }
+.final .cta { justify-content: center; }
+footer { padding: 32px 0 48px; font-size: 14px; color: var(--muted); border-top: 1px solid var(--line); }
+footer .wrap { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <a class="logo" href="#"><img src="logo/logo.svg" alt="">spec<span>loop</span></a>
+    <div class="links">
+      <a href="#how">How it works</a>
+      <a href="#dogfood">Built by itself</a>
+      <a href="#start">Quick start</a>
+      <a class="btn" href="https://github.com/ba3a/specloop">★ GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<!-- HERO -->
+<header class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <div class="eyebrow">For Claude Code</div>
+      <h1>Write the spec.<br><em>Go make tea.</em><br>Come back to reviewed commits.</h1>
+      <p class="lead">specloop turns Claude Code into a spec-driven <b>plan → implement → review</b> loop. Claude cannot say “done” until the tests pass and a reviewer approves the diff. You stop babysitting the chat.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/ba3a/specloop">Get it on GitHub →</a>
+        <a class="btn" href="#start">Install in 30 seconds</a>
+      </div>
+      <div class="badges">
+        <span>Uses your Claude subscription</span>
+        <span>No API keys</span>
+        <span>macOS · Linux · Windows</span>
+        <span>0BSD licensed</span>
+      </div>
+    </div>
+
+    <div class="term" aria-label="specloop running a feature in Claude Code">
+      <div class="bar"><i></i><i></i><i></i><b>claude — my-project</b></div>
+      <pre id="demo"><span class="p">&gt;</span> /sl-feature specs/password-reset.md
+<span class="m">[specloop] spec loaded in feature mode. Run /sl-go.</span>
+<span class="p">&gt;</span> /sl-go
+<span class="m">[specloop] branch specloop/password-reset created</span>
+<span class="m">[specloop] planning… 5 steps written to run/steps.json</span>
+<span class="p">&gt;</span> /sl-go   <span class="m"># plan looks good, approved</span>
+
+<span class="w">☕  you leave</span>
+
+  1  <span class="g">done</span>     5d6e7f8  Add reset token model
+  2  <span class="g">done</span>     a41c09b  Send the reset email
+  3  <span class="g">done</span>     e02f7aa  Add the reset endpoint
+     <span class="m">↳ review: CHANGES_REQUESTED (token not single-use)</span>
+     <span class="m">↳ implement → tests green → review: APPROVE</span>
+  4  <span class="g">done</span>     9b3d112  Rate-limit reset requests
+  5  <span class="g">done</span>     c77e0f4  Document the flow
+
+<span class="g">[specloop] done.</span> 5 commits on specloop/password-reset
+<span class="cursor"></span></pre>
+    </div>
+  </div>
+</header>
+
+<!-- PROBLEM -->
+<section class="alt">
+  <div class="wrap two">
+    <div>
+      <div class="eyebrow">The problem</div>
+      <h2>Right now, <em>you</em> are the loop.</h2>
+      <p class="lead">Coding agents are great at the first 80%. Then they stop, declare victory and wait for you. So you sit there, typing the same five messages, for an hour.</p>
+      <p class="muted">The agent is not the bottleneck. The person who has to keep saying “continue” is.</p>
+    </div>
+    <div class="chat" aria-label="A typical chat without specloop">
+      <div class="msg ai">All done! The feature is implemented. ✅</div>
+      <div class="msg you">did you run the tests?</div>
+      <div class="msg ai">You're right, 3 tests fail. Fixing now.</div>
+      <div class="msg ai">Fixed! Everything should work.</div>
+      <div class="msg you">it still fails. also you skipped step 4 of the spec</div>
+      <div class="msg ai">Apologies! Let me implement step 4…</div>
+      <div class="msg you">continue</div>
+      <div class="msg you">continue</div>
+    </div>
+  </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section id="how">
+  <div class="wrap">
+    <div class="eyebrow">How it works</div>
+    <h2>Every phase ends at a gate. Claude can't talk its way past it.</h2>
+    <p class="lead">Each time Claude tries to stop, specloop's Stop hook runs the current phase's check. Fail, and Claude gets the failure back and keeps working. Pass, and the next phase starts on its own.</p>
+
+    <div class="loop">
+      <div class="card">
+        <div class="phase-name">01 · plan</div>
+        <h3>Reads the spec, writes a plan</h3>
+        <p class="muted">Can only edit the plan file. No “let me just start coding”.</p>
+        <div class="gate"><b>Gate:</b> plan file exists</div>
+      </div>
+      <div class="card">
+        <div class="phase-name">02 · implement</div>
+        <h3>Test-first implementation</h3>
+        <p class="muted">Free to edit the code. Your linters and coverage can join as quality gates.</p>
+        <div class="gate"><b>Gate:</b> your test command exits 0</div>
+      </div>
+      <div class="card">
+        <div class="phase-name">03 · review</div>
+        <h3>A fresh reviewer reads the diff</h3>
+        <p class="muted">Read-only. Writes a verdict. Changes requested? Back to implement.</p>
+        <div class="gate"><b>Gate:</b> <code>VERDICT: APPROVE</code></div>
+      </div>
+    </div>
+    <p class="flow-note">Big spec? <code>/sl-feature</code> splits it into steps. Each step runs implement → review in fresh subagents and ends in its own commit on a dedicated branch. If a step shows the plan is wrong, the remaining steps get replanned.</p>
+  </div>
+</section>
+
+<!-- TIMELINE -->
+<section class="alt">
+  <div class="wrap two">
+    <div>
+      <div class="eyebrow">Your afternoon</div>
+      <h2>Two commands. Then it's tea time.</h2>
+      <p class="lead">You do the parts that need a human: deciding what to build and approving the plan. specloop does the grinding in between.</p>
+    </div>
+    <ol class="timeline">
+      <li class="you"><time>14:00</time>You write <code>specs/password-reset.md</code>: goal, requirements, acceptance criteria.</li>
+      <li class="you"><time>14:10</time><code>/sl-feature</code>, <code>/sl-go</code>. A planner splits it into 5 steps. You skim, approve.</li>
+      <li><time>14:12</time>Step 1: implement, tests go green, reviewer approves, committed.</li>
+      <li><time>14:40</time>Step 3: reviewer catches a token that can be reused. Back to implement. Fixed, approved, committed.</li>
+      <li><time>15:20</time>Last step committed. Run is <code>done</code>.</li>
+      <li class="you"><time>15:25</time>You're back with your tea. One branch, five reviewed commits. You open the PR.</li>
+    </ol>
+  </div>
+</section>
+
+<!-- SPEC EXAMPLE -->
+<section>
+  <div class="wrap two">
+    <div>
+      <div class="eyebrow">The input</div>
+      <h2>A spec is just Markdown.</h2>
+      <p class="lead">No DSL, no YAML, no ticket system. Say what you want and how you'll know it's done. The clearer the acceptance criteria, the less there is to argue about at review.</p>
+      <p class="muted">Tip: let Claude help you write the spec in a normal chat first. Then hand it to the loop.</p>
+    </div>
+<pre class="code"><span class="m"># Password reset</span>
+
+<span class="p">## Goal</span>
+Users who forgot their password can set a
+new one through a link sent by email.
+
+<span class="p">## Requirements</span>
+1. POST /auth/reset sends a link with a
+   single-use token, valid for 30 minutes.
+2. At most 3 requests per email per hour.
+3. Using the link sets the new password and
+   invalidates every other session.
+
+<span class="p">## Acceptance</span>
+- A used or expired token returns 410.
+- Tests cover the rate limit.
+- docs/auth.md describes the flow.</pre>
+  </div>
+</section>
+
+<!-- FEATURES -->
+<section class="alt">
+  <div class="wrap">
+    <div class="eyebrow">Why you can walk away</div>
+    <h2>Guard rails, so “unattended” doesn't mean “unsupervised”.</h2>
+    <div class="grid">
+      <div class="card"><div class="ico">🚧</div><h3>Hard gates</h3><p>Phases complete on exit codes and verdicts, not on Claude's opinion of its own work.</p></div>
+      <div class="card"><div class="ico">🔍</div><h3>Independent review</h3><p>Review runs in a fresh subagent that never saw the implementation chat. It reads the diff, not the excuses.</p></div>
+      <div class="card"><div class="ico">🧪</div><h3>Quality gates</h3><p>Plug in your linter, tests and coverage as named gates. All failures are reported at once.</p></div>
+      <div class="card"><div class="ico">🔒</div><h3>Never pushes</h3><p><code>git push</code> and PR creation are blocked until the work is done. Opening the PR stays your call.</p></div>
+      <div class="card"><div class="ico">🧾</div><h3>One commit per step</h3><p>Feature mode leaves a clean branch: one reviewed, tested commit per planned step. Easy to read, easy to revert.</p></div>
+      <div class="card"><div class="ico">🛟</div><h3>Can't run away</h3><p>After 15 blocked stops the run stalls and waits for you. A crash in specloop never breaks your session.</p></div>
+      <div class="card"><div class="ico">💸</div><h3>No extra bill</h3><p>It's hooks and slash commands inside your normal Claude Code session. Your subscription, no API keys, no orchestrator.</p></div>
+      <div class="card"><div class="ico">🪶</div><h3>Tiny and portable</h3><p>Pure Python standard library, 3.8+. CLI, desktop app or IDE. macOS, Linux and Windows.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- DOGFOOD -->
+<section id="dogfood">
+  <div class="wrap">
+    <div class="eyebrow">Dogfooding</div>
+    <h2>specloop is built by specloop.</h2>
+    <p class="lead">Since feature mode landed, new specloop features are written as specs and run through specloop itself. The installed copy in the repo plans, implements, reviews and commits the next version of the kit.</p>
+
+    <div class="stats">
+      <div class="stat"><b>3</b><span>releases in 3 days: 0.2.0, 0.2.1, 0.3.0</span></div>
+      <div class="stat"><b>14</b><span>commits authored by feature-mode steps for one spec</span></div>
+      <div class="stat"><b>12 → 14</b><span>steps: the run replanned itself mid-way</span></div>
+      <div class="stat"><b>500+</b><span>unit tests guarding the engine</span></div>
+    </div>
+
+    <p class="muted">The real <code>git log</code> of the update checker, built from <code>specs/update-checker.md</code>:</p>
+<pre class="code"><span class="p">$</span> git log --format='%h %s%n    %b'
+<span class="w">888ab25</span> docs: Document updates and config.local.json, release 0.3.0
+    <span class="m">specloop step 14/14 (12) of specs/update-checker.md</span>
+<span class="w">8eec7a1</span> feat: Show the update state in /status
+    <span class="m">specloop step 13/14 (11) of specs/update-checker.md</span>
+<span class="w">ba59562</span> feat: Apply updates automatically in auto mode at safe points
+    <span class="m">specloop step 12/14 (10) of specs/update-checker.md</span>
+<span class="m">…</span>
+<span class="w">c3d0432</span> fix: Enforce subprocess timeouts with run_limited
+    <span class="m">specloop step 8/14 (14) of specs/update-checker.md</span>
+<span class="w">906f9e7</span> fix: Keep update.json keys and harden the update files
+    <span class="m">specloop step 7/14 (13) of specs/update-checker.md</span>
+<span class="w">894d8d8</span> feat: Check for updates and show a notice at SessionStart
+    <span class="m">specloop step 6/12 (6) of specs/update-checker.md</span>
+<span class="m">…</span>
+<span class="w">fae29b7</span> feat: Add config.local.json as a personal configuration layer
+    <span class="m">specloop step 1/12 (1) of specs/update-checker.md</span></pre>
+    <p class="muted">Notice the count jump from <code>6/12</code> to <code>7/14</code>: the reviewer found problems the plan didn't cover, so the run added hardening steps on its own and kept going.</p>
+
+    <div class="callout">
+      <b>And this website, too.</b> The page you're reading was written as a spec and implemented by specloop. If it has a bug, the reviewer missed it, and we'd love a PR.
+    </div>
+  </div>
+</section>
+
+<!-- QUICK START -->
+<section id="start" class="alt">
+  <div class="wrap two">
+    <div>
+      <div class="eyebrow">Quick start</div>
+      <h2>Install into any project.</h2>
+      <p class="lead">You need Claude Code, Python 3.8+, git and <code>sh</code> (Git Bash on Windows). The installer copies the kit into your project's <code>.claude/</code> and never touches your own settings.</p>
+      <p class="muted">Then start a <b>new</b> Claude Code session in the project. Updates are one command: <code>/sl-update</code>.</p>
+    </div>
+<pre class="code"><span class="m"># once</span>
+git clone https://github.com/ba3a/specloop.git ~/tools/specloop
+~/tools/specloop/install.sh ~/code/my-project
+<span class="m"># Windows: install.cmd C:\code\my-project</span>
+
+<span class="m"># in Claude Code, one reviewable diff</span>
+<span class="p">/sl-spec</span> specs/login.md
+<span class="p">/sl-go</span>
+
+<span class="m"># or a big feature, one commit per step</span>
+<span class="p">/sl-feature</span> specs/password-reset.md
+<span class="p">/sl-go</span>        <span class="m"># plan</span>
+<span class="p">/sl-go</span>        <span class="m"># approve, then go make tea</span></pre>
+  </div>
+</section>
+
+<!-- FAQ -->
+<section>
+  <div class="wrap" style="max-width:780px">
+    <div class="eyebrow">FAQ</div>
+    <h2>Questions people ask</h2>
+    <details><summary>Does it cost extra?</summary><p>No. specloop is hooks and slash commands running inside your normal Claude Code session, so it uses your existing subscription. There is no separate service and no API key.</p></details>
+    <details><summary>Will it push to my repo or open PRs?</summary><p>Never. Pushing and PR commands are blocked while a run is active, and specloop itself never pushes. You review the branch and open the PR yourself.</p></details>
+    <details><summary>What if it gets stuck in a loop?</summary><p>After 15 blocked stops (configurable) the run goes to <code>stalled</code> and Claude is allowed to stop. <code>/sl-go</code> resumes, <code>/sl-pause</code> lets you talk to Claude in between, <code>/sl-advance</code> force-passes a phase.</p></details>
+    <details><summary>Can I change the phases?</summary><p>Yes. The phases are a configurable graph. Add a lint phase, drop review, write your own phase instructions in <code>overrides/</code>. Your config is never overwritten on update.</p></details>
+    <details><summary>Does it work with my stack?</summary><p>If your tests run from a shell command, yes. specloop doesn't care about the language: the gate is an exit code.</p></details>
+    <details><summary>Windows?</summary><p>Yes. Hooks run through Git Bash, and there is an <code>install.cmd</code> wrapper.</p></details>
+  </div>
+</section>
+
+<!-- FINAL CTA -->
+<section class="alt final">
+  <div class="wrap">
+    <h2>Stop typing “continue”.</h2>
+    <p class="lead">Write the spec. Run two commands. Put the kettle on.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/ba3a/specloop">★ Star specloop on GitHub</a>
+      <a class="btn" href="https://github.com/ba3a/specloop/tree/main/docs">Read the docs</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>specloop · 0BSD · do anything with it</span>
+    <span>Not affiliated with Anthropic. Claude Code is a product of Anthropic.</span>
+  </div>
+</footer>
+
+</body>
+</html>

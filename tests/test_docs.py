@@ -10,7 +10,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 README_MAX_LINES = 80
 GROUPS = ("Getting started", "Concepts", "Features", "Reference")
-NESTED_BLOCKS = ("feature", "largeSpecWarning", "update")
+NESTED_BLOCKS = ("feature", "largeSpecWarning", "update", "quality")
 FENCE = re.compile(r"^\s*(```|~~~)")
 LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 RELEASE_HEADING = re.compile(r"^## \[(\d+\.\d+\.\d+)\] - \d{4}-\d{2}-\d{2}$")

@@ -35,6 +35,7 @@ Nested blocks have one row here and are described on the page of the feature tha
 | `blockedCommandsUntilDone` | `git push`, `gh pr create`, `gh pr merge` | Bash commands denied while a run is active, in both modes; see [Guard rails](guard-rails.md#blocked-commands-in-both-modes). |
 | `largeSpecWarning` | `maxLines` 200, `maxWords` 2000, `maxPlanItems` 12 | Single-mode size warnings; see [Size warnings](size-warnings.md). |
 | `update` | `mode` `"notify"`, `intervalHours` 24, `timeoutSec` 20 | Update checks for the kit; see [Updates](updates.md). |
+| `quality` | `timeoutSec` 1800, `failFast` false, `legacy` `"baseline"`, no gates | Quality gates that hold a phase until they pass; see [Quality gates](quality-gates.md). |
 | `phases` | `plan` → `implement` → `review` | The single-mode phase graph; see [Phases](phases.md). |
 | `feature` | see [Feature mode](feature-mode.md#configuration-keys) | Feature-mode settings and phase graphs. |
 
@@ -68,3 +69,4 @@ Settings that are yours belong in [`config.local.json`](#personal-configuration-
 - [Installation](installation.md): the installer options that create `config.json`.
 - [Phases](phases.md): the phase graph that `phases` configures.
 - [Updates](updates.md): the `update` block and the `CI` variable.
+- [Quality gates](quality-gates.md): the `quality` block and its validation.

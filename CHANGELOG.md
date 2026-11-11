@@ -4,6 +4,10 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 ## [Unreleased]
 
+### Added
+
+- The `quality` configuration block for quality gates: named commands such as a linter or the test suite, in declared order, that a gate set to `null` in `config.local.json` removes. `/sl-go` validates the block and refuses to start or resume while it has errors, listing every one. See [Quality gates](docs/quality-gates.md).
+
 ### Changed
 
 - The documentation moved from one long `README.md` into focused pages under [`docs/`](docs/README.md). The README is now a short introduction. Old README anchors such as `README.md#feature-mode` no longer exist; use the page for the topic, for example [Feature mode](docs/feature-mode.md). Behaviour is unchanged.

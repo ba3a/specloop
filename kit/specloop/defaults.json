@@ -8,6 +8,12 @@
   "blockedCommandsUntilDone": ["git push", "gh pr create", "gh pr merge"],
   "largeSpecWarning": { "maxLines": 200, "maxWords": 2000, "maxPlanItems": 12 },
   "update": { "mode": "notify", "intervalHours": 24, "timeoutSec": 20 },
+  "quality": {
+    "timeoutSec": 1800,
+    "failFast": false,
+    "legacy": "baseline",
+    "gates": {}
+  },
   "feature": {
     "branchPrefix": "specloop/",
     "planPhase": "feature-plan",
