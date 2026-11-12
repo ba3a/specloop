@@ -25,6 +25,7 @@ kit/commands/*.md                     slash command templates; {{prefix}} is sub
                                       (spec, feature, go, pause, advance, status, reset, update)
                                       kit/commands/update.md is /sl-update (check, skip, never)
 tests/                                unittest suites for the engine, the installer and the docs
+                                      tests/test_landing.py guards site/landing.md: front matter, known unique section markers, brand files
 README.md                             short introduction, at most 80 lines
 CHANGELOG.md                          release history (Keep a Changelog); repository root only, not installed
 docs/README.md                        documentation index: every page listed once, in four groups
@@ -68,3 +69,20 @@ python -m unittest tests.test_engine -v       # one suite
 - SessionStart / UserPromptSubmit: print `{"hookSpecificOutput": {"hookEventName": "<event>", "additionalContext": "..."}}`.
 - UserPromptSubmit: `prompt` holds a typed command as typed. Print `{"decision": "block", "reason": "..."}` to stop the prompt, and with it the command's shell lines.
 - Every hook receives `session_id`; hooks inside a subagent also receive `agent_id`. Manual commands run through `` !`...` `` and receive no hook input.
+
+## Website landing page (ba3a.dev)
+
+`site/landing.md` is this project's landing page on ba3a.dev. The site fetches it from `main`
+and republishes within about 15 minutes of a push; nothing else has to change. It goes stale
+fast, so keep it true.
+
+- When a change alters what a user sees or types (commands, flags, output, install steps,
+  supported platforms, features, limits, license, version or size claims), update the matching
+  section of `site/landing.md` in the same commit.
+- Every command, number and output sample on the page must match the code. Re-run a sample
+  when you touch it.
+- Keep the section markers (`<div class="section-marker" id="name"></div>`) and their names
+  (hero, problem, audience, how-it-works, timeline, spec-example, features, compare, dogfood,
+  quick-start, faq, final-cta). The theme lays the sections out; do not add layout markup.
+- Links and images must resolve: a broken one fails the ba3a.dev build.
+- Leave `site/brand/` and `site/card.png` alone unless asked.
