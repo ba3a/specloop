@@ -30,11 +30,13 @@ Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 
 import collections
 import contextlib
+import fnmatch
 import io
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1320,6 +1322,8 @@ LEGACY_MODES = ("baseline", "ratchet")
 SHELL_EXIT_REASONS = {126: "command not executable (exit 126)", 127: "command not found (exit 127)"}
 SHELL_EXIT_CODES = tuple(sorted(SHELL_EXIT_REASONS))
 CHANGED_FILES_PLACEHOLDERS = ("{changed_files}", "{changed_files_file}")
+MAX_CHANGED_FILES_CHARS = 8000
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 DEFAULT_GATE_PHASES = ["implement"]
 
 
@@ -1770,12 +1774,12 @@ def metric_limit_message(metric, value):
     return None
 
 
-def run_quality_gate(root, config, state, name, gate, budget_left=None):
+def run_quality_gate(root, config, state, name, gate, budget_left=None, command=None):
     """Run one valid gate with no lock. Return (record, output): the record goes to state.qualityResults, the
     complete output to run/quality/<name>.log. Never raises. A gate that cannot give an answer (exit code 126 or
     127, a timeout, a command that cannot be started, a used-up time budget) is `broken`, and its record says why
     in `reason`. `budget_left` is what remains of the time budget of this Stop; the gate's timeout is the smaller
-    of that and its own."""
+    of that and its own. `command` replaces gate["command"] once its placeholders are expanded."""
     timeout = gate.get("timeoutSec", config.get("checkTimeoutSec", 900))
     started = time.monotonic()
     exit_code, timed_out, reason = None, False, None
@@ -1790,7 +1794,8 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None):
         if budget_left is not None and budget_left < timeout:
             timeout, limited_by_budget = budget_left, True
         try:
-            proc = run_limited([resolve_shell(config), "-c", gate["command"]], timeout, cwd=root, merge_stderr=True)
+            shell_command = command or gate["command"]
+            proc = run_limited([resolve_shell(config), "-c", shell_command], timeout, cwd=root, merge_stderr=True)
             raw, exit_code, timed_out = proc.stdout, proc.returncode, proc.timed_out
             if timed_out:
                 reason = "timed out after %s seconds" % _seconds_text(timeout)
@@ -1832,6 +1837,99 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None):
     if timed_out:
         record["timedOut"] = True
     return record, raw.decode("utf-8", errors="replace")
+
+
+class ChangedFilesError(Exception):
+    """The set of changed files cannot be determined."""
+
+
+def changed_files_base(state, gate):
+    """The comparison point of {changed_files}: HEAD for a feature-mode gate that runs on each step (the files
+    changed since the last step commit), else the run's baseRef. A run with no baseRef (one that started before
+    single mode recorded it) falls back to HEAD."""
+    if is_feature(state) and in_step(state) and gate.get("steps", "each") != "last":
+        return "HEAD"
+    return state.get("baseRef") or "HEAD"
+
+
+def untracked_files(root, config):
+    """Untracked files, as paths relative to the repository's top directory. Raises ChangedFilesError."""
+    ok, error, entries = _git_status(root, config)
+    if not ok:
+        raise ChangedFilesError("git status failed: %s" % error)
+    return [path for code, path in entries if code == "??"]
+
+
+def changed_files(root, config, state, gate):
+    """Project-relative paths, with forward slashes and sorted, of the files this run changed, for the
+    placeholders {changed_files} and {changed_files_file}: tracked changes against the comparison point
+    (`changed_files_base`), staged and unstaged, without deleted files, plus untracked files that were not
+    already untracked when the run started (`preexistingUntracked`), leaving out .claude/specloop/. The gate's
+    `changedGlob` patterns narrow the set. Raises ChangedFilesError when git cannot answer. Holds no lock."""
+    ok, prefix = git(root, config, "rev-parse", "--show-prefix")
+    if not ok:
+        raise ChangedFilesError("git rev-parse --show-prefix failed: %s" % prefix)
+    point = changed_files_base(state, gate)
+    if point == "HEAD" and not git(root, config, "rev-parse", "--verify", "--quiet", "HEAD")[0]:
+        point = EMPTY_TREE  # no commits yet: everything staged counts as changed
+    ok, out = git(root, config, "diff", "--name-only", "--diff-filter=d", "-z", point, "--", raw=True)
+    if not ok:
+        raise ChangedFilesError("git diff %s failed: %s" % (point[:12], out.strip()))
+    tracked = [p for p in out.split("\0") if p]
+    own_dir = prefix + _rel() + "/"
+    preexisting = set(state.get("preexistingUntracked", []))
+    found = set(tracked + untracked_files(root, config)) - preexisting
+    paths = sorted(p[len(prefix):] for p in found if p.startswith(prefix) and not p.startswith(own_dir))
+    patterns = gate.get("changedGlob")
+    if patterns:
+        paths = [p for p in paths if any(fnmatch.fnmatchcase(p, pattern) for pattern in patterns)]
+    return paths
+
+
+def changed_files_file_path(name):
+    return _rel("run", QUALITY_DIR, name + ".files")
+
+
+def write_changed_files_file(root, name, paths):
+    path = os.path.join(root, *changed_files_file_path(name).split("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("".join(p + "\n" for p in paths))
+
+
+def _unrunnable(state, name, started, result, reason, text):
+    """(None, record, log text) for a gate that does not run because of its changed-file set."""
+    record = gate_record(state, name, result, None, time.monotonic() - started, reason=reason)
+    return None, record, "[specloop] %s\n" % text
+
+
+def expand_changed_files(root, config, state, name, gate):
+    """Fill {changed_files} and {changed_files_file} in the gate's command. Return (command, record, output):
+    for a gate that can run, the expanded command and no record; otherwise the command is None and the record
+    is `skipped` (no changed files) or `broken` (git failed, or the list is too long for a command line), with
+    the text for its log. A command with neither placeholder is returned as it is. Never raises."""
+    command = gate["command"]
+    uses_list, uses_file = (p in command for p in ("{changed_files}", "{changed_files_file}"))
+    if not (uses_list or uses_file):
+        return command, None, None
+    started = time.monotonic()
+    try:
+        paths = changed_files(root, config, state, gate)
+        if paths and uses_file:
+            write_changed_files_file(root, name, paths)
+    except (ChangedFilesError, OSError) as e:
+        reason = "the changed files cannot be determined: %s" % (str(e) or e.__class__.__name__)
+        return _unrunnable(state, name, started, "broken", reason, reason)
+    if not paths:
+        reason = "no changed files%s" % (" match changedGlob" if gate.get("changedGlob") else "")
+        return _unrunnable(state, name, started, "skipped", reason, "skipped: %s; the command did not run" % reason)
+    listing = " ".join(shlex.quote(p) for p in paths)
+    if uses_list and len(listing) > MAX_CHANGED_FILES_CHARS:
+        reason = ("{changed_files} would be %d characters long, above the limit of %d; use {changed_files_file} "
+                  "(a file with one path per line) in the command instead" % (len(listing), MAX_CHANGED_FILES_CHARS))
+        return _unrunnable(state, name, started, "broken", reason, reason)
+    command = command.replace("{changed_files_file}", shlex.quote(changed_files_file_path(name)))
+    return command.replace("{changed_files}", listing), None, None
 
 
 def invalid_gate_record(root, state, name, errors):
@@ -1945,7 +2043,12 @@ def run_quality_gates(root, config, state, outcome):
     budget = quality_budget(root, config)
     started = _clock()
     for name, gate in selected:
-        record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started))
+        command, record, output = expand_changed_files(root, config, state, name, gate)
+        if record:
+            write_gate_log(root, name, output.encode("utf-8"))
+        else:
+            record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
+                                              command)
         runs.append((record, output))
         if record["result"] == "broken":
             return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},
@@ -2126,6 +2229,25 @@ def start_feature_branch(root, config, state):
         return "could not create branch %s: %s" % (name, out)
     state.update(branch=name, baseRef=base, preexistingUntracked=untracked)
     return None
+
+
+def single_mode_baseline(root, config):
+    """baseRef (HEAD) and preexistingUntracked for a single-mode run's first /go, which {changed_files} compares
+    with. It does not need a clean tree: a tracked file that is already modified counts as changed later. Outside
+    a git work tree, in a repository with no commits or when git fails nothing is recorded ({} comes back), and
+    the run starts as it always did. Holds no lock."""
+    try:
+        if not is_git_work_tree(root, config):
+            return {}
+        ok, base = git(root, config, "rev-parse", "--verify", "HEAD")
+        ok_prefix, prefix = git(root, config, "rev-parse", "--show-prefix")
+        if not (ok and ok_prefix):
+            return {}
+        own_dir = prefix + _rel() + "/"
+        untracked = sorted(p for p in untracked_files(root, config) if not p.startswith(own_dir))
+    except ChangedFilesError:
+        return {}
+    return {"baseRef": base, "preexistingUntracked": untracked}
 
 
 def check_feature_branch(root, config, state):
@@ -2851,6 +2973,8 @@ def cmd_go(root):
                 return "The replan cannot be adopted yet:\n%s\n\nFix %s, then run %s again." % (
                     "\n".join(errors), _rel("run", "steps.json"), cmd_name(config, "go"))
     branch = {k: state[k] for k in ("branch", "baseRef", "preexistingUntracked") if k in state}
+    if not is_feature(state) and "baseRef" not in state:
+        branch.update(single_mode_baseline(root, config))
 
     def apply(current):
         if not current or current["status"] == "done":

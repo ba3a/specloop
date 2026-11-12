@@ -1692,5 +1692,401 @@ class FeatureGateTest(unittest.TestCase):
         self.assertIn("matches nothing", state["pausedFor"]["reason"])
 
 
+@unittest.skipUnless(gitfixture.git_available(), "git not available")
+class ChangedFilesProject(unittest.TestCase):
+    """A committed git repository with the kit installed in `self.root`. Holds no tests itself."""
+
+    subdir = ""
+
+    def setUp(self):
+        self.fx = gitfixture.GitFixture()
+        self.addCleanup(self.fx.cleanup)
+        self.repo = self.fx.target
+        self.root = os.path.join(self.repo, self.subdir) if self.subdir else self.repo
+        os.makedirs(self.root, exist_ok=True)
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        shutil.copytree(KIT, self.base)
+        self.write("spec.md", "# Changed files\n\nDo things.\n")
+        self.write("tracked.txt", "one\n")
+        self.write("gone.txt", "bye\n")
+        self.git("add", "spec.md", "tracked.txt", "gone.txt")
+        self.git("commit", "-q", "-m", "initial")
+
+    def git(self, *args):
+        return self.fx.git(self.root, *args)
+
+    def write(self, rel, text="x\n"):
+        path = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def run_file(self, name):
+        return os.path.join(".claude", "specloop", "run", name)
+
+    def state(self):
+        return workflow.load_state(self.root)
+
+    def config(self):
+        return workflow.load_config(self.root)
+
+    def set_config(self, config):
+        with open(os.path.join(self.base, "config.json"), "w") as f:
+            json.dump(config, f)
+
+    def gate_log(self, name):
+        with open(os.path.join(self.base, "run", "quality", name + ".log"), encoding="utf-8") as f:
+            return f.read()
+
+    def stop(self):
+        return workflow.handle_stop(self.root, {})
+
+    def changed(self, **gate):
+        return workflow.changed_files(self.root, self.config(), self.state(), dict(command="exit 0", **gate))
+
+    def marker(self, name):
+        """How often the gate `name` ran: it appends a line to a marker inside .git, outside the work tree."""
+        path = os.path.join(self.repo, ".git", "ran-" + name)
+        if not os.path.exists(path):
+            return 0
+        with open(path) as f:
+            return len(f.read().split())
+
+    def counting(self, name, command, **extra):
+        marker = os.path.join(self.repo, ".git", "ran-" + name).replace("\\", "/")
+        return dict(extra, command="echo x >> '%s'; %s" % (marker, command))
+
+
+class SingleModeBaselineTest(ChangedFilesProject):
+
+    def start(self):
+        workflow.cmd_init(self.root, "spec.md")
+        return workflow.cmd_go(self.root)
+
+    def test_first_go_records_the_base_and_untracked_files_on_a_dirty_tree(self):
+        self.write("tracked.txt", "modified\n")
+        self.write("scratch/notes.txt")
+        self.write("other.txt")
+        head = self.git("rev-parse", "HEAD")
+        self.start()
+        state = self.state()
+        self.assertEqual("active", state["status"])
+        self.assertEqual(head, state["baseRef"])
+        self.assertEqual(["other.txt", "scratch/notes.txt"], state["preexistingUntracked"])
+
+    def test_the_kit_directory_is_not_recorded_as_untracked(self):
+        self.start()
+        self.assertEqual([], self.state()["preexistingUntracked"])
+
+    def test_a_later_go_keeps_the_recorded_base(self):
+        self.start()
+        base = self.state()["baseRef"]
+        self.write("more.txt")
+        self.git("add", "more.txt")
+        self.git("commit", "-q", "-m", "more")
+        workflow.cmd_pause(self.root)
+        workflow.cmd_go(self.root)
+        self.assertEqual(base, self.state()["baseRef"])
+        self.assertEqual([], self.state()["preexistingUntracked"])
+
+    def test_a_repository_without_commits_records_nothing(self):
+        root = os.path.join(self.repo, "empty")
+        self.fx.git(self.repo, "init", "-q", "empty")
+        self.fx.configure(root)
+        shutil.copytree(KIT, os.path.join(root, ".claude", "specloop"))
+        with open(os.path.join(root, "spec.md"), "w") as f:
+            f.write("# Spec\n")
+        workflow.cmd_init(root, "spec.md")
+        workflow.cmd_go(root)
+        state = workflow.load_state(root)
+        self.assertEqual("active", state["status"])
+        self.assertNotIn("baseRef", state)
+        self.assertNotIn("preexistingUntracked", state)
+
+    def test_outside_git_nothing_is_recorded(self):
+        root = tempfile.mkdtemp()
+        previous = os.environ.get("GIT_CEILING_DIRECTORIES")
+        os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(root)
+
+        def restore():
+            if previous is None:
+                os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+            else:
+                os.environ["GIT_CEILING_DIRECTORIES"] = previous
+            shutil.rmtree(root, ignore_errors=True)
+        self.addCleanup(restore)
+        shutil.copytree(KIT, os.path.join(root, ".claude", "specloop"))
+        with open(os.path.join(root, "spec.md"), "w") as f:
+            f.write("# Spec\n")
+        workflow.cmd_init(root, "spec.md")
+        workflow.cmd_go(root)
+        state = workflow.load_state(root)
+        self.assertEqual("active", state["status"])
+        self.assertNotIn("baseRef", state)
+        self.assertNotIn("preexistingUntracked", state)
+
+    def test_changed_files_lists_tracked_and_new_files_only(self):
+        self.write("preexisting.txt")
+        self.write("kept/old.txt")
+        self.start()
+        self.write("tracked.txt", "modified\n")
+        self.write("new.txt")
+        self.write("src/deep/created.txt")
+        self.write("staged.txt")
+        self.git("add", "staged.txt")
+        os.remove(os.path.join(self.root, "gone.txt"))
+        self.write("kept/old.txt", "edited but still untracked\n")
+        self.assertEqual(["new.txt", "src/deep/created.txt", "staged.txt", "tracked.txt"], self.changed())
+
+    def test_the_kit_directory_is_left_out(self):
+        self.start()
+        self.write(".claude/specloop/run/extra.txt")
+        self.write(".claude/specloop/notes.md")
+        self.write("new.txt")
+        self.assertEqual(["new.txt"], self.changed())
+
+    def test_a_tracked_file_that_was_dirty_at_the_start_counts_as_changed(self):
+        self.write("tracked.txt", "dirty before the run\n")
+        self.start()
+        self.assertEqual(["tracked.txt"], self.changed())
+
+    def test_single_mode_compares_with_the_base_ref_after_commits(self):
+        self.start()
+        self.write("committed.txt")
+        self.git("add", "committed.txt")
+        self.git("commit", "-q", "-m", "work")
+        self.write("pending.txt")
+        self.assertEqual(["committed.txt", "pending.txt"], self.changed())
+        self.assertEqual(["committed.txt", "pending.txt"], self.changed(steps="each"))
+
+    def test_changed_glob_narrows_the_set(self):
+        self.start()
+        for name in ("a.py", "docs/b.md", "src/c.py", "d.txt"):
+            self.write(name)
+        self.assertEqual(["a.py", "d.txt", "docs/b.md", "src/c.py"], self.changed())
+        self.assertEqual(["a.py", "src/c.py"], self.changed(changedGlob=["*.py"]))
+        self.assertEqual(["a.py", "docs/b.md"], self.changed(changedGlob=["a.*", "docs/*.md"]))
+        self.assertEqual([], self.changed(changedGlob=["*.kt"]))
+
+    def test_a_missing_base_ref_falls_back_to_head(self):
+        self.start()
+        self.write("new.txt")
+        state = dict(self.state())
+        state.pop("baseRef")
+        self.assertEqual(["new.txt"], workflow.changed_files(self.root, self.config(), state, {}))
+
+    def test_an_unknown_base_ref_is_an_error(self):
+        self.start()
+        state = dict(self.state(), baseRef="0" * 40)
+        with self.assertRaises(workflow.ChangedFilesError):
+            workflow.changed_files(self.root, self.config(), state, {})
+
+
+class ProjectInSubdirectoryTest(ChangedFilesProject):
+    subdir = "proj"
+
+    def test_paths_are_relative_to_the_project_and_files_outside_it_are_left_out(self):
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write("../outside.txt")
+        self.write("lib/new.txt")
+        self.write("tracked.txt", "modified\n")
+        self.assertEqual(["lib/new.txt", "tracked.txt"], self.changed())
+
+    def test_preexisting_untracked_files_are_excluded(self):
+        self.write("early.txt")
+        self.write("../early-outside.txt")
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.assertEqual(["early-outside.txt", "proj/early.txt"], self.state()["preexistingUntracked"])
+        self.write("late.txt")
+        self.assertEqual(["late.txt"], self.changed())
+
+
+class ChangedFilesGateTest(ChangedFilesProject):
+    """The placeholders in a gate's command, in single mode."""
+
+    def start_implement(self, gates):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": {"gates": gates}})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.assertIn("entering phase 'implement'", self.stop()["reason"])
+
+    def report(self):
+        with open(os.path.join(self.base, "run", "quality.md"), encoding="utf-8") as f:
+            return f.read()
+
+    def test_the_list_is_expanded_in_the_command(self):
+        self.start_implement({"lint": {"command": 'for f in {changed_files}; do echo "[$f]"; done'}})
+        self.write("a.py")
+        self.write("dir/b.py")
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual("[a.py]\n[dir/b.py]\n", self.gate_log("lint"))
+
+    def test_paths_with_spaces_are_quoted(self):
+        self.start_implement({"lint": {"command": 'for f in {changed_files}; do echo "[$f]"; done'}})
+        self.write("my file.py")
+        self.write("it's.py")
+        self.stop()
+        self.assertEqual("[it's.py]\n[my file.py]\n", self.gate_log("lint"))
+
+    def test_an_empty_set_skips_the_gate_without_running_it(self):
+        self.start_implement({"lint": self.counting("lint", "echo ran {changed_files}")})
+        out = self.stop()
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual(0, self.marker("lint"))
+        result = self.state()["qualityResults"]["lint"]
+        self.assertEqual("skipped", result["result"])
+        self.assertIn("no changed files", result["reason"])
+        self.assertIn("did not run", self.gate_log("lint"))
+        self.assertEqual("active", self.state()["status"])
+
+    def test_a_glob_without_a_match_skips_the_gate(self):
+        self.start_implement({"lint": self.counting("lint", "echo ran {changed_files}", changedGlob=["*.kt"])})
+        self.write("a.py")
+        self.stop()
+        self.assertEqual(0, self.marker("lint"))
+        result = self.state()["qualityResults"]["lint"]
+        self.assertEqual("skipped", result["result"])
+        self.assertIn("changedGlob", result["reason"])
+
+    def test_a_glob_narrows_what_the_command_gets(self):
+        self.start_implement({"lint": {"command": "echo {changed_files}", "changedGlob": ["*.kt"]}})
+        self.write("a.kt")
+        self.write("b.py")
+        self.stop()
+        self.assertEqual("a.kt\n", self.gate_log("lint"))
+
+    def test_a_command_without_placeholders_runs_when_nothing_changed(self):
+        self.start_implement({"tests": self.counting("tests", "exit 0", changedGlob=["*.kt"])})
+        self.stop()
+        self.assertEqual(1, self.marker("tests"))
+        self.assertEqual("pass", self.state()["qualityResults"]["tests"]["result"])
+
+    def test_a_skipped_gate_does_not_hide_a_failing_one(self):
+        self.start_implement({"lint": {"command": "echo {changed_files}"}, "tests": {"command": "exit 1"}})
+        out = self.stop()
+        self.assertIn("Quality gates failed: tests", out["reason"])
+        self.assertEqual("skipped", self.state()["qualityResults"]["lint"]["result"])
+        self.assertIn("| lint | skipped |", self.report())
+
+    def test_a_list_over_the_limit_makes_the_gate_broken(self):
+        self.start_implement({"lint": self.counting("lint", "echo {changed_files}")})
+        for number in range(100):
+            self.write("src/%s-%03d.py" % ("n" * 90, number))
+        self.stop()
+        state = self.state()
+        self.assertEqual("paused", state["status"])
+        self.assertEqual("lint", state["pausedFor"]["gate"])
+        self.assertIn("{changed_files_file}", state["pausedFor"]["reason"])
+        self.assertEqual(0, self.marker("lint"))
+        self.assertEqual("broken", state["qualityResults"]["lint"]["result"])
+        self.assertEqual("implement", state["phase"])
+
+    def test_a_list_within_the_limit_still_runs(self):
+        self.start_implement({"lint": {"command": "echo {changed_files}"}})
+        for number in range(75):
+            self.write("d/%03d-%s.py" % (number, "f" * 90))
+        size = len(" ".join(self.changed()))
+        self.assertTrue(7000 < size <= workflow.MAX_CHANGED_FILES_CHARS, size)
+        self.stop()
+        self.assertEqual("active", self.state()["status"])
+        self.assertEqual("pass", self.state()["qualityResults"]["lint"]["result"])
+
+    def test_the_file_placeholder_names_a_file_with_one_path_per_line(self):
+        self.start_implement({"lint": {"command": "echo {changed_files_file}; cat {changed_files_file}"}})
+        self.write("my file.py")
+        self.write("dir/b.py")
+        self.stop()
+        lines = self.gate_log("lint").splitlines()
+        self.assertEqual(".claude/specloop/run/quality/lint.files", lines[0])
+        self.assertEqual(["dir/b.py", "my file.py"], lines[1:])
+        with open(os.path.join(self.base, "run", "quality", "lint.files"), "rb") as f:
+            self.assertEqual(b"dir/b.py\nmy file.py\n", f.read())
+
+    def test_the_file_placeholder_works_for_a_list_over_the_limit(self):
+        self.start_implement({"lint": {"command": "wc -l < {changed_files_file}"}})
+        for number in range(100):
+            self.write("src/%s-%03d.py" % ("n" * 90, number))
+        self.stop()
+        self.assertEqual("active", self.state()["status"])
+        self.assertEqual(100, int(self.gate_log("lint").strip()))
+
+    def test_both_placeholders_can_be_used_together(self):
+        self.start_implement({"lint": {"command": "echo {changed_files} :: {changed_files_file}"}})
+        self.write("a.py")
+        self.stop()
+        self.assertEqual("a.py :: .claude/specloop/run/quality/lint.files\n", self.gate_log("lint"))
+
+    def test_a_git_failure_makes_the_gate_broken(self):
+        self.start_implement({"lint": self.counting("lint", "echo {changed_files}")})
+        self.write("a.py")
+
+        def corrupt(state):
+            state["baseRef"] = "0" * 40
+        workflow.update_state(self.root, corrupt)
+        self.stop()
+        state = self.state()
+        self.assertEqual("paused", state["status"])
+        self.assertIn("cannot be determined", state["pausedFor"]["reason"])
+        self.assertEqual(0, self.marker("lint"))
+
+
+class FeatureChangedFilesTest(ChangedFilesProject):
+    """The comparison point in feature mode: HEAD for `each`, baseRef for `last`."""
+
+    def begin(self):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": {"gates": {
+                             "each": {"command": "echo {changed_files}"},
+                             "last": {"command": "echo {changed_files}", "steps": "last"},
+                             "later": {"command": "cat {changed_files_file}", "steps": "last"}}}})
+        self.write("early-untracked.txt")
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "# Plan")
+        steps = {"feature": "F", "steps": [step_entry(1), step_entry(2)]}
+        self.write(self.run_file("steps.json"), json.dumps(steps))
+        self.stop()
+        workflow.cmd_go(self.root)
+        self.assertEqual(("implement", 1), (self.state()["phase"], self.state()["stepId"]))
+
+    def changed_by(self, gate_name):
+        gate = self.config()["quality"]["gates"][gate_name]
+        return workflow.changed_files(self.root, self.config(), self.state(), gate)
+
+    def test_each_compares_with_head_and_last_with_the_base_ref(self):
+        self.begin()
+        self.write("one.txt")
+        self.assertEqual(["one.txt"], self.changed_by("each"))
+        self.assertEqual(["one.txt"], self.changed_by("last"))
+        self.assertEqual("review", (self.stop(), self.state())[1]["phase"])
+        attempt = os.path.relpath(workflow.attempt_path(self.root, self.state()), self.root)
+        self.write(os.path.join(attempt, "review.md"), "Fine.\nVERDICT: APPROVE")
+        self.stop()
+        self.assertEqual(2, self.state()["stepId"])
+        self.write("two.txt")
+        self.assertEqual(["two.txt"], self.changed_by("each"))
+        self.assertEqual(["one.txt", "two.txt"], self.changed_by("last"))
+
+    def test_files_untracked_before_the_run_are_left_out(self):
+        self.begin()
+        self.assertEqual([], self.changed_by("each"))
+        self.assertEqual([], self.changed_by("last"))
+        self.assertIn("early-untracked.txt", self.state()["preexistingUntracked"])
+
+    def test_the_list_reaches_the_gate_command(self):
+        self.begin()
+        self.write("one.txt")
+        self.stop()
+        self.assertEqual("review", self.state()["phase"])
+        self.assertEqual("one.txt\n", self.gate_log("each"))
+        self.assertNotIn("last", self.state()["qualityResults"])
+        run = os.path.join(self.base, "run", "quality")
+        self.assertEqual(["each.log"], sorted(os.listdir(run)))
+
+
 if __name__ == "__main__":
     unittest.main()

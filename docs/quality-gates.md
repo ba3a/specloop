@@ -38,6 +38,7 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 | `hint` | none | Text added to the failure message, for example how to fix a finding properly. |
 | `passExitCodes` | `[0]` | Exit codes that count as success. 126 and 127 can never be listed; see [Pass criteria](#pass-criteria). |
 | `metric` | none | A threshold on a number the gate reports; see [Pass criteria](#pass-criteria). |
+| `changedGlob` | none | List of `fnmatch` patterns that narrow `{changed_files}` and `{changed_files_file}`; see [Changed files](#changed-files). |
 
 ## Running gates
 
@@ -64,7 +65,7 @@ A failed gate run counts as one failed check, however many gates failed: the sto
 
 The message starts with one line that names every failed gate, for example `Quality gates failed: lint, tests`, so a [delegated phase](delegation.md), which shows only that line, still names them all. Then it lists each failed gate with its `hint` and the end of its output, followed by failing `warn` gates; the whole message stays within `maxOutputChars`. The complete text, with every gate's full output, goes to `run/last-failure.md` (see [Phases](phases.md#runlast-failuremd)).
 
-Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail`, `warn` or `broken`, with a `reason` when broken), `exitCode`, `metric` (the value read, when the gate has a [metric](#pass-criteria)), `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
+Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail`, `warn`, `skipped` or `broken`, with a `reason` when skipped or broken), `exitCode`, `metric` (the value read, when the gate has a [metric](#pass-criteria)), `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
 
 ### Results file
 
@@ -111,6 +112,30 @@ A Kotlin project can hold coverage and detekt findings like this. `koverLog` pri
 ```
 
 With the `issues` gate the phase cannot be left, in single mode or in a feature step, while the report shows issues: the agent receives the findings and works on them, and review starts once the report shows 0. If detekt does not write the report, the gate is broken and the run pauses.
+
+## Changed files
+
+A command may name the files the run changed, so that a linter checks only those. Two placeholders are replaced before the command runs:
+
+| Placeholder | Becomes |
+|-------------|---------|
+| `{changed_files}` | The paths separated by spaces, each quoted for the shell (`shlex.quote`), so a name with spaces or quotes stays one argument. |
+| `{changed_files_file}` | The project-relative path of `run/quality/<gate>.files`, a file with one path per line, rewritten each time the gate runs. |
+
+Paths are relative to the project root and use forward slashes, also when the project is a subdirectory of its repository. The set is:
+
+- tracked files that differ from the comparison point, staged or not (deleted files are left out), plus untracked files that were not already untracked when the run started (`preexistingUntracked` in `state.json`);
+- never anything under `.claude/specloop/`.
+
+The comparison point is `HEAD` for a feature-mode gate with `steps: "each"`, so a step's gate sees what this step changed since the previous step's commit. It is `baseRef`, the commit the run started from, for a gate with `steps: "last"` and in single mode, so these see everything the run changed.
+
+`changedGlob` keeps the paths that match at least one of its patterns. Matching is `fnmatch`, case-sensitive, with `*` also matching `/`: `*.kt` matches `src/Main.kt`, and `src/*` matches everything below `src`.
+
+- When a command uses a placeholder and the set is empty, after `changedGlob`, the gate is `skipped`: its command does not run, `qualityResults` shows `skipped` with the reason, `run/quality.md` shows the result `skipped`, and it never blocks the phase. A command with neither placeholder is not affected by `changedGlob` and always runs.
+- `{changed_files}` is limited to 8000 characters, because command lines are short on Windows. A longer list makes the gate [broken](#broken-gates) with a message that points to `{changed_files_file}`, which has no limit: `ruff check $(cat {changed_files_file})`, or the tool's own option to read a list from a file.
+- A gate is also broken when git cannot answer, for example when `baseRef` is no longer a commit.
+
+Single mode records `baseRef` (`HEAD`) and `preexistingUntracked` on the first `/sl-go` of a run in a git repository. It does not require a clean tree, so single mode starts on a dirty tree as before. The limit: a tracked file that was already modified at that moment counts as changed, because the comparison is with the commit, not with the tree as it was. Outside a git repository, or in one with no commits, nothing is recorded and the run starts as before. Outside git, [validation](#validation) rejects a gate that uses a placeholder; in a repository with no commits the comparison point is `HEAD`, and everything staged or untracked counts as changed.
 
 ## Broken gates
 
