@@ -258,6 +258,17 @@ Change the block before a run starts. While a run is active, a change to the mer
 
 `/sl-go` checks the merged `quality` block before it starts or resumes a run. It reports every problem it finds and changes nothing until they are fixed. The Stop hook checks the gates it runs again and treats an invalid one as [broken](#broken-gates). The problems are: an unknown key or a wrong type, an unknown `steps`, `level` or `legacy` value, an invalid gate name or regular expression, a phase in `phases` that does not exist or sets `allowEdits`, and a project that is not a git work tree while a gate uses `{changed_files}`, `{changed_files_file}` or `forbid`.
 
+## The /sl-quality command
+
+`/sl-quality` with no argument is a read-only overview. It prints:
+
+- every merged gate in the order it runs, with its phases, level, steps and last result from `qualityResults` in `state.json` (with the metric value, and the reason of a broken or skipped gate), or `not run`;
+- the [validation](#validation) errors, if any;
+- a warning when `quality.timeoutSec` is above the budget in force (see [Time budget](#time-budget)). It names the install command that fixes it: `python install.py <project>` from the specloop clone, with the options recorded by the installer (`--scope`, `--no-gitignore`) when there are any;
+- the programs gates start that cannot be found. specloop judges the first word of each command (leading `VAR=value` words are skipped) with `shutil.which`; shell builtins and keywords are not judged, and a path such as `./gradlew` counts as found when the file exists in the project. The check uses the `PATH` of the command, which may differ from the shell the gate runs in, so treat it as a hint.
+
+The command never raises: unbalanced quotes in the arguments, a malformed `quality` block or an unreadable state print a message instead. An unknown form prints the usage. `/sl-status` also prints one line per gate from the last gate run (`quality: <gate> <result> (phase <phase>)`) and one line per gate waived by a person, in single mode and in feature mode.
+
 ## See also
 
 - [Configuration](configuration.md): the configuration files, their layering and `checkTimeoutSec`.

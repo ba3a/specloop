@@ -36,9 +36,15 @@ Delete the state and the `run/` artifacts. Blocked in a chat that is not the own
 
 `/sl-update [check|skip|never]` checks for a newer kit and applies it, or only reports (`check`), or silences a version (`skip`, `never`). Refused while a workflow is busy. See [Updates](updates.md#the-sl-update-command) for the forms.
 
+## `/sl-quality`
+
+`/sl-quality` lists the [quality gates](quality-gates.md): for each gate in the order it runs, its phases, level, steps and last result with the metric value. It then prints the configuration errors, a warning when `quality.timeoutSec` is above the budget the installed Stop hook leaves (naming the install command that fixes it), and the programs that gates start but that are neither on `PATH` nor files of the project, judged by the first word of each command. It changes nothing and works from any chat. Any other argument prints the usage. See [Quality gates](quality-gates.md#the-sl-quality-command).
+
+`/sl-status` also prints one line per gate from the last gate run, and the gates a person waived.
+
 ## Notes
 
-Claude cannot run `/sl-spec`, `/sl-feature`, `/sl-go`, `/sl-advance`, `/sl-pause`, `/sl-reset` or `/sl-update` itself: their templates set `disable-model-invocation: true`, so taking over a workflow or force-passing a phase is always your decision.
+Claude cannot run `/sl-spec`, `/sl-feature`, `/sl-go`, `/sl-advance`, `/sl-pause`, `/sl-reset`, `/sl-quality` or `/sl-update` itself: their templates set `disable-model-invocation: true`, so taking over a workflow or force-passing a phase is always your decision.
 
 If specloop is busy (another process holds `state.lock`), a command prints one line asking you to retry and changes nothing.
 

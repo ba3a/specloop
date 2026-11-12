@@ -17,6 +17,8 @@ Manual commands (used by slash commands):
     engine.py reset              delete state and run artifacts
     engine.py update [check|skip|never]
                                  check for kit updates now and report, skip or silence them
+    engine.py quality [run|init|accept]
+                                 list the quality gates, or run, set up or accept them
     engine.py update-check       background update check (run detached; prints nothing)
 
 Configuration is layered, later layers winning in a deep merge:
@@ -3554,9 +3556,10 @@ def cmd_status(root):
     if not state:
         return "No workflow state."
     late = late_reviews(root, load_config(root), state)
+    quality = quality_status_lines(state)
     if is_feature(state):
-        return "\n".join([feature_status(root, state)] + late)
-    return json.dumps(dict(state, lateReviews=late) if late else state, indent=2)
+        return "\n".join([feature_status(root, state)] + late + quality)
+    return "\n".join([json.dumps(dict(state, lateReviews=late) if late else state, indent=2)] + quality)
 
 
 def feature_status(root, state):
@@ -3588,6 +3591,48 @@ def feature_status(root, state):
     for step_id, status, sha, title in rows:
         lines.append("  %s  %s  %-7s  %s" % (step_id.rjust(width_id), status.ljust(width_status), sha, title))
     return "\n".join(lines)
+
+
+def _result_text(record):
+    """'pass', 'fail, metric 70' or 'broken (command not found)' for one entry of state.qualityResults."""
+    result = str(record.get("result", "?"))
+    if _metric_number(record.get("metric")) is not None:
+        result += ", metric %s" % _number_text(record["metric"])
+    if record.get("reason") and result.split(",")[0] in ("broken", "skipped"):
+        result += " (%s)" % str(record["reason"]).strip().rstrip(".")
+    return result
+
+
+def _waived_text(entry):
+    if isinstance(entry, dict):
+        text = str(entry.get("gate", "?"))
+        if entry.get("phase"):
+            text += " in phase %s" % entry["phase"]
+        if entry.get("stepId") is not None:
+            text += ", step %s" % entry["stepId"]
+        return text
+    return str(entry)
+
+
+def quality_status_lines(state):
+    """Lines of /status on quality gates: one per gate from the last run, then the waived gates. Reads state
+    only; never raises."""
+    try:
+        lines = []
+        results = state.get("qualityResults")
+        for name, record in (results.items() if isinstance(results, dict) else []):
+            if not isinstance(record, dict):
+                continue
+            where = "phase %s" % record.get("phase")
+            if record.get("stepId") is not None:
+                where += ", step %s" % record["stepId"]
+            lines.append("quality: %s %s (%s)" % (name, _result_text(record), where))
+        waived = state.get("qualityWaived")
+        for entry in (waived if isinstance(waived, list) else []):
+            lines.append("quality waived: %s" % _waived_text(entry))
+        return lines
+    except Exception as e:
+        return ["quality: unknown (%s)" % e]
 
 
 def relative_age(stamp):
@@ -3636,6 +3681,141 @@ def status_output(root):
     except Exception as e:
         return "%s\nupdate: unknown (%s)" % (output, e)
     return "%s\n%s" % (output, update_status_line(root, config))
+
+
+SHELL_WORDS = frozenset((":", ".", "[", "[[", "alias", "case", "cd", "command", "do", "done", "echo", "elif", "else",
+                         "eval", "exec", "exit", "export", "false", "fi", "for", "if", "pwd", "printf", "read",
+                         "return", "set", "shift", "source", "test", "then", "time", "trap", "true", "type",
+                         "ulimit", "umask", "unset", "until", "wait", "while"))
+ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def gate_tool(command):
+    """The first word of a gate's command that names a program: leading VAR=value words are skipped. None when
+    there is none or the command starts with shell syntax."""
+    if not isinstance(command, str):
+        return None
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    for word in words:
+        if not ENV_ASSIGNMENT.match(word):
+            return None if (word in SHELL_WORDS or word[:1] in "$(`{!<>") else word
+    return None
+
+
+def missing_tool(root, command):
+    """The program a gate's command starts with when it is neither on PATH nor a file of the project, else None.
+    Shell builtins and keywords are not judged."""
+    word = gate_tool(command)
+    if not word:
+        return None
+    if "/" in word or "\\" in word:
+        path = word if os.path.isabs(word) else os.path.join(root, word)
+        return None if os.path.exists(path) else word
+    return None if shutil.which(word) else word
+
+
+def _quoted(text):
+    return '"%s"' % text if re.search(r"\s", text) else text
+
+
+def install_command(root):
+    """The command that installs the kit into this project again, as the installer recorded it, and where to run
+    it."""
+    source = read_manifest_source(root)
+    source = source if isinstance(source, dict) else {}
+    command = " ".join(["python install.py", _quoted(root)] + installer_args(source))
+    path = source.get("path")
+    return "%s, run from %s" % (command, _quoted(path) if isinstance(path, str) and path else "the specloop clone")
+
+
+def quality_budget_warning(root, config):
+    """A line when quality.timeoutSec is above what the installed Stop hook leaves, else None."""
+    configured, effective = quality_timeout(config), quality_budget(root, config)
+    if configured <= effective:
+        return None
+    return ("Warning: quality.timeoutSec is %s s, but the installed Stop hook leaves %s s for the gates, so that is "
+            "the budget in force. Install again to size the hook: %s." % (
+                _seconds_text(configured), _seconds_text(effective), install_command(root)))
+
+
+def quality_list_lines(root, config, state):
+    gates, results = quality_gates(config), state.get("qualityResults")
+    results = results if isinstance(results, dict) else {}
+    if not gates:
+        return ["No quality gates are configured (see docs/quality-gates.md)."]
+    lines = ["Quality gates (%d, in the order they run):" % len(gates)]
+    for name, gate in gates.items():
+        if not isinstance(gate, dict):
+            lines.append("  %s: invalid (a gate must be an object)" % name)
+            continue
+        phases = gate.get("phases", DEFAULT_GATE_PHASES)
+        last = results.get(name)
+        lines.append("  %s: phases %s, level %s, steps %s, last result: %s" % (
+            name, ", ".join(map(str, phases)) if isinstance(phases, list) else str(phases),
+            gate.get("level", "block"), gate.get("steps", "each"),
+            _result_text(last) if isinstance(last, dict) else "not run"))
+    return lines
+
+
+def quality_tool_lines(root, config):
+    missing = []
+    for name, gate in quality_gates(config).items():
+        tool = missing_tool(root, gate.get("command")) if isinstance(gate, dict) else None
+        if tool:
+            missing.append("  %s: %s" % (name, tool))
+    return ["Tools not found on PATH or in the project (gate: program):"] + missing if missing else []
+
+
+def quality_usage(config):
+    quality = cmd_name(config, "quality")
+    return "\n".join([
+        "Usage: %s [run [gate...]|init [preset]|accept]" % quality,
+        "  %s                  list the gates, their last results and problems with the setup" % quality,
+        "  %s run [gate...]    run gates now, outside the workflow" % quality,
+        "  %s init [preset]    set up gates for this project" % quality,
+        "  %s accept           accept changes to protected files, the quality block and forbidden lines" % quality,
+    ])
+
+
+def quality_overview(root, config):
+    try:
+        state = load_state(root) or {}
+    except Exception:  # an unreadable state must not hide the setup
+        state = {}
+    lines = quality_list_lines(root, config, state)
+    reason = unreadable_quality(config)
+    errors = validate_quality(root, config)
+    if errors:
+        lines += ["", "Configuration errors:"] + ["- " + e for e in errors]
+    if not reason:
+        warning = quality_budget_warning(root, config)
+        lines += ([""] + [warning]) if warning else []
+        tools = quality_tool_lines(root, config)
+        lines += ([""] + tools) if tools else []
+    return "\n".join(lines)
+
+
+QUALITY_FORMS = {}  # form name -> handler(root, config, args); the forms run, init and accept add theirs
+
+
+def cmd_quality(root, args):
+    """/sl-quality: `args` is the argument string. Never raises."""
+    config = {}
+    try:
+        config = load_config(root)
+        try:
+            words = shlex.split(args or "")
+        except ValueError as e:
+            return "Cannot read the arguments (%s).\n%s" % (e, quality_usage(config))
+        if not words:
+            return quality_overview(root, config)
+        handler = QUALITY_FORMS.get(words[0])
+        return handler(root, config, words[1:]) if handler else quality_usage(config)
+    except Exception as e:
+        return "[specloop] %s failed: %s" % (cmd_name(config, "quality"), str(e) or e.__class__.__name__)
 
 
 def cmd_reset(root):
@@ -3932,6 +4112,7 @@ def main(argv):
         "status": lambda: status_output(root),
         "reset": lambda: cmd_reset(root),
         "update": lambda: cmd_update(root, args),
+        "quality": lambda: cmd_quality(root, " ".join(args)),
     }
     if command not in handlers:
         print("Unknown command: " + command)

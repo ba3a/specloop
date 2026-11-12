@@ -1739,6 +1739,17 @@ class FeatureGateTest(unittest.TestCase):
         self.assertEqual(("paused", "cov", 0), (state["status"], state["pausedFor"]["gate"], state["iter"]))
         self.assertIn("matches nothing", state["pausedFor"]["reason"])
 
+    def test_status_has_a_line_per_gate_and_the_waived_gates(self):
+        self.begin({"lint": self.counting("lint", exit_code=1), "tests": self.counting("tests")})
+        self.stop()
+        out = workflow.cmd_status(self.root)
+        self.assertIn("[specloop] feature run", out)
+        self.assertIn("quality: lint fail (phase implement, step 1)", out)
+        self.assertIn("quality: tests pass (phase implement, step 1)", out)
+        workflow.update_state(self.root, lambda s: s.update(qualityWaived=[{"gate": "lint", "phase": "implement",
+                                                                            "stepId": 1}]))
+        self.assertIn("quality waived: lint in phase implement, step 1", workflow.cmd_status(self.root))
+
 
 @unittest.skipUnless(gitfixture.git_available(), "git not available")
 class ChangedFilesProject(unittest.TestCase):
@@ -3055,6 +3066,200 @@ class PretoolProtectionTest(GateProject):
                 self.set_config({"quality": block})
                 self.assertIsNone(self.pretool("Edit", self.full("detekt.yml")))
                 self.assertIsNone(self.pretool("Bash", command="git status"))
+
+
+class QualityCommandTest(GateProject):
+    """/sl-quality without arguments: the gates, their last results, and problems with the setup."""
+
+    def quality(self, args=""):
+        return workflow.cmd_quality(self.root, args)
+
+    def set_manifest(self, **data):
+        self.write_json("manifest.json", data)
+
+    def test_the_template_is_for_the_user_and_runs_quality_with_the_arguments(self):
+        with open(os.path.join(os.path.dirname(KIT), "commands", "quality.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("disable-model-invocation: true\n", text)
+        self.assertIn("allowed-tools: Bash(sh .claude/specloop/run.sh:*)", text)
+        self.assertIn("argument-hint:", text)
+        self.assertIn('!`sh .claude/specloop/run.sh quality "$ARGUMENTS"`', text)
+        self.assertNotIn("/sl-", text)
+        self.assertIn("{{prefix}}", text)
+
+    def test_main_runs_quality(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.root}), contextlib.redirect_stdout(out):
+            self.assertEqual(0, workflow.main(["quality"]))
+        self.assertIn("lint", out.getvalue())
+
+    def test_no_gates(self):
+        self.assertIn("No quality gates are configured", self.quality())
+
+    def test_lists_gates_in_order_with_phases_level_and_steps(self):
+        self.configure({"zeta": {"command": "exit 0"},
+                        "alpha": {"command": "exit 0", "phases": ["implement", "review"], "level": "warn",
+                                  "steps": "last"}})
+        out = self.quality()
+        self.assertLess(out.index("zeta"), out.index("alpha"))
+        self.assertIn("zeta: phases implement, level block, steps each, last result: not run", out)
+        self.assertIn("alpha: phases implement, review, level warn, steps last, last result: not run", out)
+
+    def test_lists_the_last_result_with_the_metric_and_the_reason(self):
+        self.configure({"cov": {"command": "exit 0"}, "tool": {"command": "exit 0"}, "ok": {"command": "exit 0"}})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.update_state(self.root, lambda s: s.update(qualityResults={
+            "cov": {"result": "fail", "metric": 71.5, "phase": "implement"},
+            "tool": {"result": "broken", "reason": "command not found (exit 127)", "phase": "implement"},
+            "ok": {"result": "pass", "phase": "implement"}}))
+        out = self.quality()
+        self.assertIn("last result: fail, metric 71.5", out)
+        self.assertIn("last result: broken (command not found (exit 127))", out)
+        self.assertIn("last result: pass\n", out + "\n")
+
+    def test_prints_every_validation_error(self):
+        self.configure({"a": {"command": "exit 0", "level": "loud"}, "b": {"command": "exit 0", "steps": "never"}})
+        out = self.quality()
+        self.assertIn("Configuration errors:", out)
+        self.assertIn("level", out)
+        self.assertIn("steps", out)
+
+    def test_no_errors_section_for_a_valid_block(self):
+        self.configure({"a": {"command": "exit 0"}})
+        self.assertNotIn("Configuration errors", self.quality())
+
+    def test_warns_when_the_budget_is_above_the_installed_hook(self):
+        self.configure({"a": {"command": "exit 0"}}, {"timeoutSec": 5000})
+        self.set_manifest(stopTimeoutSec=900 + 600 + 60,
+                          source={"path": "/clones/specloop", "installArgs": {"scope": "local", "gitignore": False}})
+        out = self.quality()
+        self.assertIn("quality.timeoutSec is 5000 s", out)
+        self.assertIn("600 s", out)
+        self.assertIn("python install.py %s --scope local --no-gitignore" % self.root.replace(" ", ""), out.replace('"', ""))
+        self.assertIn("/clones/specloop", out)
+
+    def test_the_budget_warning_without_a_recorded_source_names_the_clone(self):
+        self.configure({"a": {"command": "exit 0"}}, {"timeoutSec": 5000})
+        self.set_manifest(stopTimeoutSec=900 + 600 + 60)
+        out = self.quality()
+        self.assertIn("python install.py", out)
+        self.assertIn("the specloop clone", out)
+
+    def test_no_budget_warning_when_the_budget_fits_or_the_manifest_is_old(self):
+        self.configure({"a": {"command": "exit 0"}}, {"timeoutSec": 5000})
+        self.assertNotIn("Warning", self.quality())
+        self.set_manifest(stopTimeoutSec=900 + 5000 + 60)
+        self.assertNotIn("Warning", self.quality())
+
+    def test_reports_tools_that_are_not_on_path(self):
+        os.makedirs(os.path.join(self.root, "tools"))
+        with open(os.path.join(self.root, "tools", "check.sh"), "w") as f:
+            f.write("exit 0\n")
+        with open(os.path.join(self.root, "gradlew"), "w") as f:
+            f.write("exit 0\n")
+        self.configure({"gone": {"command": "no-such-tool-xyz --flag"},
+                        "env": {"command": "FOO=1 no-such-tool-abc run"},
+                        "wrapper": {"command": "./gradlew detekt"},
+                        "script": {"command": "tools/check.sh"},
+                        "missing": {"command": "./nowhere/run"},
+                        "builtin": {"command": "exit 1"},
+                        "echo": {"command": "echo hi && no-such-tool-later"},
+                        "python": {"command": '"%s" -c pass' % sys.executable.replace("\\", "/")}})
+        out = self.quality()
+        self.assertIn("gone: no-such-tool-xyz", out)
+        self.assertIn("env: no-such-tool-abc", out)
+        self.assertIn("missing: ./nowhere/run", out)
+        tools = out.split("Tools not found")[1]
+        for name in ("wrapper:", "script:", "builtin:", "echo:", "python:"):
+            self.assertNotIn(name, tools)
+
+    def test_unknown_forms_print_the_usage(self):
+        for args in ("bogus", "run", "init kotlin", "accept", "--help"):
+            with self.subTest(args=args):
+                out = self.quality(args)
+                self.assertIn("Usage: /sl-quality", out)
+                for form in ("run", "init", "accept"):
+                    self.assertIn("/sl-quality " + form, out)
+
+    def test_usage_uses_the_prefix(self):
+        self.configure({"a": {"command": "exit 0"}}, commandPrefix="x-")
+        self.assertIn("Usage: /x-quality", self.quality("bogus"))
+
+    def test_unbalanced_quotes_print_a_usage_error(self):
+        out = self.quality('run "lint')
+        self.assertIn("Cannot read the arguments", out)
+        self.assertIn("Usage: /sl-quality", out)
+
+    def test_never_raises_on_malformed_config_or_state(self):
+        shapes = [None, [], "gates", {"gates": []}, {"gates": {"a": None}}, {"gates": {"a": "exit 0"}},
+                  {"gates": {"a": {"command": 5, "phases": 3}}}, {"gates": {"a": {"command": "exit 0"}}, "timeoutSec": "x"},
+                  {"gates": {"a": {"command": "'unbalanced"}}}]
+        for block in shapes:
+            with self.subTest(block=block):
+                self.set_config({"quality": block})
+                self.assertIsInstance(self.quality(), str)
+        self.set_config("not an object")
+        self.assertIsInstance(self.quality(), str)
+        self.set_gates({"a": {"command": "exit 0"}})
+        with open(os.path.join(self.base, "state.json"), "w") as f:
+            f.write("{broken")
+        self.assertIn("a: phases", self.quality())
+        with open(os.path.join(self.base, "state.json"), "w") as f:
+            json.dump({"qualityResults": ["x", {"a": 1}]}, f)
+        self.assertIsInstance(self.quality(), str)
+
+    def test_an_internal_error_is_a_message(self):
+        with mock.patch.object(workflow, "quality_overview", side_effect=RuntimeError("boom")):
+            out = self.quality()
+        self.assertIn("/sl-quality failed: boom", out)
+
+    def test_it_changes_nothing(self):
+        self.configure({"a": {"command": "exit 0"}})
+        workflow.cmd_init(self.root, "spec.md")
+        before = self.state_bytes()
+        self.quality()
+        self.assertEqual(before, self.state_bytes())
+
+
+class QualityStatusTest(GateProject):
+    """/sl-status shows the last result of each gate and the waived gates."""
+
+    def test_single_mode_status_has_a_line_per_gate(self):
+        self.configure({"lint": {"command": "echo found; exit 1"}, "cov": {"command": "echo 'coverage: 70%'",
+                       "metric": {"pattern": "coverage: ([0-9.]+)%", "min": 80}}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        out = workflow.cmd_status(self.root)
+        self.assertIn("quality: lint fail (phase implement)", out)
+        self.assertIn("quality: cov fail, metric 70 (phase implement)", out)
+
+    def test_no_quality_lines_without_a_gate_run(self):
+        self.start_implement()
+        self.assertNotIn("quality:", workflow.cmd_status(self.root))
+
+    def test_waived_gates_are_listed(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(qualityWaived=[
+            {"gate": "lint", "phase": "implement", "stepId": 2, "at": "now"}, "tests"]))
+        out = workflow.cmd_status(self.root)
+        self.assertIn("quality waived: lint in phase implement, step 2", out)
+        self.assertIn("quality waived: tests", out)
+
+    def test_malformed_results_do_not_break_status(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(qualityResults=["x"], qualityWaived="x"))
+        self.assertIn("phase", workflow.cmd_status(self.root))
+        workflow.update_state(self.root, lambda s: s.update(qualityResults={"a": 1, "b": {"result": "pass"}}))
+        self.assertIn("quality: b pass", workflow.cmd_status(self.root))
+
+    def test_status_output_keeps_the_update_line_last(self):
+        self.configure({"lint": {"command": "exit 1"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        lines = workflow.status_output(self.root).splitlines()
+        self.assertTrue(lines[-1].startswith("update:"))
+        self.assertTrue(any(line.startswith("quality: lint") for line in lines))
 
 
 if __name__ == "__main__":
