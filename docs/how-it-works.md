@@ -45,6 +45,7 @@ Files in `<project>/.claude/specloop/`:
 | `phases/<phase>.md` | kit (replaced on update) | Shipped phase instructions. |
 | `overrides/<phase>.md` | **project** | Your phase instructions; take precedence over `phases/`. |
 | `state.json`, `state.lock`, `run/` | runtime | Current state, its lock, plan and review files. |
+| `run/quality.md`, `run/quality/` | runtime | The [quality gates](quality-gates.md#results-file) report of the last gate run and each gate's complete output. Both move to `run/steps/<id>/` when a feature-mode step finishes. |
 | `update.json`, `update.lock` | runtime | Result of the last update check and the lock of a running check. See [Updates](updates.md). |
 | `manifest.json` | kit | What the installer wrote: `commands`, `settings`, `stopTimeoutSec` (the Stop hook's timeout, which bounds the [quality gates](quality-gates.md#time-budget)) and `source`, the clone the kit was installed from. |
 

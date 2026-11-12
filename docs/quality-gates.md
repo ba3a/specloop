@@ -66,6 +66,12 @@ The message starts with one line that names every failed gate, for example `Qual
 
 Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail`, `warn` or `broken`, with a `reason` when broken), `exitCode`, `metric` (the value read, when the gate has a [metric](#pass-criteria)), `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
 
+### Results file
+
+After each gate run, `.claude/specloop/run/quality.md` is rewritten from that run's results: a table with one row per gate that ran (name, `result`, duration and the metric value, or `-` when the gate has none), then, for each `warn` result, a section with the end of its output, bounded by `maxOutputChars` across all warnings. The reviewer reads this file. It is written together with `qualityResults`, so a dropped result writes nothing, and a run without gates never creates it.
+
+In a feature-mode run, `run/quality.md` and `run/quality/` move to `run/steps/<id>/` when the step finishes, with the step's review files; the next step starts without them. In single mode they stay in `run/`.
+
 ## Pass criteria
 
 By default the exit code decides, so a tool's own threshold works unchanged, for example detekt's `maxIssues`. Two keys refine that:

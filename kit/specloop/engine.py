@@ -1841,16 +1841,17 @@ def invalid_gate_record(root, state, name, errors):
     return gate_record(state, name, "broken", None, 0, reason=reason)
 
 
-def broken_outcome(records, paused_for):
+def broken_outcome(records, paused_for, outputs=None):
     """The outcome of a Stop whose gates could not give an answer. `records` are every gate that ran or was
-    judged; the details name each broken gate and its reason."""
+    judged; the details name each broken gate and its reason. `outputs` maps gate names to their output."""
     broken = [r for r in records if r["result"] == "broken"]
     if broken:
         lines = ["Quality gate '%s' is broken: %s" % (r["name"], r["reason"]) for r in broken]
     else:
         lines = ["The quality configuration is broken: %s" % paused_for["reason"]]
     details = "\n".join(lines)
-    return {"result": "broken", "details": details, "full": details, "quality": records, "pausedFor": paused_for}
+    return {"result": "broken", "details": details, "full": details, "quality": records, "pausedFor": paused_for,
+            "qualityOutputs": outputs or {}}
 
 
 def _gate_exit(record):
@@ -1918,6 +1919,10 @@ def gate_pass_details(details, runs):
     return "; ".join([details] + notes)
 
 
+def _outputs_of(runs):
+    return {record["name"]: output for record, output in runs}
+
+
 def run_quality_gates(root, config, state, outcome):
     """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record.
 
@@ -1943,14 +1948,91 @@ def run_quality_gates(root, config, state, outcome):
         record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started))
         runs.append((record, output))
         if record["result"] == "broken":
-            return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]})
+            return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},
+                                  _outputs_of(runs))
         if fail_fast and record["result"] == "fail":
             break
     records = [record for record, _ in runs]
     if any(record["result"] == "fail" for record in records):
         details, full = gate_failure(config, runs)
-        return {"result": "fail", "details": details, "full": full, "quality": records}
-    return dict(outcome, details=gate_pass_details(outcome["details"], runs), quality=records)
+        return {"result": "fail", "details": details, "full": full, "quality": records,
+                "qualityOutputs": _outputs_of(runs)}
+    return dict(outcome, details=gate_pass_details(outcome["details"], runs), quality=records,
+                qualityOutputs=_outputs_of(runs))
+
+
+QUALITY_REPORT = "quality.md"
+
+
+def quality_report_path(root):
+    return os.path.join(run_dir(root), QUALITY_REPORT)
+
+
+def quality_waived_lines(state):
+    """Lines of the report's section on gates a person waived with advance. Added by the step that records
+    waivers; empty until then."""
+    return []
+
+
+def quality_accepted_lines(state):
+    """Lines of the report's section on changes a person accepted. Added by the step that records accepted
+    changes; empty until then."""
+    return []
+
+
+def quality_baseline_lines(config, state):
+    """Lines noting ratchet gates that have no baseline to measure from. Added by the step that records
+    baselines; empty until then."""
+    return []
+
+
+def _fenced(text):
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return "%s\n%s\n%s" % (fence, text, fence)
+
+
+def quality_report(config, state, records, outputs):
+    """The text of run/quality.md: a row per gate that ran, the end of each warning's output, then the sections
+    other steps fill. Built only from the records and outputs of one gate run."""
+    where = "phase `%s`" % state["phase"]
+    if state.get("stepId") is not None:
+        where += ", step %s" % state["stepId"]
+    lines = ["# Quality gates", "", "Last gate run: %s." % where, "",
+             "| Gate | Result | Duration | Metric |", "|------|--------|----------|--------|"]
+    for record in records:
+        metric = record.get("metric")
+        lines.append("| %s | %s | %ss | %s |" % (
+            record["name"], record["result"], _seconds_text(record.get("durationSec", 0)),
+            "-" if metric is None else _number_text(metric)))
+    warned = [r for r in records if r["result"] == "warn"]
+    if warned:
+        texts = [(outputs.get(r["name"]) or "").rstrip("\n") for r in warned]
+        limit = config.get("maxOutputChars", 4000)
+        for record, text, share in zip(warned, texts, _shares([len(t) for t in texts], limit)):
+            lines += ["", "## Warning: %s" % record["name"], "",
+                      "The end of its output; the complete output is in `%s`." % _rel("run", QUALITY_DIR, record["name"] + ".log"),
+                      "", _fenced(_clip_tail(text, share))]
+    for extra in (quality_baseline_lines(config, state), quality_waived_lines(state), quality_accepted_lines(state)):
+        if extra:
+            lines += [""] + list(extra)
+    return "\n".join(lines) + "\n"
+
+
+def write_quality_report(root, config, state, outcome):
+    """Rewrite run/quality.md from the gate run in `outcome`. Called where the run's result is recorded, so the
+    file never comes from a run that state dropped. Without gate records nothing is written. Never raises."""
+    records = outcome.get("quality")
+    if not records:
+        return
+    try:
+        text = quality_report(config, state, records, outcome.get("qualityOutputs") or {})
+        os.makedirs(run_dir(root), exist_ok=True)
+        with open(quality_report_path(root), "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        print("[specloop] could not write %s: %s" % (QUALITY_REPORT, e), file=sys.stderr)
 
 
 def record_quality(state, records):
@@ -2174,15 +2256,18 @@ def save_steps(root, state):
 
 
 def archive_step_files(root, step_id):
-    """Move the finished step's review*.md and last-failure.md into run/steps/<id>/."""
+    """Move the finished step's review*.md, last-failure.md, quality.md and quality/ into run/steps/<id>/."""
     names = [n for n in os.listdir(run_dir(root))
-             if (n.startswith("review") and n.endswith(".md")) or n == FAILURE_FILE]
+             if (n.startswith("review") and n.endswith(".md")) or n in (FAILURE_FILE, QUALITY_REPORT, QUALITY_DIR)]
     if not names:
         return
     dest = os.path.join(run_dir(root), "steps", str(step_id))
     os.makedirs(dest, exist_ok=True)
     for name in names:
-        os.replace(os.path.join(run_dir(root), name), os.path.join(dest, name))
+        target = os.path.join(dest, name)
+        if os.path.isdir(target):
+            shutil.rmtree(target, ignore_errors=True)
+        os.replace(os.path.join(run_dir(root), name), target)
 
 
 def start_next_step(root, config, state):
@@ -2435,6 +2520,7 @@ def apply_gate(root, config, state, outcome, hook_input):
     result, details, full = outcome["result"], outcome["details"], outcome["full"]
     if outcome.get("quality"):
         record_quality(state, outcome["quality"])
+        write_quality_report(root, config, state, outcome)
     phase = state["phase"]
     if result == "broken":
         return pause_for_broken_gate(config, state, session, outcome)

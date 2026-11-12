@@ -683,6 +683,102 @@ class GateRunTest(GateProject):
         self.assertFalse(os.path.exists(self.run_path("quality")))
 
 
+class QualityReportTest(GateProject):
+    """run/quality.md after a gate run, in single mode."""
+
+    def report(self):
+        return self.read(self.run_path("quality.md"))
+
+    def test_one_row_per_gate_with_result_duration_and_metric(self):
+        self.configure({"lint": {"command": "exit 0"},
+                        "cov": {"command": "echo coverage: 91.5%", "metric": {"pattern": "coverage: ([0-9.]+)%", "min": 80}},
+                        "tests": {"command": "exit 1"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        rows = [line for line in self.report().splitlines() if line.startswith("| ")][1:]
+        self.assertEqual(3, len(rows))
+        cells = [[c.strip() for c in row.strip("|").split("|")] for row in rows]
+        self.assertEqual(["lint", "pass"], cells[0][:2])
+        self.assertEqual(["cov", "pass"], cells[1][:2])
+        self.assertEqual(["tests", "fail"], cells[2][:2])
+        for row in cells:
+            self.assertRegex(row[2], r"^\d+(\.\d+)?s$")
+        self.assertEqual(["-", "91.5", "-"], [row[3] for row in cells])
+
+    def test_a_warn_result_shows_the_end_of_its_output(self):
+        self.configure({"style": {"command": "echo style-output; exit 1", "level": "warn"}}, maxOutputChars=60)
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        report = self.report()
+        self.assertIn("| style | warn |", report)
+        self.assertIn("style-output", report)
+        self.assertIn("quality/style.log", report)
+
+    def test_a_long_warn_output_is_cut_to_its_end(self):
+        self.configure({"style": {"command": "i=0; while [ $i -lt 200 ]; do echo line$i; i=$((i+1)); done; exit 1",
+                                  "level": "warn"}}, maxOutputChars=100)
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        report = self.report()
+        self.assertIn("line199", report)
+        self.assertNotIn("line0\n", report)
+        self.assertLess(len(report), 700)
+
+    def test_a_passing_gate_has_no_warning_section(self):
+        self.configure({"tests": {"command": "echo fine; exit 0"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        self.assertNotIn("Warning", self.report())
+        self.assertNotIn("fine", self.report())
+
+    def test_the_report_is_rewritten_on_each_run(self):
+        self.configure({"tests": {"command": "test -f ok"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        self.assertIn("| tests | fail |", self.report())
+        with open(os.path.join(self.root, "ok"), "w") as f:
+            f.write("x")
+        workflow.handle_stop(self.root, {})
+        self.assertIn("| tests | pass |", self.report())
+        self.assertNotIn("fail", self.report())
+
+    def test_a_broken_gate_run_is_reported_too(self):
+        self.configure({"lint": {"command": "exit 0"}, "tests": {"command": "exit 127"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        self.assertIn("| lint | pass |", self.report())
+        self.assertIn("| tests | broken |", self.report())
+
+    def test_without_gates_no_report_is_written(self):
+        self.set_config({})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        self.assertFalse(os.path.exists(self.run_path("quality.md")))
+
+    def test_a_dropped_result_writes_no_report(self):
+        self.configure({"tests": {"command": "exit 0"}})
+        self.start_implement()
+        original = workflow.run_limited
+
+        def pause_then_run(*args, **kwargs):
+            workflow.cmd_pause(self.root)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(workflow, "run_limited", side_effect=pause_then_run):
+            self.assertIsNone(workflow.handle_stop(self.root, {}))
+        self.assertFalse(os.path.exists(self.run_path("quality.md")))
+        self.assertNotIn("qualityResults", self.state())
+
+    def test_the_report_has_hooks_for_the_sections_later_steps_add(self):
+        self.configure({"tests": {"command": "exit 0"}})
+        self.start_implement()
+        with mock.patch.object(workflow, "quality_waived_lines", lambda state: ["## Waived", "- lint"]),                 mock.patch.object(workflow, "quality_accepted_lines", lambda state: ["## Accepted"]),                 mock.patch.object(workflow, "quality_baseline_lines", lambda config, state: ["No baseline."]):
+            workflow.handle_stop(self.root, {})
+        report = self.report()
+        self.assertLess(report.index("No baseline."), report.index("## Waived"))
+        self.assertLess(report.index("## Waived"), report.index("## Accepted"))
+
+
 class BrokenGateTest(GateProject):
     """A gate that cannot give an answer pauses the run and uses no iteration."""
 
@@ -1547,6 +1643,46 @@ class FeatureGateTest(unittest.TestCase):
         self.assertEqual(("pass", 0, 0, 1), (result["result"], result["exitCode"], result["metric"],
                                              result["stepId"]))
         self.assertEqual("review", self.state()["phase"])
+
+    def test_quality_files_are_archived_with_the_step(self):
+        self.begin({"tests": self.counting("tests")})
+        self.assertIn("entering phase 'review'", self.write_work_and_stop())
+        run = os.path.join(self.base, "run")
+        self.assertTrue(os.path.exists(os.path.join(run, "quality.md")))
+        self.assertTrue(os.path.exists(os.path.join(run, "quality", "tests.log")))
+        self.approve_step()
+        self.assertEqual(2, self.state()["stepId"])
+        self.assertFalse(os.path.exists(os.path.join(run, "quality.md")))
+        self.assertFalse(os.path.exists(os.path.join(run, "quality")))
+        archived = os.path.join(run, "steps", "1")
+        self.assertIn("| tests | pass |", self.read_file(os.path.join(archived, "quality.md")))
+        self.assertTrue(os.path.exists(os.path.join(archived, "quality", "tests.log")))
+
+    def test_archiving_replaces_an_older_quality_directory(self):
+        self.begin({"tests": self.counting("tests")})
+        stale = os.path.join(self.base, "run", "steps", "1", "quality")
+        os.makedirs(stale)
+        self.write(os.path.relpath(os.path.join(stale, "old.log"), self.root), "old")
+        self.write_work_and_stop()
+        self.approve_step()
+        archived = os.path.join(self.base, "run", "steps", "1", "quality")
+        self.assertEqual(["tests.log"], os.listdir(archived))
+
+    def read_file(self, path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def write_work_and_stop(self):
+        self.write("work-%d.txt" % self.state()["stepId"], "work\n")
+        return self.stop()["reason"]
+
+    def test_the_next_step_starts_without_the_previous_report(self):
+        self.begin({"final": self.counting("final", steps="last")})
+        self.write_work_and_stop()
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality.md")))
+        self.approve_step()
+        self.write_work_and_stop()
+        self.assertIn("| final | pass |", self.read_file(os.path.join(self.base, "run", "quality.md")))
 
     def test_a_broken_metric_pauses_a_step(self):
         self.begin({"cov": {"command": "echo nothing", "metric": {"pattern": r"(\d+)", "min": 1}}})
