@@ -46,7 +46,7 @@ Files in `<project>/.claude/specloop/`:
 | `overrides/<phase>.md` | **project** | Your phase instructions; take precedence over `phases/`. |
 | `state.json`, `state.lock`, `run/` | runtime | Current state, its lock, plan and review files. |
 | `update.json`, `update.lock` | runtime | Result of the last update check and the lock of a running check. See [Updates](updates.md). |
-| `manifest.json` | kit | What the installer wrote, including `source`, the clone the kit was installed from. |
+| `manifest.json` | kit | What the installer wrote: `commands`, `settings`, `stopTimeoutSec` (the Stop hook's timeout, which bounds the [quality gates](quality-gates.md#time-budget)) and `source`, the clone the kit was installed from. |
 
 Everything in this directory except `config.json` and `overrides/` is git-ignored.
 

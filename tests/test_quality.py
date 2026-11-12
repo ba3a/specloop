@@ -851,6 +851,150 @@ class BrokenGateTest(GateProject):
         self.assertNotIn("qualityResults", state)
 
 
+class BudgetTest(GateProject):
+    """quality.timeoutSec is one time budget for all gates of a Stop, capped by the installed Stop hook."""
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.root, "sleep.py"), "w") as f:
+            f.write("import sys, time\ntime.sleep(float(sys.argv[1]))\n")
+
+    def sleeper(self, seconds, marker=None):
+        command = '"%s" sleep.py %s' % (sys.executable.replace("\\", "/"), seconds)
+        return command + (" && echo ran > %s" % marker if marker else "")
+
+    def set_manifest(self, **data):
+        self.write_json("manifest.json", data)
+
+    def budget(self, **top):
+        self.set_config(top)
+        return workflow.quality_budget(self.root, self.config())
+
+    def test_without_stop_timeout_in_the_manifest_the_configured_value_is_used(self):
+        self.assertEqual(1800, self.budget())
+        self.assertEqual(77, self.budget(quality={"timeoutSec": 77}))
+        self.set_manifest(commands=[], settings="x")
+        self.assertEqual(77, self.budget(quality={"timeoutSec": 77}))
+
+    def test_a_hook_that_fits_the_configured_value_leaves_it_unchanged(self):
+        self.set_manifest(stopTimeoutSec=900 + 1800 + 60)
+        self.assertEqual(1800, self.budget())
+        self.set_manifest(stopTimeoutSec=900 + 5000 + 60)
+        self.assertEqual(1800, self.budget())
+
+    def test_a_raised_setting_cannot_outlive_the_installed_hook(self):
+        self.set_manifest(stopTimeoutSec=900 + 600 + 60)
+        self.assertEqual(600, self.budget(quality={"timeoutSec": 3000}))
+
+    def test_the_budget_follows_check_timeout_sec(self):
+        self.set_manifest(stopTimeoutSec=100 + 200 + 60)
+        self.assertEqual(200, self.budget(checkTimeoutSec=100, quality={"timeoutSec": 3000}))
+        self.assertEqual(50, self.budget(checkTimeoutSec=250, quality={"timeoutSec": 3000}))
+
+    def test_a_manifest_value_that_is_not_a_number_is_ignored(self):
+        for value in ("big", None, True, [3]):
+            self.set_manifest(stopTimeoutSec=value)
+            self.assertEqual(1800, self.budget(), value)
+
+    def test_unreadable_manifest_and_malformed_quality_do_not_raise(self):
+        with open(os.path.join(self.base, "manifest.json"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(1800, self.budget(quality=["x"]))
+        self.assertEqual(1800, self.budget(quality={"timeoutSec": "soon"}))
+
+    def run_stop(self, gates, quality=None):
+        self.configure(gates, quality)
+        self.start_implement()
+        timeouts = []
+        original = workflow.run_limited
+
+        def spy(args, timeout, *a, **kw):
+            timeouts.append(timeout)
+            return original(args, timeout, *a, **kw)
+
+        started = time.monotonic()
+        with mock.patch.object(workflow, "run_limited", side_effect=spy):
+            out = workflow.handle_stop(self.root, {})
+        return out, timeouts, time.monotonic() - started
+
+    def test_a_later_gate_receives_only_the_time_that_is_left(self):
+        self.set_manifest(stopTimeoutSec=900 + 4 + 60)
+        clock = iter([0, 0, 1.5])  # start, first gate, second gate: the first gate "took" 1.5 s
+        with mock.patch.object(workflow, "_clock", side_effect=lambda: next(clock)):
+            out, timeouts, elapsed = self.run_stop({"first": {"command": "exit 0", "timeoutSec": 100},
+                                                    "second": {"command": self.sleeper(60), "timeoutSec": 100}})
+        self.assertEqual(2, len(timeouts))
+        self.assertEqual(4, timeouts[0])
+        self.assertEqual(2.5, timeouts[1])
+        self.assertLess(elapsed, 30)
+        state = self.state()
+        self.assertEqual("pass", state["qualityResults"]["first"]["result"])
+        second = state["qualityResults"]["second"]
+        self.assertEqual("broken", second["result"])
+        self.assertTrue(second["timedOut"])
+        self.assertIn("timed out after", second["reason"])
+        self.assertIn("time budget", second["reason"])
+        self.assertEqual("paused", state["status"])
+        self.assertEqual("second", state["pausedFor"]["gate"])
+
+    def test_a_gate_with_a_shorter_timeout_keeps_its_own(self):
+        out, timeouts, _ = self.run_stop({"quick": {"command": "exit 0", "timeoutSec": 7}})
+        self.assertEqual([7], timeouts)
+
+    def test_a_gate_that_cannot_start_because_the_budget_is_used_up_is_broken(self):
+        marker = "second-ran"
+        clock = iter([0, 1, 50])  # start, first gate, second gate
+        with mock.patch.object(workflow, "_clock", side_effect=lambda: next(clock)):
+            out, timeouts, _ = self.run_stop({"first": {"command": "exit 0"},
+                                              "second": {"command": "echo ran > " + marker},
+                                              "third": {"command": "echo ran > third-ran"}},
+                                             {"timeoutSec": 5})
+        self.assertEqual(1, len(timeouts))
+        self.assertNotIn("decision", out)
+        state = self.state()
+        self.assertEqual("pass", state["qualityResults"]["first"]["result"])
+        second = state["qualityResults"]["second"]
+        self.assertEqual("broken", second["result"])
+        self.assertIn("budget", second["reason"])
+        self.assertIn("exhausted", second["reason"])
+        self.assertEqual("second", state["pausedFor"]["gate"])
+        self.assertEqual("paused", state["status"])
+        self.assertFalse(self.exists(marker))
+        self.assertFalse(self.exists("third-ran"))
+        self.assertNotIn("third", state["qualityResults"])
+        self.assertIn("exhausted", self.read(self.run_path("quality", "second.log")))
+        self.assertIn("exhausted", out["systemMessage"])
+
+    def test_a_used_up_budget_pauses_without_using_an_iteration(self):
+        self.configure({"only": {"command": "exit 0"}}, {"timeoutSec": 5})
+        self.start_implement()
+        before = self.state()
+        clock = iter([0, 9])
+        with mock.patch.object(workflow, "_clock", side_effect=lambda: next(clock)):
+            workflow.handle_stop(self.root, {})
+        state = self.state()
+        self.assertEqual(before["iter"], state["iter"])
+        self.assertEqual("paused", state["status"])
+        self.assertEqual("only", state["pausedFor"]["gate"])
+
+    def test_a_hung_gate_is_killed_at_its_timeout_and_the_hook_returns(self):
+        out, timeouts, elapsed = self.run_stop({"hung": {"command": self.sleeper(60), "timeoutSec": 1}})
+        self.assertEqual([1], timeouts)
+        self.assertLess(elapsed, 30)
+        self.assertNotIn("decision", out)
+        state = self.state()
+        self.assertEqual("timed out after 1 seconds", state["pausedFor"]["reason"])
+        self.assertEqual("paused", state["status"])
+        self.assertNotIn("gate", state)
+
+    def test_a_hung_gate_is_killed_at_the_installed_budget(self):
+        self.set_manifest(stopTimeoutSec=900 + 2 + 60)
+        out, timeouts, elapsed = self.run_stop({"hung": {"command": self.sleeper(60), "timeoutSec": 100}})
+        self.assertLessEqual(timeouts[0], 2)
+        self.assertLess(elapsed, 30)
+        self.assertEqual("broken", self.state()["qualityResults"]["hung"]["result"])
+
+
 class MalformedConfigHooksTest(GateProject):
     """No shape of the quality block makes a hook entry point fail."""
 

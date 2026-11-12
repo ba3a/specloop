@@ -19,7 +19,7 @@ A quality gate is a named command, such as a linter, the test suite or a coverag
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `quality.timeoutSec` | `1800` | Time limit for all gates of one stop together. |
+| `quality.timeoutSec` | `1800` | Time limit for all gates of one stop together; see [Time budget](#time-budget). Run the installer again after changing it. |
 | `quality.failFast` | `false` | `false` runs every gate, so all failures are reported at once. `true` stops at the first failing `block` gate. |
 | `quality.legacy` | `"baseline"` | How existing problems are treated, for gates that do not set `legacy` themselves: `"baseline"` or `"ratchet"`. |
 | `quality.gates` | `{}` | The gates, by name, in the order they run. |
@@ -39,7 +39,7 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 
 ## Running gates
 
-On a Stop, after the phase's `check` passes, the engine runs every gate whose `phases` list names the current phase, in declared order. Planning phases (`plan`, `feature-plan`, `feature-replan`) never run gates, and a failed `check` stops the Stop before any gate runs. Each gate runs its `command` with `shell` from the project root, with stderr merged into stdout, for at most its `timeoutSec`. No lock is held while gates run.
+On a Stop, after the phase's `check` passes, the engine runs every gate whose `phases` list names the current phase, in declared order. Planning phases (`plan`, `feature-plan`, `feature-replan`) never run gates, and a failed `check` stops the Stop before any gate runs. Each gate runs its `command` with `shell` from the project root, with stderr merged into stdout, for at most its `timeoutSec` and the [time budget](#time-budget) that is left. No lock is held while gates run.
 
 - Exit code `0` is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, except 126 and 127, which make it [broken](#broken-gates).
 - With `failFast: false` every gate runs, so all failures are reported at once. With `failFast: true` the first failing `block` gate ends the run: later gates do not run and keep their previous results. A failing `warn` gate never ends the run.
@@ -70,6 +70,16 @@ Fix the gate or install its tool, then:
 
 - `/sl-go` resumes the run and clears `pausedFor`. The next stop runs every gate of the phase again.
 - `/sl-advance` skips the phase, as it does from any pause, and clears `pausedFor`. The run stays paused until `/sl-go`.
+
+## Time budget
+
+`quality.timeoutSec` is one budget for all gates of a stop together, not a limit per gate. Gates run one after another, and each gets `min(its own timeoutSec, time left)` as its timeout, so a later gate may be killed earlier than its own limit says. A gate that cannot start because the budget is used up is [broken](#broken-gates) and its reason says so. A hung gate is killed with every process it started, and the stop hook returns normally.
+
+The budget has to fit in the stop hook that hosts it. The hook's timeout is written into `settings.json` when specloop is installed, as `checkTimeoutSec + quality.timeoutSec + 60` from the merged defaults and `config.json`, and the same number is recorded in `manifest.json` as `stopTimeoutSec`. The effective budget is the smaller of `quality.timeoutSec` and `stopTimeoutSec - checkTimeoutSec - 60`, so a raised setting cannot outlive the hook. A manifest without `stopTimeoutSec`, written by an older installer, uses the configured value.
+
+After changing `checkTimeoutSec` or `quality.timeoutSec`, run the install command again (`./install.sh <project>` from the clone; `/sl-update` does it too) so that the hook is sized for the new values. Until then the old hook timeout and `stopTimeoutSec` stay in force. `--test-command` is unchanged: it still writes `phases.implement.check`.
+
+A gate mark left by a stop that was killed counts as stale after the same sum, `checkTimeoutSec + quality.timeoutSec + 60` seconds; `/sl-go` clears it at once (see [Several chats in one project](multiple-chats.md#state-files)).
 
 ## Changing gates in config.local.json
 

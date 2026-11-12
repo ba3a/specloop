@@ -277,13 +277,31 @@ def update_gitignore(target, commands):
         print("! .gitignore not updated: %s is not in a git work tree or .gitignore is not writable." % target)
 
 
+def seconds_setting(*values):
+    """The first value that is a positive number of seconds, as an int; 0 when there is none."""
+    for value in values:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return int(value)
+    return 0
+
+
+def stop_hook_timeout(config, defaults):
+    """Seconds the Stop hook may run: the phase check, all quality gates together, and a minute of margin.
+    The value is fixed in settings.json at install, so a changed setting needs a reinstall to take effect."""
+    quality = config.get("quality") if isinstance(config.get("quality"), dict) else {}
+    default_quality = defaults.get("quality") if isinstance(defaults.get("quality"), dict) else {}
+    check = seconds_setting(config.get("checkTimeoutSec"), defaults.get("checkTimeoutSec"), 900)
+    gates = seconds_setting(quality.get("timeoutSec"), default_quality.get("timeoutSec"), 1800)
+    return check + gates + 60
+
+
 def install(target, scope="project", prefix=None, test_command=None, force=False, gitignore=True):
     copy_kit(target)
     config = write_config(target, test_command, prefix, force)
     prefix = config["commandPrefix"]
     commands = install_commands(target, prefix)
     defaults = read_json(os.path.join(target, BASE_DIR, "defaults.json"))
-    stop_timeout = int(config.get("checkTimeoutSec", defaults.get("checkTimeoutSec", 900))) + 60
+    stop_timeout = stop_hook_timeout(config, defaults)
     chosen = settings_files(target)[0 if scope == "project" else 1]
     for path in settings_files(target):
         if path != chosen and os.path.exists(path):
@@ -291,7 +309,7 @@ def install(target, scope="project", prefix=None, test_command=None, force=False
     write_json(chosen, merge_hooks(read_json(chosen), stop_timeout))
     source = describe_source(scope, gitignore)
     write_json(manifest_path(target), {"commands": commands, "settings": os.path.relpath(chosen, target),
-                                       "source": source})
+                                       "stopTimeoutSec": stop_timeout, "source": source})
     if not source["checkable"]:
         print("! update checks unavailable: " + source["reason"])
     if gitignore:

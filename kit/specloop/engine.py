@@ -1587,6 +1587,46 @@ QUALITY_DIR = "quality"
 TRUNCATED = "...(truncated)...\n"
 
 
+STOP_MARGIN_SEC = 60
+DEFAULT_QUALITY_TIMEOUT_SEC = 1800
+
+
+def _seconds(value, default):
+    return value if _is_number(value) and value > 0 else default
+
+
+def quality_timeout(config):
+    """quality.timeoutSec as configured: the limit for all gates of one Stop together."""
+    return _seconds(quality_block(config).get("timeoutSec"), DEFAULT_QUALITY_TIMEOUT_SEC)
+
+
+def stop_limit(config):
+    """Seconds a Stop may take, as install.py sizes the hook: the check, all gates and a margin. A mark left by a
+    Stop that was killed is stale after this long."""
+    check = _seconds((config or {}).get("checkTimeoutSec", 900), 900)
+    return check + quality_timeout(config) + STOP_MARGIN_SEC
+
+
+def quality_budget(root, config):
+    """Seconds all gates of one Stop may use together: quality.timeoutSec, but never more than the Stop hook
+    installed in settings.json leaves after the check. install.py records that hook's timeout in manifest.json as
+    stopTimeoutSec; an old manifest has none, and then the configured value is used."""
+    configured = quality_timeout(config)
+    hosted = _read_json_tolerant(_path(root, "manifest.json")).get("stopTimeoutSec")
+    if not _is_number(hosted):
+        return configured
+    check = _seconds((config or {}).get("checkTimeoutSec", 900), 900)
+    return min(configured, hosted - check - STOP_MARGIN_SEC)
+
+
+def _clock():
+    return time.monotonic()
+
+
+def _seconds_text(value):
+    return ("%.1f" % value).rstrip("0").rstrip(".") if isinstance(value, float) else str(value)
+
+
 def planning_phase(config, state):
     """True in a planning or replanning phase, where gates never run."""
     if in_replan(config, state):
@@ -1629,22 +1669,32 @@ def gate_record(state, name, result, exit_code, duration, **extra):
                  "phase": state["phase"], "stepId": state.get("stepId"), "finishedAt": now()}, **extra)
 
 
-def run_quality_gate(root, config, state, name, gate):
+def run_quality_gate(root, config, state, name, gate, budget_left=None):
     """Run one valid gate with no lock. Return (record, output): the record goes to state.qualityResults, the
     complete output to run/quality/<name>.log. Never raises. A gate that cannot give an answer (exit code 126 or
-    127, a timeout, a command that cannot be started) is `broken`, and its record says why in `reason`."""
+    127, a timeout, a command that cannot be started, a used-up time budget) is `broken`, and its record says why
+    in `reason`. `budget_left` is what remains of the time budget of this Stop; the gate's timeout is the smaller
+    of that and its own."""
     timeout = gate.get("timeoutSec", config.get("checkTimeoutSec", 900))
     started = time.monotonic()
     exit_code, timed_out, reason = None, False, None
+    limited_by_budget = False
     if not _is_number(timeout) or timeout <= 0:
         reason = "timeoutSec is not a positive number: %r" % (timeout,)
         raw = ("[specloop] %s\n" % reason).encode("utf-8")
+    elif budget_left is not None and budget_left <= 0:
+        reason = "the time budget for all gates (quality.timeoutSec) is exhausted"
+        raw = ("[specloop] %s; the gate did not run\n" % reason).encode("utf-8")
     else:
+        if budget_left is not None and budget_left < timeout:
+            timeout, limited_by_budget = budget_left, True
         try:
             proc = run_limited([resolve_shell(config), "-c", gate["command"]], timeout, cwd=root, merge_stderr=True)
             raw, exit_code, timed_out = proc.stdout, proc.returncode, proc.timed_out
             if timed_out:
-                reason = "timed out after %s seconds" % timeout
+                reason = "timed out after %s seconds" % _seconds_text(timeout)
+                if limited_by_budget:
+                    reason += " (all that was left of the time budget for all gates)"
             else:
                 reason = SHELL_EXIT_REASONS.get(exit_code)
             if reason:
@@ -1771,8 +1821,10 @@ def run_quality_gates(root, config, state, outcome):
         return broken_outcome(records, {"gate": records[0]["name"], "reason": records[0]["reason"]})
     fail_fast = quality_block(config).get("failFast") is True
     runs = []
+    budget = quality_budget(root, config)
+    started = _clock()
     for name, gate in selected:
-        record, output = run_quality_gate(root, config, state, name, gate)
+        record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started))
         runs.append((record, output))
         if record["result"] == "broken":
             return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]})
@@ -2162,7 +2214,7 @@ def take_gate(root, config, hook_input):
         if state.get("status") != "active" or not is_owner(state, hook_input):
             raise Unchanged((None, None))
         running = state.get("gate") or {}
-        if seconds_since(running.get("at")) < config.get("checkTimeoutSec", 900) + 60:
+        if seconds_since(running.get("at")) < stop_limit(config):
             raise Unchanged((None, {"systemMessage": (
                 "[specloop] a check is marked as running since %s, so this stop ran none. If no check is running, "
                 "%s clears the mark." % (running.get("at"), cmd_name(config, "go")))}))

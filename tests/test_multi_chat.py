@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -766,6 +767,31 @@ class StopOrderTest(ProjectTest):
         self.implement_with_check("exit 1")
         stamp = "2000-01-01T00:00:00+00:00"
         workflow.update_state(self.root, lambda s: s.update(gate={"session": "x", "at": stamp}))
+        self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])
+
+    def mark_aged(self, seconds):
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=seconds)).isoformat(timespec="seconds")
+        workflow.update_state(self.root, lambda s: s.update(gate={"session": "x", "at": stamp}))
+        return stamp
+
+    def test_a_mark_is_kept_for_the_check_timeout_plus_the_quality_budget_plus_a_minute(self):
+        self.implement_with_check("exit 1")
+        stamp = self.mark_aged(900 + 1800 + 60 - 120)
+        self.assertIn("marked as running since " + stamp, workflow.handle_stop(self.root, {})["systemMessage"])
+
+    def test_a_mark_older_than_that_sum_is_stale(self):
+        self.implement_with_check("exit 1")
+        self.mark_aged(900 + 1800 + 60 + 120)
+        self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])
+
+    def test_the_stale_limit_follows_the_configured_timeouts(self):
+        self.set_config({"checkTimeoutSec": 100, "quality": {"timeoutSec": 200},
+                         "phases": {"implement": {"check": {"type": "command", "command": "exit 1"}}}})
+        self.start()
+        workflow.cmd_advance(self.root)
+        stamp = self.mark_aged(100 + 200 + 60 - 30)
+        self.assertIn("marked as running since " + stamp, workflow.handle_stop(self.root, {})["systemMessage"])
+        self.mark_aged(100 + 200 + 60 + 30)
         self.assertEqual("block", workflow.handle_stop(self.root, {})["decision"])
 
     def test_a_young_gate_makes_stop_say_so_and_change_nothing(self):
