@@ -2112,6 +2112,23 @@ def protected_entries(config):
     return keys
 
 
+def is_protected_path(config, rel):
+    """True when the project-relative path `rel` is a `protect` entry of any gate or lies under one."""
+    if not rel:
+        return False
+    rel = os.path.normcase(rel).replace("\\", "/")
+    for key in protected_entries(config):
+        key = os.path.normcase(key).replace("\\", "/")
+        if key in ("", ".", "..") or key.startswith("../"):
+            continue
+        if rel == key or rel.startswith(key + "/"):
+            return True
+    return False
+
+
+GUARDED_COMMANDS = re.compile(r"""run\.sh["']?\s+(?:advance\b|quality\s+accept\b)""")
+
+
 def protected_fingerprint(root, key):
     """{project-relative path: SHA-256, or None when the path is missing} for one protect entry. A directory is
     walked recursively and contributes each file in it; a missing entry contributes itself with None."""
@@ -3223,6 +3240,9 @@ def handle_pretool(root, hook_input):
                 return deny("%s/ belongs to the chat that drives the workflow. Run %s here to take it over." % (
                     _rel("run"), cmd_name(config, "go")))
             return None
+        if is_protected_path(config, rel):
+            return deny("%s is protected by a quality gate. Only a person may allow a change, with %s." % (
+                rel, cmd_name(config, "quality accept")))
         allowed = phase_graph(config, state).get(phase, {}).get("allowEdits")
         if allowed is not None and (rel is None or not any(rel.startswith(p) for p in allowed)):
             return deny("phase '%s' only allows editing %s, not %s." % (
@@ -3235,6 +3255,9 @@ def handle_pretool(root, hook_input):
 
     if tool == "Bash":
         command = tool_input.get("command", "")
+        if isinstance(command, str) and GUARDED_COMMANDS.search(command):
+            return deny("only the user may run 'run.sh advance' and 'run.sh quality accept'. Ask them to type %s or %s." % (
+                cmd_name(config, "advance"), cmd_name(config, "quality accept")))
         for blocked in config.get("blockedCommandsUntilDone", []) if owner else []:
             if blocked in command:
                 return deny("'%s' is not allowed until the workflow is done (phase '%s')." % (blocked, phase))

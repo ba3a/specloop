@@ -2900,5 +2900,162 @@ class ProtectionTest(GateProject):
         self.assertNotIn("/sl-quality", out["reason"])
 
 
+
+class PretoolProtectionTest(GateProject):
+    """PreToolUse gives early feedback: protected paths cannot be edited and the user's commands cannot be run."""
+
+    PROTECT = ["detekt.yml", "config/detekt/"]
+
+    def setUp(self):
+        super().setUp()
+        self.configure({"lint": {"command": "exit 0", "protect": self.PROTECT}})
+
+    def pretool(self, tool, path=None, command=None, **extra):
+        tool_input = {"command": command} if command is not None else {"file_path": path}
+        if tool == "NotebookEdit":
+            tool_input = {"notebook_path": path}
+        return workflow.handle_pretool(self.root, dict(extra, tool_name=tool, tool_input=tool_input))
+
+    def assertDenied(self, out, *fragments):
+        self.assertIsNotNone(out)
+        decision = out["hookSpecificOutput"]
+        self.assertEqual("deny", decision["permissionDecision"])
+        for fragment in fragments:
+            self.assertIn(fragment, decision["permissionDecisionReason"])
+
+    def full(self, rel):
+        return os.path.join(self.root, *rel.split("/"))
+
+    def test_edit_tools_are_denied_on_a_protected_file_in_every_phase(self):
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        phases = [self.state()["phase"]]
+        with open(self.run_path("plan.md"), "w") as f:
+            f.write("- [ ] step")
+        workflow.handle_stop(self.root, {})
+        phases.append(self.state()["phase"])
+        self.assertEqual(["plan", "implement"], phases)
+        for phase in phases:
+            workflow.update_state(self.root, lambda s: s.update(phase=phase))
+            for tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+                with self.subTest(phase=phase, tool=tool):
+                    self.assertDenied(self.pretool(tool, self.full("detekt.yml")), "detekt.yml", "/sl-quality accept")
+
+    def test_the_review_phase_is_covered_too(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(phase="review"))
+        self.assertDenied(self.pretool("Edit", self.full("detekt.yml")), "/sl-quality accept")
+
+    def test_a_file_under_a_protected_directory_is_denied(self):
+        self.start_implement()
+        for rel in ("config/detekt/a.yml", "config/detekt/sub/deep/b.yml", "config/detekt/new.yml"):
+            with self.subTest(rel=rel):
+                self.assertDenied(self.pretool("Write", self.full(rel)), rel, "/sl-quality accept")
+
+    def test_a_relative_path_and_odd_spelling_are_denied(self):
+        self.start_implement()
+        for path in ("detekt.yml", "./detekt.yml", "config/../detekt.yml", "config/detekt/a.yml"):
+            with self.subTest(path=path):
+                self.assertDenied(self.pretool("Edit", path), "/sl-quality accept")
+
+    def test_paths_next_to_protected_ones_are_allowed(self):
+        self.start_implement()
+        for rel in ("src/detekt.yml", "detekt.yml.bak", "config/detektx/a.yml", "config/other.yml", "src/Main.kt"):
+            with self.subTest(rel=rel):
+                self.assertIsNone(self.pretool("Edit", self.full(rel)))
+
+    def test_the_reason_uses_the_command_prefix(self):
+        self.configure({"lint": {"command": "exit 0", "protect": self.PROTECT}}, commandPrefix="x-")
+        self.start_implement()
+        out = self.pretool("Edit", self.full("detekt.yml"))
+        self.assertDenied(out, "/x-quality accept")
+        self.assertNotIn("/sl-", out["hookSpecificOutput"]["permissionDecisionReason"])
+
+    def test_edits_are_allowed_when_no_run_is_active(self):
+        self.assertIsNone(self.pretool("Edit", self.full("detekt.yml")))  # no run at all
+        self.start_implement()
+        workflow.cmd_pause(self.root)
+        self.assertEqual("paused", self.state()["status"])
+        self.assertIsNone(self.pretool("Edit", self.full("detekt.yml")))
+        self.assertIsNone(self.pretool("Write", self.full("config/detekt/a.yml")))
+
+    def test_nothing_is_protected_without_protect_entries(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        self.start_implement()
+        self.assertIsNone(self.pretool("Edit", self.full("detekt.yml")))
+
+    def test_the_entries_of_every_gate_count(self):
+        self.configure({"lint": {"command": "exit 0", "protect": ["a.yml"]},
+                        "types": {"command": "exit 0", "protect": ["b.ini"]}})
+        self.start_implement()
+        self.assertDenied(self.pretool("Edit", self.full("a.yml")), "/sl-quality accept")
+        self.assertDenied(self.pretool("Edit", self.full("b.ini")), "/sl-quality accept")
+
+    def test_an_entry_naming_the_project_root_protects_nothing(self):
+        self.start_implement()
+        self.configure({"lint": {"command": "exit 0", "protect": [".", "", "./", ".."]}})
+        self.assertIsNone(self.pretool("Edit", self.full("src/Main.kt")))
+
+    def test_another_chat_may_edit_protected_files(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(owner={"session": "owner-chat"}))
+        self.assertIsNone(self.pretool("Edit", self.full("detekt.yml"), session_id="other-chat"))
+        self.assertDenied(self.pretool("Edit", self.full("detekt.yml"), session_id="owner-chat"),
+                          "/sl-quality accept")
+
+    def test_a_subagent_of_the_owner_is_denied_too(self):
+        self.start_implement()
+        self.assertDenied(self.pretool("Edit", self.full("detekt.yml"), agent_id="sub-1"), "/sl-quality accept")
+
+    def test_bash_commands_for_advance_and_accept_are_denied(self):
+        self.start_implement()
+        for command in ("sh .claude/specloop/run.sh advance",
+                        'sh "$CLAUDE_PROJECT_DIR/.claude/specloop/run.sh" advance',
+                        "sh .claude/specloop/run.sh quality accept",
+                        "sh .claude/specloop/run.sh   quality   accept --all",
+                        "cd x && sh .claude/specloop/run.sh advance; echo done"):
+            with self.subTest(command=command):
+                self.assertDenied(self.pretool("Bash", command=command), "only the user", "/sl-advance",
+                                  "/sl-quality accept")
+
+    def test_the_bash_denial_applies_in_every_chat(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(owner={"session": "owner-chat"}))
+        self.assertDenied(self.pretool("Bash", command="sh run.sh advance", session_id="other-chat"), "only the user")
+
+    def test_other_run_sh_forms_are_allowed(self):
+        self.start_implement()
+        for command in ("sh .claude/specloop/run.sh quality run", "sh .claude/specloop/run.sh status",
+                        "sh .claude/specloop/run.sh quality", "echo advance", "git status"):
+            with self.subTest(command=command):
+                self.assertIsNone(self.pretool("Bash", command=command))
+
+    def test_the_bash_denial_applies_only_while_a_run_is_active(self):
+        self.start_implement()
+        workflow.cmd_pause(self.root)
+        self.assertIsNone(self.pretool("Bash", command="sh .claude/specloop/run.sh advance"))
+
+    def test_the_prefix_names_the_commands_in_the_bash_reason(self):
+        self.configure({"lint": {"command": "exit 0"}}, commandPrefix="x-")
+        self.start_implement()
+        self.assertDenied(self.pretool("Bash", command="sh run.sh advance"), "/x-advance", "/x-quality accept")
+
+    def test_advance_keeps_disabling_model_invocation(self):
+        with open(os.path.join(os.path.dirname(KIT), "commands", "advance.md"), encoding="utf-8") as f:
+            self.assertIn("disable-model-invocation: true\n", f.read())
+
+    def test_malformed_protect_never_raises(self):
+        self.start_implement()
+        for protect in (5, "detekt.yml", [None], [1, "a"], {"a": 1}):
+            with self.subTest(protect=protect):
+                self.configure({"lint": {"command": "exit 0", "protect": protect}})
+                self.assertIsNone(self.pretool("Edit", self.full("detekt.yml")))
+        for block in (None, ["x"], "gates", {"gates": ["lint"]}, {"gates": {"lint": "exit 0"}}):
+            with self.subTest(block=block):
+                self.set_config({"quality": block})
+                self.assertIsNone(self.pretool("Edit", self.full("detekt.yml")))
+                self.assertIsNone(self.pretool("Bash", command="git status"))
+
+
 if __name__ == "__main__":
     unittest.main()

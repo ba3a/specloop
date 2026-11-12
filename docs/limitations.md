@@ -18,8 +18,14 @@ Claude Code adds `agent_id` (and `agent_type`) to hook input when a tool call co
 - edits made through Bash (for example `sed -i` or `>` redirects) are not covered;
 - `agent_type` alone is not trusted, because it is also present in the main conversation of a session started with `--agent`; in-process teammates carry an `agent_id` and are treated like subagents.
 
+## PreToolUse is only early feedback
+
+PreToolUse sees tool calls, not what a command does. Its denials of edits to `protect`ed paths cover `Edit`, `Write`, `MultiEdit` and `NotebookEdit` only. They do not stop `sed -i`, `>` or a script run through Bash, and nothing in the hook can tell that such a command rewrites `detekt.yml`. The same holds for the denial of `run.sh advance` and `run.sh quality accept`: it matches the text of the Bash command, so a command that builds the call another way (a wrapper script, a variable, `python engine.py`) is not recognised. The `disable-model-invocation: true` setting of the command templates is the other half, and it only stops Claude from invoking the slash command.
+
+Protection that matters therefore works when a gate runs: the engine compares the SHA-256 of every `protect`ed file and the `quality` block with the values stored at the first `/sl-go`, and scans added lines for `forbid` patterns, whatever tool made the change (see [Protected files](quality-gates.md#protected-files)). The PreToolUse denials only tell Claude early, before it wastes an iteration. A person who runs `/sl-quality accept` or `/sl-advance` can always override them.
+
 ## See also
 
 - [Delegating a phase](delegation.md): the key row for `feature.enforceDelegation` and the phase brief.
-- [Guard rails](guard-rails.md): the other PreToolUse rules.
+- [Guard rails](guard-rails.md): the other PreToolUse rules, including the denials of protected paths and of the commands only the user may run.
 - [Several chats in one project](multiple-chats.md#limits): limits of running several chats in one checkout.

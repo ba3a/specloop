@@ -25,6 +25,7 @@ One checkout is still one working tree, so these apply in every chat:
 
 - specloop's own files (`state.json`, `config.json`, `defaults.json`, `engine.py`) cannot be edited.
 - `feature.blockedCommands` stay denied, because a `git checkout` or `git stash` in any chat would break the run.
+- Bash commands that contain `run.sh advance` or `run.sh quality accept` are denied while a run is `active`: only the user runs them (see [Guard rails](guard-rails.md#commands-only-the-user-may-run)). Edits to `protect`ed gate files are denied in the owner's chat only.
 - Edits under `.claude/specloop/run/` are denied outside a subagent, so a stray review file cannot affect a gate.
 - `/sl-advance` and `/sl-reset` are blocked while `active`; the message names `/sl-go` and `/sl-pause`. A paused workflow whose chat is gone can still be advanced or reset from anywhere.
 
