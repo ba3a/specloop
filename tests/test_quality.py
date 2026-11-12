@@ -1596,6 +1596,47 @@ class FeatureGateTest(unittest.TestCase):
         self.assertIn("Quality gates failed: final", out["reason"])
         self.assertEqual(1, self.marker("final"))
 
+    def write_value(self, value):
+        self.write("value.txt", str(value))
+
+    def test_the_value_is_measured_on_the_stop_that_passes_feature_plan(self):
+        self.write_value(70)
+        self.begin({"cov": ratchet_gate()})
+        self.assertEqual({"cov": 70}, self.state()["qualityBaseline"])
+        self.write_value(65)
+        self.write("work.txt", "work\n")
+        self.assertIn("Quality gates failed: cov", self.stop()["reason"])
+        with open(os.path.join(self.base, "run", "last-failure.md"), encoding="utf-8") as f:
+            self.assertIn("metric 65 is below the minimum 80 and below the baseline 70 (ratchet)", f.read())
+        self.write_value(72)
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+
+    def test_a_replan_does_not_measure(self):
+        self.write_value(70)
+        self.begin({"cov": ratchet_gate()}, feature={"replan": "auto"})
+        workflow.update_state(self.root, lambda current: current.pop("qualityBaseline"))
+        self.write_value(50)
+        self.assertIn("feature-replan", self.request_replan()["reason"])
+        data = self.steps_file()
+        data["steps"][1]["description"] = "Rewritten."
+        self.write(self.run_file("steps.json"), json.dumps(data))
+        self.assertIn("Replan adopted", self.stop()["reason"])
+        self.assertNotIn("qualityBaseline", self.state())
+
+    def test_an_unreadable_value_pauses_feature_plan(self):
+        self.configure({"cov": ratchet_gate(command="echo none")})
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "# Plan")
+        self.write(self.run_file("steps.json"), json.dumps(self.steps()))
+        out = self.stop()
+        state = self.state()
+        self.assertNotIn("decision", out)
+        self.assertEqual(("paused", "feature-plan", 0), (state["status"], state["phase"], state["iter"]))
+        self.assertFalse(state.get("awaitingApproval"))
+        self.assertEqual("cov", state["pausedFor"]["gate"])
+
+
     def test_gates_never_run_in_feature_plan(self):
         self.configure({"all": self.counting("all", 1)})
         workflow.cmd_init(self.root, "spec.md", mode="feature")
@@ -2086,6 +2127,308 @@ class FeatureChangedFilesTest(ChangedFilesProject):
         self.assertNotIn("last", self.state()["qualityResults"])
         run = os.path.join(self.base, "run", "quality")
         self.assertEqual(["each.log"], sorted(os.listdir(run)))
+
+
+def value_gate(**extra):
+    """A gate whose metric is the number in value.txt, read from its output."""
+    return dict({"command": "echo value: $(cat value.txt)", "metric": {"pattern": r"value: ([0-9.]+)"}}, **extra)
+
+
+def ratchet_gate(limit_key="min", limit=80, **extra):
+    gate = value_gate(legacy="ratchet", **extra)
+    gate["metric"] = dict(gate["metric"], **{limit_key: limit})
+    return gate
+
+
+class RatchetTest(GateProject):
+    """legacy: "ratchet" gates are measured on the Stop that passes plan and compared with that value."""
+
+    def write_value(self, value):
+        with open(os.path.join(self.root, "value.txt"), "w") as f:
+            f.write(str(value))
+
+    def start_plan(self, gates, quality=None, value=70):
+        self.configure(gates, quality)
+        self.write_value(value)
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        with open(self.run_path("plan.md"), "w") as f:
+            f.write("- [ ] step")
+
+    def start_implement_ratchet(self, gates, quality=None, value=70):
+        self.start_plan(gates, quality, value)
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'implement'", out["reason"])
+
+    def stop_with(self, value):
+        self.write_value(value)
+        return workflow.handle_stop(self.root, {})
+
+    def gate_result(self, name="cov"):
+        return self.state()["qualityResults"][name]
+
+    # legacy
+
+    def test_legacy_defaults_to_baseline(self):
+        self.configure({"g": {"command": "exit 0"}})
+        self.assertEqual("baseline", workflow.gate_legacy(self.config(), {"command": "exit 0"}))
+
+    def test_legacy_can_be_set_per_gate_and_overrides_the_block(self):
+        self.configure({}, {"legacy": "ratchet"})
+        config = self.config()
+        self.assertEqual("ratchet", workflow.gate_legacy(config, {"command": "x"}))
+        self.assertEqual("baseline", workflow.gate_legacy(config, {"command": "x", "legacy": "baseline"}))
+        self.configure({}, {"legacy": "baseline"})
+        self.assertEqual("ratchet", workflow.gate_legacy(self.config(), {"command": "x", "legacy": "ratchet"}))
+
+    def test_the_block_default_makes_a_gate_with_a_metric_a_ratchet(self):
+        self.start_implement_ratchet({"cov": value_gate(metric={"pattern": r"value: ([0-9.]+)", "min": 80})},
+                                     {"legacy": "ratchet"})
+        self.assertEqual({"cov": 70}, self.state()["qualityBaseline"])
+
+    def test_a_baseline_gate_is_not_measured_and_keeps_its_limit(self):
+        self.start_implement_ratchet({"cov": value_gate(metric={"pattern": r"value: ([0-9.]+)", "min": 80})})
+        state = self.state()
+        self.assertNotIn("qualityBaseline", state)
+        self.assertNotIn("qualityResults", state)
+        self.assertFalse(os.path.exists(self.run_path("quality", "cov.log")))
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("metric 70 is below the minimum 80", out["reason"])
+        self.assertNotIn("baseline", out["reason"])
+
+    # measuring
+
+    def test_the_value_is_measured_on_the_stop_that_passes_plan(self):
+        self.start_plan({"cov": ratchet_gate()})
+        self.assertNotIn("qualityBaseline", self.state())
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'implement'", out["reason"])
+        state = self.state()
+        self.assertEqual({"cov": 70}, state["qualityBaseline"])
+        self.assertNotIn("qualityResults", state)
+
+    def test_a_failing_plan_check_measures_nothing(self):
+        self.start_plan({"cov": ratchet_gate()})
+        os.remove(self.run_path("plan.md"))
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertNotIn("qualityBaseline", self.state())
+
+    def test_the_value_is_measured_once_per_run(self):
+        self.start_implement_ratchet({"cov": ratchet_gate()})
+        self.write_value(90)
+        workflow.handle_stop(self.root, {})
+        self.assertEqual({"cov": 70}, self.state()["qualityBaseline"])
+
+    def test_a_value_that_is_already_stored_is_kept(self):
+        outcome_state = {"qualityBaseline": {"a": 5}}
+        workflow.record_baseline(outcome_state, {"a": 9, "b": 7})
+        self.assertEqual({"a": 5, "b": 7}, outcome_state["qualityBaseline"])
+        workflow.record_baseline(outcome_state, None)
+        self.assertEqual({"a": 5, "b": 7}, outcome_state["qualityBaseline"])
+
+    def test_every_ratchet_gate_is_measured_and_no_other(self):
+        gates = {"first": ratchet_gate(), "other": ratchet_gate("max", 90, steps="last"),
+                 "plain": value_gate(metric={"pattern": r"value: ([0-9.]+)", "min": 1})}
+        self.start_implement_ratchet(gates)
+        self.assertEqual({"first": 70, "other": 70}, self.state()["qualityBaseline"])
+
+    def test_the_measurement_does_not_apply_the_limit_or_the_exit_code(self):
+        gate = ratchet_gate(command="echo value: $(cat value.txt); exit 1")
+        self.start_implement_ratchet({"cov": gate})
+        self.assertEqual({"cov": 70}, self.state()["qualityBaseline"])
+
+    def test_the_gate_that_is_skipped_for_lack_of_changed_files_is_not_measured(self):
+        self.git_init()
+        gate = ratchet_gate(command="echo value: $(cat value.txt) {changed_files}", changedGlob=["*.nothing"])
+        self.start_implement_ratchet({"cov": gate})
+        self.assertNotIn("qualityBaseline", self.state())
+
+    # the comparison
+
+    def test_a_min_gate_passes_at_the_baseline_and_above(self):
+        self.start_implement_ratchet({"cov": ratchet_gate()})
+        out = self.stop_with(70)
+        self.assertIn("entering phase 'review'", out["reason"])
+        result = self.gate_result()
+        self.assertEqual(("pass", 70, 70), (result["result"], result["metric"], result["baseline"]))
+        self.assertIn("metric 70 is below the minimum 80, but no worse than the baseline 70 (ratchet)",
+                      self.read(self.run_path("quality", "cov.log")))
+
+    def test_a_min_gate_passes_above_the_baseline(self):
+        self.start_implement_ratchet({"cov": ratchet_gate()})
+        self.assertIn("entering phase 'review'", self.stop_with(75)["reason"])
+
+    def test_a_min_gate_passes_when_the_limit_is_met_even_below_the_baseline(self):
+        self.start_implement_ratchet({"cov": ratchet_gate()}, value=95)
+        self.assertIn("entering phase 'review'", self.stop_with(85)["reason"])
+
+    def test_a_min_gate_fails_below_the_baseline_with_value_limit_and_baseline(self):
+        self.start_implement_ratchet({"cov": ratchet_gate()})
+        before = self.state()["iter"]
+        out = self.stop_with(65)
+        self.assertEqual("block", out["decision"])
+        self.assertIn("metric 65 is below the minimum 80 and below the baseline 70 (ratchet)", out["reason"])
+        state = self.state()
+        self.assertEqual(("implement", before + 1), (state["phase"], state["iter"]))
+        self.assertEqual("fail", self.gate_result()["result"])
+
+    def test_a_max_gate_passes_at_the_baseline_and_below_and_fails_above(self):
+        self.start_implement_ratchet({"cov": ratchet_gate("max", 3)}, value=10)
+        out = self.stop_with(11)
+        self.assertIn("metric 11 is above the maximum 3 and above the baseline 10 (ratchet)", out["reason"])
+        self.assertIn("entering phase 'review'", self.stop_with(10)["reason"])
+
+    def test_a_max_gate_passes_below_the_baseline(self):
+        self.start_implement_ratchet({"cov": ratchet_gate("max", 3)}, value=10)
+        self.assertIn("entering phase 'review'", self.stop_with(4)["reason"])
+
+    def test_a_ratchet_gate_at_level_warn_only_warns_below_the_baseline(self):
+        self.start_implement_ratchet({"cov": ratchet_gate(level="warn")})
+        out = self.stop_with(60)
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual("warn", self.gate_result()["result"])
+
+    def test_the_exit_code_still_decides_for_a_ratchet_gate(self):
+        gate = ratchet_gate(command="echo value: $(cat value.txt); exit 1")
+        self.start_implement_ratchet({"cov": gate})
+        out = self.stop_with(90)
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: cov", out["reason"])
+
+    # an unreadable baseline
+
+    def test_an_unreadable_value_pauses_the_run_before_the_plan_passes(self):
+        gate = ratchet_gate(command="echo nothing here")
+        self.start_plan({"cov": gate})
+        out = workflow.handle_stop(self.root, {})
+        self.assertNotIn("decision", out)
+        state = self.state()
+        self.assertEqual(("paused", "plan", 0), (state["status"], state["phase"], state["iter"]))
+        self.assertEqual("cov", state["pausedFor"]["gate"])
+        self.assertIn("baseline could not be measured before the first edit", state["pausedFor"]["reason"])
+        self.assertIn("matches nothing", state["pausedFor"]["reason"])
+        self.assertNotIn("qualityBaseline", state)
+        self.assertEqual("broken", state["qualityResults"]["cov"]["result"])
+        self.assertIn("cov", out["systemMessage"])
+        self.assertFalse(os.path.exists(self.run_path("last-failure.md")))
+
+    def test_go_retries_the_measurement(self):
+        self.start_plan({"cov": ratchet_gate(command="cat missing.txt")})
+        workflow.handle_stop(self.root, {})
+        self.assertEqual("paused", self.state()["status"])
+        self.configure({"cov": ratchet_gate()})
+        workflow.cmd_go(self.root)
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'implement'", out["reason"])
+        self.assertEqual({"cov": 70}, self.state()["qualityBaseline"])
+
+    def test_advance_skips_the_measurement_and_the_gate_uses_its_limit_only(self):
+        self.start_plan({"cov": ratchet_gate(command="cat missing.txt")})
+        workflow.handle_stop(self.root, {})
+        workflow.cmd_advance(self.root)
+        workflow.cmd_go(self.root)
+        state = self.state()
+        self.assertEqual("implement", state["phase"])
+        self.assertNotIn("qualityBaseline", state)
+
+    def test_values_measured_before_a_broken_gate_are_kept(self):
+        gates = {"good": ratchet_gate(), "bad": ratchet_gate(command="echo none")}
+        self.start_plan(gates)
+        workflow.handle_stop(self.root, {})
+        state = self.state()
+        self.assertEqual("bad", state["pausedFor"]["gate"])
+        self.assertEqual({"good": 70}, state["qualityBaseline"])
+
+    def test_a_command_that_is_not_found_pauses_the_run(self):
+        self.start_plan({"cov": ratchet_gate(command="no-such-tool-for-specloop")})
+        workflow.handle_stop(self.root, {})
+        self.assertIn("command not found", self.state()["pausedFor"]["reason"])
+
+    # no baseline
+
+    def test_without_a_baseline_the_gate_uses_its_limit_only_and_the_report_says_so(self):
+        self.start_implement_ratchet({"plain": {"command": "exit 0"}})
+        self.configure({"cov": ratchet_gate()})
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("metric 70 is below the minimum 80", out["reason"])
+        self.assertNotIn("baseline", out["reason"])
+        self.assertNotIn("qualityBaseline", self.state())
+        report = self.read(self.run_path("quality.md"))
+        self.assertIn("## Ratchet baselines", report)
+        self.assertIn("- cov: no baseline was measured, so the gate uses its limit only.", report)
+
+    def test_the_report_lists_the_measured_baseline(self):
+        self.start_implement_ratchet({"cov": ratchet_gate()})
+        workflow.handle_stop(self.root, {})
+        report = self.read(self.run_path("quality.md"))
+        self.assertIn("- cov: baseline 70, measured before the first edit.", report)
+
+    def test_the_report_has_no_baseline_section_without_ratchet_gates(self):
+        self.start_implement_ratchet({"cov": value_gate(metric={"pattern": r"value: ([0-9.]+)", "min": 1})})
+        self.stop_with(70)
+        self.assertNotIn("Ratchet baselines", self.read(self.run_path("quality.md")))
+
+    def test_a_graph_without_a_plan_phase_has_no_baseline(self):
+        self.configure({"cov": ratchet_gate()})
+        self.write_value(70)
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        state = self.state()
+        self.assertTrue(workflow.baseline_phase(self.config(), dict(state, phase="plan")))
+        self.assertFalse(workflow.baseline_phase(self.config(), dict(state, phase="implement")))
+        self.assertFalse(workflow.baseline_phase(self.config(), dict(state, phase="review")))
+
+    # the time budget
+
+    def test_the_measurement_runs_within_the_quality_budget(self):
+        self.start_plan({"cov": ratchet_gate()}, {"timeoutSec": 7})
+        timeouts = []
+        original = workflow.run_limited
+
+        def spy(args, timeout, *a, **kw):
+            timeouts.append(timeout)
+            return original(args, timeout, *a, **kw)
+
+        with mock.patch.object(workflow, "run_limited", side_effect=spy):
+            out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'implement'", out["reason"])
+        self.assertEqual([7], timeouts)
+
+    def test_the_measurements_share_one_budget(self):
+        self.start_plan({"first": ratchet_gate(), "second": ratchet_gate()}, {"timeoutSec": 4})
+        clock = iter([0, 0, 10])  # start, first gate, second gate: the first gate "took" 10 s
+        with mock.patch.object(workflow, "_clock", side_effect=lambda: next(clock)):
+            out = workflow.handle_stop(self.root, {})
+        state = self.state()
+        self.assertNotIn("decision", out)
+        self.assertEqual("second", state["pausedFor"]["gate"])
+        self.assertIn("time budget", state["pausedFor"]["reason"])
+        self.assertEqual({"first": 70}, state["qualityBaseline"])
+
+    def test_a_hung_measurement_is_killed_and_pauses_the_run(self):
+        sleeper = '"%s" -c "import time; time.sleep(30)"' % sys.executable.replace("\\", "/")
+        self.start_plan({"cov": ratchet_gate(command=sleeper)}, {"timeoutSec": 1})
+        started = time.monotonic()
+        workflow.handle_stop(self.root, {})
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("timed out", self.state()["pausedFor"]["reason"])
+
+    # a dropped result
+
+    def test_a_dropped_result_stores_no_baseline(self):
+        self.start_plan({"cov": ratchet_gate()})
+        original = workflow.run_quality_gate
+
+        def change_the_workflow(*args, **kwargs):
+            result = original(*args, **kwargs)
+            workflow.update_state(self.root, lambda current: current.update(attempt=current.get("attempt", 0) + 1))
+            return result
+
+        with mock.patch.object(workflow, "run_quality_gate", side_effect=change_the_workflow):
+            workflow.handle_stop(self.root, {})
+        self.assertNotIn("qualityBaseline", self.state())
+        self.assertEqual("plan", self.state()["phase"])
 
 
 if __name__ == "__main__":

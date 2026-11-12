@@ -1774,12 +1774,40 @@ def metric_limit_message(metric, value):
     return None
 
 
-def run_quality_gate(root, config, state, name, gate, budget_left=None, command=None):
+def baseline_values(state):
+    """state.qualityBaseline as a dict: {gate: number measured before the first edit}."""
+    values = state.get("qualityBaseline")
+    return values if isinstance(values, dict) else {}
+
+
+def gate_legacy(config, gate):
+    """How the gate treats existing problems: its own `legacy`, else quality.legacy, else "baseline"."""
+    own = gate.get("legacy") if isinstance(gate, dict) else None
+    chosen = own if own is not None else quality_block(config).get("legacy", "baseline")
+    return chosen if chosen in LEGACY_MODES else "baseline"
+
+
+def is_ratchet_gate(config, gate):
+    """True for a gate whose legacy mode is "ratchet" and whose metric has exactly one numeric limit."""
+    metric = gate.get("metric") if isinstance(gate, dict) else None
+    return (gate_legacy(config, gate) == "ratchet" and isinstance(metric, dict)
+            and ("min" in metric) != ("max" in metric) and _is_number(metric.get("min", metric.get("max"))))
+
+
+def no_worse_than(metric, value, baseline):
+    """True when `value` is at least the baseline for a `min` metric (higher is better), at most for `max`."""
+    return value >= baseline if "min" in metric else value <= baseline
+
+
+def run_quality_gate(root, config, state, name, gate, budget_left=None, command=None, baseline=None, measure=False):
     """Run one valid gate with no lock. Return (record, output): the record goes to state.qualityResults, the
     complete output to run/quality/<name>.log. Never raises. A gate that cannot give an answer (exit code 126 or
     127, a timeout, a command that cannot be started, a used-up time budget) is `broken`, and its record says why
     in `reason`. `budget_left` is what remains of the time budget of this Stop; the gate's timeout is the smaller
-    of that and its own. `command` replaces gate["command"] once its placeholders are expanded."""
+    of that and its own. `command` replaces gate["command"] once its placeholders are expanded. `baseline` is the
+    value a ratchet gate was measured at before the first edit. With `measure` the gate is only measured: the
+    metric is read whatever the exit code is, no limit is applied and the result is `pass` unless the gate is
+    broken."""
     timeout = gate.get("timeoutSec", config.get("checkTimeoutSec", 900))
     started = time.monotonic()
     exit_code, timed_out, reason = None, False, None
@@ -1812,7 +1840,7 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None, command=
     value = None
     if reason:
         result = "broken"
-    elif exit_code in gate.get("passExitCodes", [0]):
+    elif measure or exit_code in gate.get("passExitCodes", [0]):
         result = "pass"
         metric = gate.get("metric")
         if isinstance(metric, dict):
@@ -1820,8 +1848,17 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None, command=
             if why:
                 result, reason = "broken", why
                 raw += ("\n[specloop] %s\n" % why).encode("utf-8")
-            else:
+            elif not measure:
                 limit = metric_limit_message(metric, value)
+                held = _metric_number(baseline) if is_ratchet_gate(config, gate) else None
+                if limit and held is not None:
+                    if no_worse_than(metric, value, held):
+                        raw += ("\n[specloop] %s, but no worse than the baseline %s (ratchet)\n" % (
+                            limit, _number_text(held))).encode("utf-8")
+                        limit = None
+                    else:
+                        limit = "%s and %s the baseline %s (ratchet)" % (
+                            limit, "below" if "min" in metric else "above", _number_text(held))
                 if limit:
                     result = failed_level
                     raw += ("\n[specloop] %s\n" % limit).encode("utf-8")
@@ -1832,6 +1869,8 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None, command=
     record = gate_record(state, name, result, exit_code, duration)
     if value is not None:
         record["metric"] = value
+    if baseline is not None and not measure and is_ratchet_gate(config, gate):
+        record["baseline"] = baseline
     if reason:
         record["reason"] = reason
     if timed_out:
@@ -2021,13 +2060,59 @@ def _outputs_of(runs):
     return {record["name"]: output for record, output in runs}
 
 
+def baseline_phase(config, state):
+    """True in the last planning phase, where ratchet values are measured: `plan` in single mode, the feature's
+    planning phase in feature mode. Never feature-replan, and never a graph that has neither."""
+    if in_replan(config, state):
+        return False
+    return is_plan_phase(config, state) if is_feature(state) else state["phase"] == "plan"
+
+
+def measure_baselines(root, config, state, outcome):
+    """On the Stop that passes the last planning phase, measure every ratchet gate that has no baseline yet.
+    Planning leaves the source untouched, so the values are those from before the run's first edit. Holds no
+    lock; the values go into state.qualityBaseline in apply_gate. Returns the outcome with `qualityBaseline`
+    ({gate: value}) added, or a broken outcome when a value cannot be read. The measurements share the time
+    budget of the Stop. A gate whose command lists changed files, and finds none, is not measured."""
+    if unreadable_quality(config):
+        return outcome
+    have = baseline_values(state)
+    pending = [(name, gate) for name, gate in quality_gates(config).items()
+               if is_ratchet_gate(config, gate) and _metric_number(have.get(name)) is None]
+    invalid = gate_definition_errors(root, config, pending) if pending else {}
+    pending = [(name, gate) for name, gate in pending if name not in invalid]  # run as broken in implement
+    if not pending:
+        return outcome
+    measured, runs = {}, []
+    budget = quality_budget(root, config)
+    started = _clock()
+    for name, gate in pending:
+        command, record, output = expand_changed_files(root, config, state, name, gate)
+        if record:
+            write_gate_log(root, name, output.encode("utf-8"))
+            if record["result"] == "skipped":
+                continue
+        else:
+            record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
+                                              command, measure=True)
+        if record["result"] == "broken":
+            record["reason"] = "the baseline could not be measured before the first edit: %s" % record["reason"]
+            runs.append((record, output))
+            broken = broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},
+                                    _outputs_of(runs))
+            return dict(broken, qualityBaseline=measured)
+        runs.append((record, output))
+        measured[name] = record["metric"]
+    return dict(outcome, qualityBaseline=measured) if measured else outcome
+
+
 def run_quality_gates(root, config, state, outcome):
     """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record.
 
     Definitions are checked first: an invalid gate is broken and no command runs. The first gate that breaks
     while running ends the run of gates, because the run pauses and every gate runs again after /sl-go."""
     if planning_phase(config, state):
-        return outcome
+        return measure_baselines(root, config, state, outcome) if baseline_phase(config, state) else outcome
     unreadable = unreadable_quality(config)
     if unreadable:
         return broken_outcome([], {"reason": "invalid quality configuration: %s" % unreadable})
@@ -2042,13 +2127,14 @@ def run_quality_gates(root, config, state, outcome):
     runs = []
     budget = quality_budget(root, config)
     started = _clock()
+    baselines = baseline_values(state)
     for name, gate in selected:
         command, record, output = expand_changed_files(root, config, state, name, gate)
         if record:
             write_gate_log(root, name, output.encode("utf-8"))
         else:
             record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
-                                              command)
+                                              command, _metric_number(baselines.get(name)))
         runs.append((record, output))
         if record["result"] == "broken":
             return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},
@@ -2084,9 +2170,20 @@ def quality_accepted_lines(state):
 
 
 def quality_baseline_lines(config, state):
-    """Lines noting ratchet gates that have no baseline to measure from. Added by the step that records
-    baselines; empty until then."""
-    return []
+    """Lines on the ratchet gates: the value each was measured at before the first edit, or that it has none and
+    uses its limit only (no planning phase, or a run that started without one)."""
+    ratchets = [name for name, gate in quality_gates(config).items() if is_ratchet_gate(config, gate)]
+    if not ratchets:
+        return []
+    have = baseline_values(state)
+    lines = ["## Ratchet baselines", ""]
+    for name in ratchets:
+        value = _metric_number(have.get(name))
+        if value is None:
+            lines.append("- %s: no baseline was measured, so the gate uses its limit only." % name)
+        else:
+            lines.append("- %s: baseline %s, measured before the first edit." % (name, _number_text(value)))
+    return lines
 
 
 def _fenced(text):
@@ -2145,6 +2242,18 @@ def record_quality(state, records):
     for record in records:
         results[record["name"]] = {key: value for key, value in record.items() if key != "name"}
     state["qualityResults"] = results
+
+
+def record_baseline(state, measured):
+    """Store measured ratchet values in state.qualityBaseline. A gate that already has a value keeps it: the
+    reloaded state decides, so a value is measured once per run."""
+    if not measured:
+        return
+    stored = dict(baseline_values(state))
+    for name, value in measured.items():
+        if _metric_number(stored.get(name)) is None:
+            stored[name] = value
+    state["qualityBaseline"] = stored
 
 
 # --- feature mode ----------------------------------------------------------------
@@ -2640,6 +2749,7 @@ def apply_gate(root, config, state, outcome, hook_input):
     if outcome["result"] == "replan":
         return request_replan(root, config, state, session)
     result, details, full = outcome["result"], outcome["details"], outcome["full"]
+    record_baseline(state, outcome.get("qualityBaseline"))
     if outcome.get("quality"):
         record_quality(state, outcome["quality"])
         write_quality_report(root, config, state, outcome)

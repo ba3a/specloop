@@ -51,6 +51,8 @@ Files in `<project>/.claude/specloop/`:
 
 Everything in this directory except `config.json` and `overrides/` is git-ignored.
 
+`state.json` holds, besides the workflow position, the state of [quality gates](quality-gates.md). `qualityBaseline` is one key: the value of each [ratchet](quality-gates.md#existing-problems) gate, measured once per run on the Stop that passes the planning phase and kept for the rest of the run.
+
 ## See also
 
 - [Phases](phases.md): the phase graph, check types and instruction placeholders.

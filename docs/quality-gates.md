@@ -38,6 +38,7 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 | `hint` | none | Text added to the failure message, for example how to fix a finding properly. |
 | `passExitCodes` | `[0]` | Exit codes that count as success. 126 and 127 can never be listed; see [Pass criteria](#pass-criteria). |
 | `metric` | none | A threshold on a number the gate reports; see [Pass criteria](#pass-criteria). |
+| `legacy` | `quality.legacy` | How existing problems are treated: `"baseline"` or `"ratchet"`; see [Existing problems](#existing-problems). |
 | `changedGlob` | none | List of `fnmatch` patterns that narrow `{changed_files}` and `{changed_files_file}`; see [Changed files](#changed-files). |
 
 ## Running gates
@@ -69,7 +70,7 @@ Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.l
 
 ### Results file
 
-After each gate run, `.claude/specloop/run/quality.md` is rewritten from that run's results: a table with one row per gate that ran (name, `result`, duration and the metric value, or `-` when the gate has none), then, for each `warn` result, a section with the end of its output, bounded by `maxOutputChars` across all warnings. The reviewer reads this file. It is written together with `qualityResults`, so a dropped result writes nothing, and a run without gates never creates it.
+After each gate run, `.claude/specloop/run/quality.md` is rewritten from that run's results: a table with one row per gate that ran (name, `result`, duration and the metric value, or `-` when the gate has none), then, for each `warn` result, a section with the end of its output, bounded by `maxOutputChars` across all warnings, then, for each [ratchet](#existing-problems) gate, its baseline or the note that it has none. The reviewer reads this file. It is written together with `qualityResults`, so a dropped result writes nothing, and a run without gates never creates it.
 
 In a feature-mode run, `run/quality.md` and `run/quality/` move to `run/steps/<id>/` when the step finishes, with the step's review files; the next step starts without them. In single mode they stay in `run/`.
 
@@ -137,6 +138,28 @@ The comparison point is `HEAD` for a feature-mode gate with `steps: "each"`, so 
 
 Single mode records `baseRef` (`HEAD`) and `preexistingUntracked` on the first `/sl-go` of a run in a git repository. It does not require a clean tree, so single mode starts on a dirty tree as before. The limit: a tracked file that was already modified at that moment counts as changed, because the comparison is with the commit, not with the tree as it was. Outside a git repository, or in one with no commits, nothing is recorded and the run starts as before. Outside git, [validation](#validation) rejects a gate that uses a placeholder; in a repository with no commits the comparison point is `HEAD`, and everything staged or untracked counts as changed.
 
+## Existing problems
+
+`legacy` says how a gate treats problems that exist before the run. It is set per gate and defaults to `quality.legacy`, which defaults to `"baseline"`.
+
+| Setting | Behaviour |
+|---------|-----------|
+| `"baseline"` (default) | specloop adds nothing: the tool's own baseline applies, for example detekt's baseline file, and a gate may use [`{changed_files}`](#changed-files) to check only what the run touched. A gate that must hold for the whole project uses `"baseline"` with no placeholder and no tool baseline. |
+| `"ratchet"` | A gate with a `metric` passes when the value meets its limit **or** is no worse than the value measured before the run. The metric needs exactly one of `min` (higher is better) and `max` (lower is better); see [Validation](#validation). |
+
+A ratchet gate is measured once per run, before any source edit, on the Stop that passes the last planning phase: `plan` in single mode, `feature.planPhase` (`feature-plan`) in feature mode. `feature-replan` never measures. Planning cannot edit the source, so the value is the one from before the run, with no stash and no second worktree. The command runs as the gate would, with the same shell, the gate's `timeoutSec` and the `{changed_files}` expansion, and it counts against the same [time budget](#time-budget). The metric is read whatever the exit code is, because a tool often fails exactly where problems exist; no limit is applied. Every ratchet gate is measured, whatever its `phases` or `steps`. The values are stored in `state.json` under `qualityBaseline`, as `{gate: value}`. A gate that already has a value is not measured again, so a retry after a pause measures only what is missing. A gate whose command uses a placeholder and finds no changed files is not measured.
+
+A value that cannot be read (a missing file, no match, invalid JSON, a missing key, a value that is not a number, a timeout, exit code 126 or 127) makes the measurement [broken](#broken-gates): the run is paused in the planning phase instead of passing it, with no iteration used. Values measured before the broken gate are kept. `/sl-go` measures again; `/sl-advance` skips the phase, and the gate then has no baseline.
+
+Later, in the gate's phases, a ratchet gate that has a baseline:
+
+- passes when the value meets its limit, or is at least the baseline (`min`) or at most the baseline (`max`). The log notes the second case, for example `metric 78 is below the minimum 80, but no worse than the baseline 75 (ratchet)`;
+- fails, at the gate's `level`, when the value is worse than the baseline and outside the limit, with value, limit and baseline in the message: `metric 70 is below the minimum 80 and below the baseline 75 (ratchet)`.
+
+The exit code still decides first, as for any gate. The baseline used is stored in the gate's `qualityResults` entry as `baseline`.
+
+In a graph with no planning phase, and in a run that started without a baseline, there is nothing to measure from: the gate uses its `min` or `max` only, and `run/quality.md` lists it with that note. The same section lists each measured baseline.
+
 ## Broken gates
 
 A gate is `broken` when it cannot give an answer, so neither the agent nor a retry of the same code can fix it:
@@ -145,6 +168,7 @@ A gate is `broken` when it cannot give an answer, so neither the agent nor a ret
 - it runs longer than its `timeoutSec` and is killed with every process it started;
 - its command cannot be started at all, for example because the `shell` does not exist;
 - its [metric](#pass-criteria) cannot be read: the file is missing, the pattern matches nothing, the document is not valid JSON, the key is missing or the value is not a number;
+- its [ratchet baseline](#existing-problems) cannot be measured, for any of the reasons above;
 - its definition is invalid when the Stop hook runs it. `/sl-go` validates the block (see [Validation](#validation)), but `config.json` or `config.local.json` may change afterwards. A gate that is not an object, or whose `phases` is not a list of phase names, counts in every phase that runs gates. An invalid key of the block itself, such as `failFast`, makes every gate of the phase broken, and a `quality` or `gates` value that is not an object pauses the run in every such phase.
 
 Any other exit code is an ordinary failure, even when its cause is a missing plugin or a broken build script: a Gradle wrapper that exits 1 fails the gate, and the agent handles it.
