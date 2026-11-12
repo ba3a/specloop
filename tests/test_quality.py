@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import os
@@ -455,6 +456,11 @@ class GateProject(QualityProject):
 
     def state(self):
         return workflow.load_state(self.root)
+
+    def accept_quality(self):
+        """Take the quality block as it is now as the run's fingerprint, as a person's /sl-quality accept will."""
+        workflow.update_state(self.root, lambda s: s["qualityFingerprints"].update(
+            quality=workflow.quality_block_fingerprint(self.config())))
 
     def run_path(self, *parts):
         return os.path.join(self.base, "run", *parts)
@@ -1174,6 +1180,7 @@ class MetricGateTest(GateProject):
         self.assertIn("matches nothing", self.read(self.run_path("quality", "g.log")))
         self.assertFalse(os.path.exists(self.run_path("last-failure.md")))
         self.configure({"g": {"command": "echo 3", "metric": {"pattern": r"(\d+)", "max": 5}}})
+        self.accept_quality()
         workflow.cmd_go(self.root)
         self.assertEntersReview(workflow.handle_stop(self.root, {}))
 
@@ -2350,6 +2357,7 @@ class RatchetTest(GateProject):
     def test_without_a_baseline_the_gate_uses_its_limit_only_and_the_report_says_so(self):
         self.start_implement_ratchet({"plain": {"command": "exit 0"}})
         self.configure({"cov": ratchet_gate()})
+        self.accept_quality()
         out = workflow.handle_stop(self.root, {})
         self.assertIn("metric 70 is below the minimum 80", out["reason"])
         self.assertNotIn("baseline", out["reason"])
@@ -2429,6 +2437,245 @@ class RatchetTest(GateProject):
             workflow.handle_stop(self.root, {})
         self.assertNotIn("qualityBaseline", self.state())
         self.assertEqual("plan", self.state()["phase"])
+
+
+class ProtectionTest(GateProject):
+    """`protect` and the quality block are fingerprinted on the first /go and compared before a gate's command."""
+
+    def setUp(self):
+        super().setUp()
+        self.write("detekt.yml", "maxIssues: 0\n")
+        self.write("config/detekt/a.yml", "a\n")
+        self.write("config/detekt/sub/b.yml", "b\n")
+
+    def write(self, rel, text):
+        path = os.path.join(self.root, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def sha(self, text):
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def ran(self, name="ran.txt"):
+        return self.exists(name)
+
+    def protecting(self, protect=("detekt.yml", "config/detekt/", "missing.yml"), **extra):
+        return dict(extra, command="echo x >> ran.txt", protect=list(protect))
+
+    def fingerprints(self):
+        return self.state()["qualityFingerprints"]
+
+    # what the first /go stores
+
+    def test_first_go_stores_hashes_of_files_directories_and_missing_files(self):
+        self.configure({"lint": self.protecting()})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        protected = self.fingerprints()["protected"]
+        self.assertEqual({"detekt.yml": self.sha("maxIssues: 0\n")}, protected["detekt.yml"])
+        self.assertEqual({"config/detekt/a.yml": self.sha("a\n"), "config/detekt/sub/b.yml": self.sha("b\n")},
+                         protected["config/detekt"])
+        self.assertEqual({"missing.yml": None}, protected["missing.yml"])
+
+    def test_first_go_stores_the_fingerprint_of_the_quality_block(self):
+        self.configure({"lint": self.protecting()})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        text = json.dumps(self.config()["quality"], sort_keys=True)
+        self.assertEqual(self.sha(text), self.fingerprints()["quality"])
+
+    def test_a_gate_set_to_null_does_not_change_the_block_fingerprint(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        before = workflow.quality_block_fingerprint(self.config())
+        self.write_json("config.local.json", {"quality": {"gates": {"extra": None}}})
+        self.assertEqual(before, workflow.quality_block_fingerprint(self.config()))
+        self.write_json("config.local.json", {"quality": {"gates": {"extra": {"command": "exit 0"}}}})
+        self.assertNotEqual(before, workflow.quality_block_fingerprint(self.config()))
+
+    def test_a_project_without_gates_still_stores_the_block_fingerprint(self):
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.assertEqual({}, self.fingerprints()["protected"])
+        self.assertIsInstance(self.fingerprints()["quality"], str)
+
+    def test_a_later_go_keeps_the_fingerprints_of_the_first(self):
+        self.configure({"lint": self.protecting()})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        first = self.fingerprints()
+        self.write("detekt.yml", "maxIssues: 99\n")
+        workflow.cmd_pause(self.root)
+        workflow.cmd_go(self.root)
+        self.assertEqual(first, self.fingerprints())
+
+    def test_a_run_with_no_fingerprints_gets_them_on_a_later_go(self):
+        self.configure({"lint": self.protecting()})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        workflow.update_state(self.root, lambda s: s.pop("qualityFingerprints"))
+        workflow.cmd_pause(self.root)
+        workflow.cmd_go(self.root)
+        self.assertEqual({"detekt.yml": self.sha("maxIssues: 0\n")}, self.fingerprints()["protected"]["detekt.yml"])
+
+    # protected files
+
+    def test_unchanged_protected_files_let_the_command_run(self):
+        self.configure({"lint": self.protecting()})
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertTrue(self.ran())
+
+    def test_a_direct_write_to_a_protected_file_fails_the_gate_and_skips_the_command(self):
+        self.configure({"lint": self.protecting()})
+        self.start_implement()
+        self.write("detekt.yml", "maxIssues: 1000\n")  # as sed or > through Bash would
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: lint", out["reason"])
+        self.assertIn("detekt.yml (changed)", out["reason"])
+        self.assertIn("/sl-quality accept", out["reason"])
+        self.assertFalse(self.ran())
+        self.assertIn("detekt.yml (changed)", self.read(self.run_path("quality", "lint.log")))
+        self.assertEqual("implement", self.state()["phase"])
+
+    def test_creating_a_missing_protected_file_fails_the_gate(self):
+        self.configure({"lint": self.protecting()})
+        self.start_implement()
+        self.write("missing.yml", "new\n")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("missing.yml (created)", out["reason"])
+        self.assertFalse(self.ran())
+
+    def test_adding_a_file_to_a_protected_directory_fails_the_gate(self):
+        self.configure({"lint": self.protecting()})
+        self.start_implement()
+        self.write("config/detekt/sub/new.yml", "x\n")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("config/detekt/sub/new.yml (created)", out["reason"])
+        self.assertFalse(self.ran())
+
+    def test_deleting_a_protected_file_fails_the_gate(self):
+        self.configure({"lint": self.protecting()})
+        self.start_implement()
+        os.remove(os.path.join(self.root, "config", "detekt", "a.yml"))
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("config/detekt/a.yml (deleted)", out["reason"])
+        self.assertFalse(self.ran())
+
+    def test_a_protection_failure_is_an_ordinary_failure_with_one_iteration(self):
+        self.configure({"lint": self.protecting(), "other": self.protecting(protect=["detekt.yml"])})
+        self.start_implement()
+        before = self.state()["iter"]
+        self.write("detekt.yml", "changed\n")
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: lint, other", out["reason"])
+        state = self.state()
+        self.assertEqual("active", state["status"])
+        self.assertNotIn("pausedFor", state)
+        self.assertEqual(before + 1, state["iter"])
+        self.assertEqual("fail", state["qualityResults"]["lint"]["result"])
+        self.assertTrue(os.path.exists(self.run_path("last-failure.md")))
+
+    def test_restoring_the_file_lets_the_gate_pass_again(self):
+        self.configure({"lint": self.protecting()})
+        self.start_implement()
+        self.write("detekt.yml", "changed\n")
+        workflow.handle_stop(self.root, {})
+        self.write("detekt.yml", "maxIssues: 0\n")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+
+    def test_a_gate_without_protect_runs_beside_a_protected_one(self):
+        self.configure({"lint": self.protecting(), "tests": {"command": "echo x >> tests-ran.txt"}})
+        self.start_implement()
+        self.write("detekt.yml", "changed\n")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("Quality gates failed: lint\n", out["reason"])
+        self.assertFalse(self.ran())
+        self.assertTrue(self.ran("tests-ran.txt"))
+        self.assertEqual("pass", self.state()["qualityResults"]["tests"]["result"])
+
+    def test_a_warn_gate_with_changed_protected_files_warns_and_skips_its_command(self):
+        self.configure({"lint": self.protecting(level="warn")})
+        self.start_implement()
+        self.write("detekt.yml", "changed\n")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual("warn", self.state()["qualityResults"]["lint"]["result"])
+        self.assertFalse(self.ran())
+        self.assertIn("detekt.yml (changed)", self.read(self.run_path("quality.md")))
+
+    def test_fail_fast_stops_after_a_protection_failure(self):
+        self.configure({"lint": self.protecting(), "tests": {"command": "echo x >> tests-ran.txt"}},
+                       {"failFast": True})
+        self.start_implement()
+        self.write("detekt.yml", "changed\n")
+        workflow.handle_stop(self.root, {})
+        self.assertFalse(self.ran("tests-ran.txt"))
+
+    def test_a_run_without_fingerprints_is_not_checked(self):
+        self.configure({"lint": self.protecting()})
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.pop("qualityFingerprints"))
+        self.write("detekt.yml", "changed\n")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+
+    # the quality block
+
+    def test_config_json_written_directly_fails_every_gate_including_warn(self):
+        gates = {"lint": {"command": "echo x >> ran.txt"}, "soft": {"command": "echo x >> ran.txt", "level": "warn"}}
+        self.configure(gates)
+        self.start_implement()
+        gates["lint"]["command"] = "exit 0"  # the agent weakens the harness
+        self.configure(gates)
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: lint, soft", out["reason"])
+        self.assertIn("/sl-quality accept", out["reason"])
+        self.assertFalse(self.ran())
+        state = self.state()
+        self.assertEqual("implement", state["phase"])
+        self.assertEqual(["fail", "fail"], [state["qualityResults"][n]["result"] for n in ("lint", "soft")])
+
+    def test_config_local_json_written_directly_fails_every_gate(self):
+        self.configure({"lint": {"command": "echo x >> ran.txt"}, "tests": {"command": "echo x >> ran.txt"}})
+        self.start_implement()
+        self.write_json("config.local.json", {"quality": {"gates": {"lint": {"command": "exit 0"}}}})
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: lint, tests", out["reason"])
+        self.assertIn("config.local.json", out["reason"])
+        self.assertFalse(self.ran())
+        self.assertEqual("fail", self.state()["qualityResults"]["tests"]["result"])
+
+    def test_a_block_change_is_one_iteration_and_no_pause(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        self.start_implement()
+        before = self.state()["iter"]
+        self.configure({"lint": {"command": "exit 0"}}, {"failFast": True})
+        workflow.handle_stop(self.root, {})
+        state = self.state()
+        self.assertEqual(before + 1, state["iter"])
+        self.assertEqual("active", state["status"])
+        self.assertNotIn("pausedFor", state)
+
+    def test_a_block_change_without_gates_in_the_phase_does_not_block(self):
+        self.start_implement()
+        self.configure({}, {"failFast": True})
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("entering phase 'review'", out["reason"])
+
+    def test_the_command_prefix_names_the_accept_command(self):
+        self.configure({"lint": {"command": "exit 0"}}, commandPrefix="x-")
+        self.start_implement()
+        self.configure({"lint": {"command": "exit 1"}}, commandPrefix="x-")
+        out = workflow.handle_stop(self.root, {})
+        self.assertIn("/x-quality accept", out["reason"])
+        self.assertNotIn("/sl-quality", out["reason"])
 
 
 if __name__ == "__main__":

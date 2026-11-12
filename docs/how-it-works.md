@@ -51,7 +51,7 @@ Files in `<project>/.claude/specloop/`:
 
 Everything in this directory except `config.json` and `overrides/` is git-ignored.
 
-`state.json` holds, besides the workflow position, the state of [quality gates](quality-gates.md). `qualityBaseline` is one key: the value of each [ratchet](quality-gates.md#existing-problems) gate, measured once per run on the Stop that passes the planning phase and kept for the rest of the run.
+`state.json` holds, besides the workflow position, the state of [quality gates](quality-gates.md). `qualityBaseline` is one key: the value of each [ratchet](quality-gates.md#existing-problems) gate, measured once per run on the Stop that passes the planning phase and kept for the rest of the run. `qualityFingerprints` holds the SHA-256 of each [protected](quality-gates.md#protected-files) file and of the merged `quality` block, stored on the first `/sl-go`; a gate compares against it before its command runs.
 
 ## See also
 

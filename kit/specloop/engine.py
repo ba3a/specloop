@@ -31,10 +31,12 @@ Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 import collections
 import contextlib
 import fnmatch
+import hashlib
 import io
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -1992,6 +1994,8 @@ def broken_outcome(records, paused_for, outputs=None):
 
 
 def _gate_exit(record):
+    if record.get("protection"):
+        return "protection"
     if record.get("timedOut"):
         return "timed out"
     if record["exitCode"] is None:
@@ -2058,6 +2062,152 @@ def gate_pass_details(details, runs):
 
 def _outputs_of(runs):
     return {record["name"]: output for record, output in runs}
+
+
+UNREADABLE = "unreadable"  # stands for the hash of a protected file that cannot be read
+FINGERPRINT_CHUNK = 1 << 16
+MAX_LISTED_PATHS = 20
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(FINGERPRINT_CHUNK), b""):
+                digest.update(chunk)
+    except OSError:
+        return UNREADABLE
+    return digest.hexdigest()
+
+
+def protect_key(entry):
+    """A `protect` entry as a project-relative path with forward slashes and no trailing slash."""
+    key = posixpath.normpath(entry.strip().replace("\\", "/"))
+    return key[2:] if key.startswith("./") else key
+
+
+def protected_entries(config):
+    """The distinct `protect` entries of every gate, as `protect_key`s in declared order."""
+    keys = []
+    for gate in quality_gates(config).values():
+        entries = gate.get("protect") if isinstance(gate, dict) else None
+        if _string_list(entries):
+            keys.extend(k for k in dict.fromkeys(protect_key(e) for e in entries) if k not in keys)
+    return keys
+
+
+def protected_fingerprint(root, key):
+    """{project-relative path: SHA-256, or None when the path is missing} for one protect entry. A directory is
+    walked recursively and contributes each file in it; a missing entry contributes itself with None."""
+    full = os.path.join(root, *key.split("/"))
+    if not os.path.isdir(full):
+        return {key: _sha256_file(full) if os.path.isfile(full) else None}
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(full):
+        dirnames.sort()
+        for file_name in sorted(filenames):
+            path = os.path.join(dirpath, file_name)
+            found[key + "/" + os.path.relpath(path, full).replace(os.sep, "/")] = _sha256_file(path)
+    return found
+
+
+def _without_nulls(value):
+    if isinstance(value, dict):
+        return dict((k, _without_nulls(v)) for k, v in value.items() if v is not None)
+    if isinstance(value, list):
+        return [_without_nulls(v) for v in value]
+    return value
+
+
+def quality_block_fingerprint(config):
+    """SHA-256 of the merged quality block with null values removed, so a gate set to null in config.local.json
+    and a gate that was never declared are the same."""
+    text = json.dumps(_without_nulls(quality_block(config)), sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def quality_fingerprints(root, config):
+    """What state.qualityFingerprints holds: the fingerprint of the quality block and, per protected path of any
+    gate, the hash of each file. The work grows with the size of the protected trees. Holds no lock. Returns None
+    when it cannot be computed, and never raises."""
+    try:
+        return {"quality": quality_block_fingerprint(config),
+                "protected": dict((key, protected_fingerprint(root, key)) for key in protected_entries(config))}
+    except Exception as e:
+        print("[specloop] could not fingerprint the quality gates: %s" % (str(e) or e.__class__.__name__),
+              file=sys.stderr)
+        return None
+
+
+def stored_fingerprints(state):
+    stored = state.get("qualityFingerprints")
+    return stored if isinstance(stored, dict) else {}
+
+
+def quality_block_changed(config, state):
+    """True when the merged quality block differs from the one fingerprinted at the run's first /go."""
+    before = stored_fingerprints(state).get("quality")
+    return isinstance(before, str) and before != quality_block_fingerprint(config)
+
+
+def protected_changes(root, state, gate):
+    """Lines naming the files in the gate's `protect` paths that differ from the stored fingerprints: changed,
+    created (a missing file or a new file in a protected directory) or deleted. Paths whose entry was not
+    fingerprinted are not compared, because a changed quality block fails the gate on its own."""
+    entries = gate.get("protect") if isinstance(gate, dict) else None
+    stored = stored_fingerprints(state).get("protected")
+    if not (_string_list(entries) and isinstance(stored, dict)):
+        return []
+    lines = []
+    for key in dict.fromkeys(protect_key(e) for e in entries):
+        before = stored.get(key)
+        if not isinstance(before, dict):
+            continue
+        current = protected_fingerprint(root, key)
+        for path in sorted(set(before) | set(current)):
+            old, new = before.get(path), current.get(path)
+            if old != new:
+                lines.append("%s (%s)" % (path, "created" if old is None else "deleted" if new is None else "changed"))
+    return lines
+
+
+def protection_record(state, name, result, reason, started):
+    return gate_record(state, name, result, None, time.monotonic() - started, reason=reason, protection=True)
+
+
+def protection_text(config, what, lines):
+    shown = lines[:MAX_LISTED_PATHS]
+    if len(lines) > len(shown):
+        shown.append("... and %d more" % (len(lines) - len(shown)))
+    return ("%s\n%s\nThe gate's command did not run. Restore them. Only a person can allow the change, by running "
+            "%s accept." % (what, "\n".join("- " + line for line in shown), cmd_name(config, "quality")))
+
+
+def block_changed_runs(root, config, state, selected):
+    """(record, output) for every selected gate, all `fail` whatever their level, when the quality block changed
+    since the run started. No command runs."""
+    text = ("The quality configuration (config.json or config.local.json) changed since the run started, so a "
+            "gate may have been weakened. The gate's command did not run. Only a person can allow the change, by "
+            "running %s accept." % cmd_name(config, "quality"))
+    runs = []
+    for name, _ in selected:
+        started = time.monotonic()
+        write_gate_log(root, name, ("[specloop] %s\n" % text).encode("utf-8"))
+        runs.append((protection_record(state, name, "fail", "the quality configuration changed", started), text))
+    return runs
+
+
+def protection_run(root, config, state, name, gate):
+    """(record, output) for a gate whose protected files changed, or None when they did not. Its command does not
+    run; the failure is at the gate's level."""
+    started = time.monotonic()
+    changes = protected_changes(root, state, gate)
+    if not changes:
+        return None
+    text = protection_text(config, "Protected files changed since the run started:", changes)
+    write_gate_log(root, name, ("[specloop] %s\n" % text).encode("utf-8"))
+    result = "warn" if gate.get("level", "block") == "warn" else "fail"
+    return protection_record(state, name, result, "protected files changed: %s" % ", ".join(changes[:5]), started), text
 
 
 def baseline_phase(config, state):
@@ -2128,7 +2278,18 @@ def run_quality_gates(root, config, state, outcome):
     budget = quality_budget(root, config)
     started = _clock()
     baselines = baseline_values(state)
+    if quality_block_changed(config, state):
+        runs = block_changed_runs(root, config, state, selected)
+        details, full = gate_failure(config, runs)
+        return {"result": "fail", "details": details, "full": full, "quality": [r for r, _ in runs],
+                "qualityOutputs": _outputs_of(runs)}
     for name, gate in selected:
+        protected = protection_run(root, config, state, name, gate)
+        if protected:
+            runs.append(protected)
+            if fail_fast and protected[0]["result"] == "fail":
+                break
+            continue
         command, record, output = expand_changed_files(root, config, state, name, gate)
         if record:
             write_gate_log(root, name, output.encode("utf-8"))
@@ -3085,12 +3246,15 @@ def cmd_go(root):
     branch = {k: state[k] for k in ("branch", "baseRef", "preexistingUntracked") if k in state}
     if not is_feature(state) and "baseRef" not in state:
         branch.update(single_mode_baseline(root, config))
+    fingerprints = None if "qualityFingerprints" in state else quality_fingerprints(root, config)
 
     def apply(current):
         if not current or current["status"] == "done":
             raise Unchanged("The workflow changed while %s ran. Run %s to see it." % (
                 cmd_name(config, "go"), cmd_name(config, "status")))
         current.update(branch)
+        if fingerprints is not None and "qualityFingerprints" not in current:
+            current["qualityFingerprints"] = fingerprints
         return resume(root, config, current, plan, replan)
     out = update_state(root, apply)
     warning = stale_override_warning(root, config, state)

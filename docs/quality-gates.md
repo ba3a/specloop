@@ -40,6 +40,7 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 | `metric` | none | A threshold on a number the gate reports; see [Pass criteria](#pass-criteria). |
 | `legacy` | `quality.legacy` | How existing problems are treated: `"baseline"` or `"ratchet"`; see [Existing problems](#existing-problems). |
 | `changedGlob` | none | List of `fnmatch` patterns that narrow `{changed_files}` and `{changed_files_file}`; see [Changed files](#changed-files). |
+| `protect` | `[]` | Project-relative files and directories the run may not change, for example `["detekt.yml", "config/detekt/"]`; see [Protected files](#protected-files). |
 
 ## Running gates
 
@@ -160,6 +161,27 @@ The exit code still decides first, as for any gate. The baseline used is stored 
 
 In a graph with no planning phase, and in a run that started without a baseline, there is nothing to measure from: the gate uses its `min` or `max` only, and `run/quality.md` lists it with that note. The same section lists each measured baseline.
 
+## Protected files
+
+An agent could pass a gate by weakening it: loosening `detekt.yml`, or editing the `quality` block. `protect` names the files and directories a gate depends on, and specloop checks them when the gate runs, so the check also catches changes made through Bash (`sed`, `>`), which a tool-call guard cannot see.
+
+On the first `/sl-go` of a run, and on a later `/sl-go` of a run that has none yet, the engine stores in `state.json` under `qualityFingerprints`:
+
+- `protected`: for every `protect` entry of every gate, the SHA-256 of each file it names. A directory is walked recursively and every file in it is hashed. A missing entry is stored as `null`.
+- `quality`: the SHA-256 of the merged `quality` block (`config.json` over `defaults.json`, then `config.local.json`), serialised as JSON with sorted keys after null values are removed. A gate set to `null` and a gate that was never declared are the same.
+
+The fingerprints are taken before the state is locked and stored once; later `/sl-go` calls keep them. A run that started before this existed has none, and is not checked.
+
+Before a gate's command runs, the engine compares the gate's own `protect` paths with the stored hashes. A file that changed, a file created where none existed (a missing protected file, or a new file in a protected directory) or a file that was deleted fails the gate:
+
+- It is an ordinary failure at the gate's `level`: `block` fails the phase with one iteration, `warn` is reported and lets the phase pass. It is never `broken`, because the agent can fix it by restoring the files.
+- The message and `run/quality/<gate>.log` list each path with `changed`, `created` or `deleted`, and the gate's command does not run.
+- Restoring the files makes the gate pass on the next stop.
+
+If the merged `quality` block no longer matches its fingerprint, **every** gate of the phase fails, whatever its `level` (`warn` included), and no command runs. This is how a run is kept from weakening its harness by writing `config.json` or `config.local.json` directly. The message says that a person must run `/sl-quality accept` to allow the change. A phase with no gates is not affected.
+
+Fingerprinting reads every byte of every protected file at the start of the run, and the engine walks the protected directories again before each protected gate. Protect configuration files and small directories, not build output or source trees; a large tree makes every stop slower, and keeping that cost down is the maintainer's concern.
+
 ## Broken gates
 
 A gate is `broken` when it cannot give an answer, so neither the agent nor a retry of the same code can fix it:
@@ -175,7 +197,7 @@ Any other exit code is an ordinary failure, even when its cause is a missing plu
 
 A broken gate, at level `block` or `warn`, pauses the run instead of failing the phase. The status becomes `paused`, `state.json` records the first broken gate and its reason under `pausedFor`, for example `{"gate": "detekt", "reason": "command not found (exit 127)"}`, and the gate's last result is `broken` with the same `reason`. No iteration is used and nothing is written to `run/last-failure.md`. The stop is not blocked: the message is for you, and it names each broken gate with its reason. Invalid definitions are all reported at once and no gate command runs. A gate that breaks while running ends the run of gates; later gates do not run and keep their previous results.
 
-Fix the gate or install its tool, then:
+Fix the gate or install its tool. If the fix changes the `quality` block while the run is active, a person must also run `/sl-quality accept`, or every gate fails (see [Protected files](#protected-files)). Then:
 
 - `/sl-go` resumes the run and clears `pausedFor`. The next stop runs every gate of the phase again.
 - `/sl-advance` skips the phase, as it does from any pause, and clears `pausedFor`. The run stays paused until `/sl-go`.
@@ -199,6 +221,8 @@ A gate mark left by a stop that was killed counts as stale after the same sum, `
 ```
 
 A gate that only you define is added after the shared ones.
+
+Change the block before a run starts. While a run is active, a change to the merged block fails every gate (see [Protected files](#protected-files)).
 
 ## Validation
 
