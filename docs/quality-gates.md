@@ -41,6 +41,7 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 | `legacy` | `quality.legacy` | How existing problems are treated: `"baseline"` or `"ratchet"`; see [Existing problems](#existing-problems). |
 | `changedGlob` | none | List of `fnmatch` patterns that narrow `{changed_files}` and `{changed_files_file}`; see [Changed files](#changed-files). |
 | `protect` | `[]` | Project-relative files and directories the run may not change, for example `["detekt.yml", "config/detekt/"]`; see [Protected files](#protected-files). |
+| `forbid` | `[]` | Patterns that new lines may not match: strings, or objects with `pattern`, `glob` and `message`; see [Forbidden patterns](#forbidden-patterns). |
 
 ## Running gates
 
@@ -181,6 +182,35 @@ Before a gate's command runs, the engine compares the gate's own `protect` paths
 If the merged `quality` block no longer matches its fingerprint, **every** gate of the phase fails, whatever its `level` (`warn` included), and no command runs. This is how a run is kept from weakening its harness by writing `config.json` or `config.local.json` directly. The message says that a person must run `/sl-quality accept` to allow the change. A phase with no gates is not affected.
 
 Fingerprinting reads every byte of every protected file at the start of the run, and the engine walks the protected directories again before each protected gate. Protect configuration files and small directories, not build output or source trees; a large tree makes every stop slower, and keeping that cost down is the maintainer's concern.
+
+## Forbidden patterns
+
+`forbid` lists regular expressions that new lines may not match, for example `# noqa` or `@Suppress(`. An entry is a string (a pattern applied to every file) or an object:
+
+```json
+"forbid": [
+  "TODO\\(remove\\)",
+  { "pattern": "@Suppress\\(", "glob": ["*.kt", "*.kts"], "message": "Fix the finding instead of suppressing it." }
+]
+```
+
+| Key | Meaning |
+|-----|---------|
+| `pattern` | Regular expression, searched in each added line (Python `re` syntax). |
+| `glob` | Optional list of `fnmatch` patterns on the project-relative path, with forward slashes. `*` also matches `/`, so `*.kt` covers every directory. Without it the pattern applies to every file. |
+| `message` | Optional text shown under each hit, for example how to fix it properly. |
+
+Before a gate's command runs, the engine collects the lines this run added, from the same files and with the same comparison point as [`{changed_files}`](#changed-files) (`HEAD` for a feature-mode gate that runs on each step, `baseRef` otherwise), but without `changedGlob`:
+
+- For tracked files, `git diff --unified=0` against the comparison point; the `+` lines are numbered from the hunk headers. A line that existed before the comparison point is not added, so legacy code never fails the gate.
+- For untracked files that were not already untracked when the run started, every line.
+- Binary files are skipped (a NUL byte in the first 8000 bytes of an untracked file, or git's own detection for tracked ones). A trailing carriage return is not part of the line.
+
+A hit fails the gate as an ordinary failure at its `level`, in the same way as a [changed protected file](#protected-files): `block` fails the phase with one iteration, `warn` is reported in the message and `run/quality.md` and lets the phase pass. The message and `run/quality/<gate>.log` list each hit as `path:line: text` with the entry's `message` under it, and the gate's command does not run. If a gate has both protected-file changes and hits, one message lists both. When git cannot answer, the gate is [broken](#broken-gates).
+
+A hit is skipped when the SHA-256 of its path, a NUL character and the text of the line is in `state.qualityAccepted`, a list of such hashes. Only a person adds to it, with `/sl-quality accept`; a line that is changed or moved to another file is a new hit. The function `forbid_hits` in `engine.py` does the scanning for `accept` as well.
+
+A gate with `forbid` needs a git work tree; [validation](#validation) reports it otherwise. In single mode a tracked file that was already modified when the run started counts as changed, so lines already in that diff are reported.
 
 ## Broken gates
 

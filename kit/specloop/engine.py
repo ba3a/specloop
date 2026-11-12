@@ -1901,12 +1901,13 @@ def untracked_files(root, config):
     return [path for code, path in entries if code == "??"]
 
 
-def changed_files(root, config, state, gate):
-    """Project-relative paths, with forward slashes and sorted, of the files this run changed, for the
-    placeholders {changed_files} and {changed_files_file}: tracked changes against the comparison point
-    (`changed_files_base`), staged and unstaged, without deleted files, plus untracked files that were not
-    already untracked when the run started (`preexistingUntracked`), leaving out .claude/specloop/. The gate's
-    `changedGlob` patterns narrow the set. Raises ChangedFilesError when git cannot answer. Holds no lock."""
+def changed_file_sets(root, config, state, gate):
+    """(comparison point, tracked, untracked): the project-relative paths, with forward slashes and sorted, of
+    the files this run changed. `tracked` holds tracked changes against the comparison point
+    (`changed_files_base`), staged and unstaged, without deleted files; `untracked` holds untracked files that
+    were not already untracked when the run started (`preexistingUntracked`). .claude/specloop/ is left out.
+    The comparison point is EMPTY_TREE in a repository with no commits. Raises ChangedFilesError when git cannot
+    answer. Holds no lock."""
     ok, prefix = git(root, config, "rev-parse", "--show-prefix")
     if not ok:
         raise ChangedFilesError("git rev-parse --show-prefix failed: %s" % prefix)
@@ -1916,11 +1917,23 @@ def changed_files(root, config, state, gate):
     ok, out = git(root, config, "diff", "--name-only", "--diff-filter=d", "-z", point, "--", raw=True)
     if not ok:
         raise ChangedFilesError("git diff %s failed: %s" % (point[:12], out.strip()))
-    tracked = [p for p in out.split("\0") if p]
+    tracked = set(p for p in out.split("\0") if p)
+    untracked = set(untracked_files(root, config))
     own_dir = prefix + _rel() + "/"
     preexisting = set(state.get("preexistingUntracked", []))
-    found = set(tracked + untracked_files(root, config)) - preexisting
-    paths = sorted(p[len(prefix):] for p in found if p.startswith(prefix) and not p.startswith(own_dir))
+
+    def project_paths(found):
+        return sorted(p[len(prefix):] for p in found - preexisting if p.startswith(prefix) and not p.startswith(own_dir))
+    return point, project_paths(tracked), project_paths(untracked - tracked)
+
+
+def changed_files(root, config, state, gate):
+    """Project-relative paths, with forward slashes and sorted, of the files this run changed, for the
+    placeholders {changed_files} and {changed_files_file}: the tracked and untracked files of
+    `changed_file_sets`, narrowed by the gate's `changedGlob` patterns. Raises ChangedFilesError when git cannot
+    answer. Holds no lock."""
+    _, tracked, untracked = changed_file_sets(root, config, state, gate)
+    paths = sorted(tracked + untracked)
     patterns = gate.get("changedGlob")
     if patterns:
         paths = [p for p in paths if any(fnmatch.fnmatchcase(p, pattern) for pattern in patterns)]
@@ -2067,6 +2080,9 @@ def _outputs_of(runs):
 UNREADABLE = "unreadable"  # stands for the hash of a protected file that cannot be read
 FINGERPRINT_CHUNK = 1 << 16
 MAX_LISTED_PATHS = 20
+MAX_HIT_CHARS = 200
+BINARY_SNIFF_BYTES = 8000
+HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
 def _sha256_file(path):
@@ -2171,16 +2187,133 @@ def protected_changes(root, state, gate):
     return lines
 
 
+def forbid_entries(gate):
+    """The gate's `forbid` entries as (compiled pattern, glob list or None, message or None). An entry that is
+    not valid is left out: validation reports it."""
+    entries = []
+    forbid = gate.get("forbid") if isinstance(gate, dict) else None
+    for entry in forbid if isinstance(forbid, list) else []:
+        if isinstance(entry, dict):
+            pattern, globs, message = entry.get("pattern"), entry.get("glob"), entry.get("message")
+        else:
+            pattern, globs, message = entry, None, None
+        try:
+            compiled = re.compile(pattern)
+        except (re.error, TypeError):
+            continue
+        entries.append((compiled, globs if _string_list(globs) else None, message if isinstance(message, str) else None))
+    return entries
+
+
+def _parse_added_lines(diff):
+    """[(line number, text)] of the lines a `git diff --unified=0` of one file adds, numbered by the hunk headers."""
+    added, number = [], None
+    for line in diff.split("\n"):
+        if line.startswith("@@"):
+            match = HUNK_HEADER.match(line)
+            number = int(match.group(1)) if match else None
+        elif number is not None and line.startswith("+"):
+            added.append((number, line[1:].rstrip("\r")))
+            number += 1
+    return added
+
+
+def added_lines(root, config, state, gate):
+    """[(project-relative path, line number, text)] of the lines this run added, from the changed-file set of
+    `changed_file_sets` (the gate's `changedGlob` does not narrow it): `git diff --unified=0` against the
+    comparison point for tracked files, and the whole text of untracked files that were not already untracked
+    when the run started. Binary files are skipped. Raises ChangedFilesError when git cannot answer. Holds no
+    lock."""
+    point, tracked, untracked = changed_file_sets(root, config, state, gate)
+    found = []
+    for path in tracked:
+        ok, out = git(root, config, "diff", "--unified=0", "--no-color", "--no-ext-diff", "--no-renames",
+                      point, "--", path, raw=True)
+        if not ok:
+            raise ChangedFilesError("git diff %s failed for %s: %s" % (point[:12], path, out.strip()))
+        found.extend((path, number, text) for number, text in _parse_added_lines(out))
+    for path in untracked:
+        try:
+            with open(os.path.join(root, *path.split("/")), "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue  # gone, a directory or unreadable: there is no text to scan
+        if b"\0" in raw[:BINARY_SNIFF_BYTES]:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        found.extend((path, number, line.rstrip("\r")) for number, line in enumerate(text.split("\n"), 1))
+    return found
+
+
+def forbid_hit_hash(path, text):
+    """The hash by which an accepted hit is recorded in state.qualityAccepted: SHA-256 of the project-relative
+    path, a NUL character and the text of the line (without its line ending)."""
+    return hashlib.sha256((path + "\0" + text).encode("utf-8", errors="replace")).hexdigest()
+
+
+def accepted_hits(state):
+    accepted = state.get("qualityAccepted")
+    return set(h for h in accepted if isinstance(h, str)) if isinstance(accepted, (list, dict)) else set()
+
+
+def forbid_hits(root, config, state, gate, include_accepted=False, lines=None):
+    """The added lines that match the gate's `forbid` entries, as dicts with path, line, text, message, pattern
+    and hash, in file and line order (a line that matches two entries is listed for each). A hit whose hash is
+    in state.qualityAccepted is left out unless `include_accepted` is true. `lines` are the added lines to scan
+    when the caller has them already. Raises ChangedFilesError when git cannot answer. Holds no lock."""
+    entries = forbid_entries(gate)
+    if not entries:
+        return []
+    if lines is None:
+        lines = added_lines(root, config, state, gate)
+    accepted = set() if include_accepted else accepted_hits(state)
+    hits = []
+    for path, number, text in lines:
+        digest = None
+        for compiled, globs, message in entries:
+            if globs and not any(fnmatch.fnmatchcase(path, g) for g in globs):
+                continue
+            if not compiled.search(text):
+                continue
+            digest = digest or forbid_hit_hash(path, text)
+            if digest in accepted:
+                continue
+            hits.append({"path": path, "line": number, "text": text, "message": message,
+                         "pattern": compiled.pattern, "hash": digest})
+    return hits
+
+
+def forbid_text(hits):
+    """The report of forbid hits: one `path:line: text` per hit, with the entry's message under it."""
+    lines = []
+    for hit in hits[:MAX_LISTED_PATHS]:
+        text = hit["text"].strip()
+        if len(text) > MAX_HIT_CHARS:
+            text = text[:MAX_HIT_CHARS] + "..."
+        lines.append("%s:%d: %s%s" % (hit["path"], hit["line"], text, "\n  " + hit["message"] if hit["message"] else ""))
+    if len(hits) > len(lines):
+        lines.append("... and %d more" % (len(hits) - len(lines)))
+    return "Forbidden patterns were added since the comparison point:\n" + "\n".join("- " + l for l in lines)
+
+
 def protection_record(state, name, result, reason, started):
     return gate_record(state, name, result, None, time.monotonic() - started, reason=reason, protection=True)
 
 
-def protection_text(config, what, lines):
+def _listing(lines):
     shown = lines[:MAX_LISTED_PATHS]
     if len(lines) > len(shown):
         shown.append("... and %d more" % (len(lines) - len(shown)))
-    return ("%s\n%s\nThe gate's command did not run. Restore them. Only a person can allow the change, by running "
-            "%s accept." % (what, "\n".join("- " + line for line in shown), cmd_name(config, "quality")))
+    return "\n".join("- " + line for line in shown)
+
+
+def protection_text(config, what, lines):
+    return "%s\n%s" % (what, _listing(lines))
+
+
+def protection_footer(config, what):
+    return ("The gate's command did not run. %s Only a person can allow the change, by running %s accept."
+            % (what, cmd_name(config, "quality")))
 
 
 def block_changed_runs(root, config, state, selected):
@@ -2198,16 +2331,35 @@ def block_changed_runs(root, config, state, selected):
 
 
 def protection_run(root, config, state, name, gate):
-    """(record, output) for a gate whose protected files changed, or None when they did not. Its command does not
-    run; the failure is at the gate's level."""
+    """(record, output) for a gate whose protected files changed or to which forbidden lines were added, or None
+    when neither happened. Its command does not run; the failure is at the gate's level. Git failing makes the
+    gate broken, because the agent cannot fix it."""
     started = time.monotonic()
     changes = protected_changes(root, state, gate)
-    if not changes:
+    try:
+        hits = forbid_hits(root, config, state, gate)
+    except (ChangedFilesError, OSError) as e:
+        reason = "the added lines cannot be determined: %s" % (str(e) or e.__class__.__name__)
+        write_gate_log(root, name, ("[specloop] %s\n" % reason).encode("utf-8"))
+        return protection_record(state, name, "broken", reason, started), reason
+    if not (changes or hits):
         return None
-    text = protection_text(config, "Protected files changed since the run started:", changes)
+    parts, reasons, restore = [], [], []
+    if changes:
+        parts.append(protection_text(config, "Protected files changed since the run started:", changes))
+        reasons.append("protected files changed: %s" % ", ".join(changes[:5]))
+        restore.append("Restore the files.")
+    if hits:
+        parts.append(forbid_text(hits))
+        reasons.append("forbidden lines added: %s" % ", ".join("%s:%d" % (h["path"], h["line"]) for h in hits[:5]))
+        restore.append("Remove the lines.")
+    text = "\n".join(parts + [protection_footer(config, " ".join(restore))])
     write_gate_log(root, name, ("[specloop] %s\n" % text).encode("utf-8"))
     result = "warn" if gate.get("level", "block") == "warn" else "fail"
-    return protection_record(state, name, result, "protected files changed: %s" % ", ".join(changes[:5]), started), text
+    record = protection_record(state, name, result, "; ".join(reasons), started)
+    if hits:
+        record["forbidden"] = len(hits)
+    return record, text
 
 
 def baseline_phase(config, state):
@@ -2287,6 +2439,9 @@ def run_quality_gates(root, config, state, outcome):
         protected = protection_run(root, config, state, name, gate)
         if protected:
             runs.append(protected)
+            if protected[0]["result"] == "broken":
+                return broken_outcome([r for r, _ in runs], {"gate": name, "reason": protected[0]["reason"]},
+                                      _outputs_of(runs))
             if fail_fast and protected[0]["result"] == "fail":
                 break
             continue

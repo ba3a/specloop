@@ -2136,6 +2136,228 @@ class FeatureChangedFilesTest(ChangedFilesProject):
         self.assertEqual(["each.log"], sorted(os.listdir(run)))
 
 
+class ForbidTest(ChangedFilesProject):
+    """`forbid`: added lines that match a pattern fail the gate before its command runs."""
+
+    PATTERN = {"pattern": "@Suppress\\(", "glob": ["*.kt", "*.kts"], "message": "Fix the finding instead."}
+    OLD = 'fun a() {}\n@Suppress("old")\nfun b() {}\n'
+
+    def setUp(self):
+        super().setUp()
+        self.write("src/Old.kt", self.OLD)
+        self.git("add", "src/Old.kt")
+        self.git("commit", "-q", "-m", "legacy")
+
+    def start_implement(self, forbid=None, **extra):
+        gate = self.counting("lint", "exit 0", forbid=[self.PATTERN] if forbid is None else forbid, **extra)
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": {"gates": {"lint": gate}}})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.assertIn("entering phase 'implement'", self.stop()["reason"])
+
+    def hits(self, **kwargs):
+        return workflow.forbid_hits(self.root, self.config(), self.state(),
+                                    self.config()["quality"]["gates"]["lint"], **kwargs)
+
+    def places(self, hits):
+        return [(h["path"], h["line"]) for h in hits]
+
+    def test_an_added_line_fails_the_gate_with_path_line_and_message(self):
+        self.start_implement()
+        self.write("src/Old.kt", self.OLD + '    @Suppress("new")\n')
+        out = self.stop()
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: lint", out["reason"])
+        self.assertIn('src/Old.kt:4: @Suppress("new")', out["reason"])
+        self.assertIn("Fix the finding instead.", out["reason"])
+        self.assertIn("/sl-quality accept", out["reason"])
+        self.assertEqual(0, self.marker("lint"))
+        self.assertIn("src/Old.kt:4", self.gate_log("lint"))
+        state = self.state()
+        self.assertEqual("implement", state["phase"])
+        self.assertEqual("fail", state["qualityResults"]["lint"]["result"])
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "last-failure.md")))
+
+    def test_line_numbers_follow_the_hunks(self):
+        self.start_implement()
+        self.write("src/Old.kt", '// top\nfun a() {}\n@Suppress("old")\n@Suppress("x")\nfun b() {}\n@Suppress("y")\n')
+        found = [(h["path"], h["line"], h["text"]) for h in self.hits()]
+        self.assertEqual([("src/Old.kt", 4, '@Suppress("x")'), ("src/Old.kt", 6, '@Suppress("y")')], found)
+
+    def test_lines_that_existed_before_the_comparison_point_do_not_count(self):
+        self.start_implement()
+        self.write("src/Old.kt", self.OLD + "fun c() {}\n")
+        self.assertEqual([], self.hits())
+        out = self.stop()
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual(1, self.marker("lint"))
+
+    def test_a_line_in_a_new_untracked_file_counts(self):
+        self.start_implement()
+        self.write("src/New.kt", 'fun n() {}\n\n@Suppress("n")\n')
+        out = self.stop()
+        self.assertIn('src/New.kt:3: @Suppress("n")', out["reason"])
+        self.assertEqual(0, self.marker("lint"))
+
+    def test_a_file_untracked_before_the_run_does_not_count(self):
+        self.write("src/Early.kt", '@Suppress("early")\n')
+        self.start_implement()
+        self.assertEqual([], self.hits())
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+
+    def test_a_committed_addition_still_counts_against_the_base_ref(self):
+        self.start_implement()
+        self.write("src/New.kt", '@Suppress("n")\n')
+        self.git("add", "src/New.kt")
+        self.git("commit", "-q", "-m", "sneaky")
+        self.assertEqual([("src/New.kt", 1)], self.places(self.hits()))
+
+    def test_glob_limits_a_pattern_to_matching_files(self):
+        self.start_implement()
+        self.write("notes.txt", '@Suppress("in a note")\n')
+        self.write("src/build.gradle.kts", '@Suppress("kts")\n')
+        self.assertEqual(["src/build.gradle.kts"], [h["path"] for h in self.hits()])
+        self.write("src/build.gradle.kts", "ok\n")
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+
+    def test_an_entry_without_glob_applies_to_every_file(self):
+        self.start_implement(forbid=["TODO"])
+        self.write("a.txt", "x\nTODO later\n")
+        self.assertEqual([("a.txt", 2)], self.places(self.hits()))
+
+    def test_every_matching_entry_reports_its_own_message(self):
+        self.start_implement(forbid=[{"pattern": "TODO", "message": "No TODOs."},
+                                     {"pattern": "FIXME", "message": "No FIXMEs."}])
+        self.write("a.txt", "TODO one\nFIXME two\n")
+        out = self.stop()
+        self.assertIn("a.txt:1: TODO one\n  No TODOs.", out["reason"])
+        self.assertIn("a.txt:2: FIXME two\n  No FIXMEs.", out["reason"])
+
+    def test_a_hit_in_the_accepted_list_is_not_reported(self):
+        self.start_implement()
+        self.write("src/A.kt", '@Suppress("a")\n')
+        self.write("src/B.kt", '@Suppress("b")\n')
+        digest = workflow.forbid_hit_hash("src/A.kt", '@Suppress("a")')
+        self.assertEqual(hashlib.sha256(b'src/A.kt\0@Suppress("a")').hexdigest(), digest)
+        workflow.update_state(self.root, lambda s: s.update(qualityAccepted=[digest]))
+        self.assertEqual(["src/B.kt"], [h["path"] for h in self.hits()])
+        self.assertEqual(["src/A.kt", "src/B.kt"], [h["path"] for h in self.hits(include_accepted=True)])
+        reason = self.stop()["reason"]
+        self.assertIn("src/B.kt:1", reason)
+        self.assertNotIn("src/A.kt", reason)
+
+    def test_when_every_hit_is_accepted_the_gate_passes(self):
+        self.start_implement()
+        self.write("src/A.kt", '@Suppress("a")\n')
+        digest = workflow.forbid_hit_hash("src/A.kt", '@Suppress("a")')
+        workflow.update_state(self.root, lambda s: s.update(qualityAccepted=[digest]))
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual(1, self.marker("lint"))
+
+    def test_an_accepted_line_in_another_file_is_still_reported(self):
+        self.start_implement()
+        self.write("src/B.kt", '@Suppress("a")\n')
+        digest = workflow.forbid_hit_hash("src/A.kt", '@Suppress("a")')
+        workflow.update_state(self.root, lambda s: s.update(qualityAccepted=[digest]))
+        self.assertEqual(["src/B.kt"], [h["path"] for h in self.hits()])
+
+    def test_a_warn_gate_reports_a_hit_without_blocking(self):
+        self.start_implement(level="warn")
+        self.write("src/A.kt", '@Suppress("a")\n')
+        out = self.stop()
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual(0, self.marker("lint"))
+        state = self.state()
+        self.assertEqual("warn", state["qualityResults"]["lint"]["result"])
+        self.assertEqual("active", state["status"])
+        with open(os.path.join(self.base, "run", "quality.md"), encoding="utf-8") as f:
+            self.assertIn("src/A.kt:1", f.read())
+
+    def test_protected_changes_and_forbidden_lines_are_reported_together(self):
+        self.write("rules.yml", "a\n")
+        self.git("add", "rules.yml")
+        self.git("commit", "-q", "-m", "rules")
+        self.start_implement(protect=["rules.yml"])
+        self.write("rules.yml", "b\n")
+        self.write("src/A.kt", '@Suppress("a")\n')
+        out = self.stop()
+        self.assertIn("rules.yml (changed)", out["reason"])
+        self.assertIn("src/A.kt:1", out["reason"])
+        self.assertEqual(0, self.marker("lint"))
+
+    def test_binary_files_are_skipped_and_line_endings_removed(self):
+        self.start_implement(forbid=["TODO"])
+        with open(os.path.join(self.root, "blob.bin"), "wb") as f:
+            f.write(b"\0TODO\0")
+        with open(os.path.join(self.root, "dos.txt"), "wb") as f:
+            f.write(b"ok\r\nTODO\r\n")
+        self.assertEqual([("dos.txt", 2, "TODO")], [(h["path"], h["line"], h["text"]) for h in self.hits()])
+
+    def test_a_binary_tracked_file_is_skipped(self):
+        with open(os.path.join(self.root, "blob.bin"), "wb") as f:
+            f.write(b"\0\1\2")
+        self.git("add", "blob.bin")
+        self.git("commit", "-q", "-m", "bin")
+        self.start_implement(forbid=["TODO"])
+        with open(os.path.join(self.root, "blob.bin"), "wb") as f:
+            f.write(b"\0TODO\0")
+        self.assertEqual([], self.hits())
+
+    def test_a_gate_without_forbid_scans_nothing(self):
+        self.assertEqual([], workflow.forbid_hits(self.root, self.config(), {}, {"command": "exit 0"}))
+
+    def test_a_git_failure_makes_the_gate_broken(self):
+        self.start_implement()
+        self.write("src/A.kt", '@Suppress("a")\n')
+        workflow.update_state(self.root, lambda s: s.update(baseRef="0" * 40))
+        self.stop()
+        state = self.state()
+        self.assertEqual("paused", state["status"])
+        self.assertIn("added lines cannot be determined", state["pausedFor"]["reason"])
+        self.assertEqual(0, self.marker("lint"))
+
+    def test_fail_fast_stops_after_a_forbid_failure(self):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": {"failFast": True, "gates": {
+                             "lint": self.counting("lint", "exit 0", forbid=["TODO"]),
+                             "tests": self.counting("tests", "exit 0")}}})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.stop()
+        self.write("a.txt", "TODO\n")
+        self.stop()
+        self.assertEqual(0, self.marker("tests"))
+
+
+class FeatureForbidTest(ChangedFilesProject):
+    """In feature mode a gate that runs on each step compares with HEAD: earlier steps' lines do not count."""
+
+    def test_only_lines_added_in_the_current_step_count(self):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": {"gates": {"lint": {"command": "exit 0", "forbid": ["TODO"]},
+                                               "whole": {"command": "exit 0", "forbid": ["TODO"], "steps": "last"}}}})
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "# Plan")
+        self.write(self.run_file("steps.json"), json.dumps({"feature": "F", "steps": [step_entry(1), step_entry(2)]}))
+        self.stop()
+        workflow.cmd_go(self.root)
+        self.write("one.txt", "TODO one\n")
+        config, state = self.config(), self.state()
+
+        def places(name):
+            hits = workflow.forbid_hits(self.root, config, state, config["quality"]["gates"][name])
+            return [(h["path"], h["line"]) for h in hits]
+        self.assertEqual([("one.txt", 1)], places("lint"))
+        self.git("add", "one.txt")
+        self.git("commit", "-q", "-m", "step 1")
+        self.assertEqual([], places("lint"))
+        self.assertEqual([("one.txt", 1)], places("whole"))
+
+
 def value_gate(**extra):
     """A gate whose metric is the number in value.txt, read from its output."""
     return dict({"command": "echo value: $(cat value.txt)", "metric": {"pattern": r"value: ([0-9.]+)"}}, **extra)
