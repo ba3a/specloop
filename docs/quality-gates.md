@@ -32,7 +32,7 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 |-----|---------|---------|
 | `command` | required | Run with `shell` from the project root. |
 | `phases` | `["implement"]` | Phases whose exit is held by this gate, matched by name in the active graph. Each must exist in `phases` or `feature.stepPhases` and must not set `allowEdits`, because the agent could not fix a failure there. |
-| `steps` | `"each"` | Feature mode: `"each"` runs on every step, `"last"` only when no step is pending after the current one. Ignored in single mode. |
+| `steps` | `"each"` | Feature mode: `"each"` runs on every step, `"last"` only when no step is pending after the current one (see [Feature mode](#feature-mode)). Ignored in single mode. |
 | `level` | `"block"` | `"block"` fails the phase; `"warn"` reports and lets it pass. |
 | `timeoutSec` | `checkTimeoutSec` | Limit for this gate's command, a positive number of seconds. |
 | `hint` | none | Text added to the failure message, for example how to fix a finding properly. |
@@ -44,6 +44,17 @@ On a Stop, after the phase's `check` passes, the engine runs every gate whose `p
 - Exit code `0` is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, except 126 and 127, which make it [broken](#broken-gates).
 - With `failFast: false` every gate runs, so all failures are reported at once. With `failFast: true` the first failing `block` gate ends the run: later gates do not run and keep their previous results. A failing `warn` gate never ends the run.
 - The phase passes only if every `block` gate passes. Failing `warn` gates are named, with their log paths, in the message that announces the next phase.
+
+## Feature mode
+
+In feature mode the gates run in the `implement` step phase, before the step enters `review`, and a step that passes them is reviewed and committed as usual. A failing `block` gate keeps the step in `implement`; `maxIterations` applies per step. Planning and replanning (`feature-plan`, `feature-replan`) never run gates. See [Feature mode](feature-mode.md#step-cycle).
+
+`steps` chooses the steps a gate runs on:
+
+- `"each"` (the default) runs on every step.
+- `"last"` runs only when no step after the current one in the approved plan is still `pending`, so it runs once, on the last step, for example a slow end-to-end suite. A step whose status is not `pending` (`done`, `empty` or `active`) does not count as a later step.
+
+The engine reads the approved plan on each Stop, so a [replan](replanning.md) that adds a step moves a `"last"` gate to the new last step: it does not run on the step that used to be last, and runs on the new one. A replan that removes the steps after the current one does the opposite. `steps` is ignored in single mode, where every gate that names the phase runs.
 
 ## Failure reporting
 
@@ -99,3 +110,5 @@ A gate that only you define is added after the shared ones.
 
 - [Configuration](configuration.md): the configuration files, their layering and `checkTimeoutSec`.
 - [Phases](phases.md): the phase graph and the `check` that runs before the gates.
+- [Feature mode](feature-mode.md): the step cycle that runs the gates before review.
+- [Replanning](replanning.md): how a replan changes which step is the last.

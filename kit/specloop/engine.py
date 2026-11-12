@@ -1634,6 +1634,23 @@ def planning_phase(config, state):
     return not in_step(state) if is_feature(state) else state["phase"] == "plan"
 
 
+def on_last_step(state):
+    """True in a feature step when no step after the current one in approvedSteps is still pending. Read on each
+    Stop, so a replan that adds a step moves the answer to the new last step."""
+    index, _ = current_step(state)
+    if index is None:
+        return True
+    return not any(isinstance(step, dict) and step.get("status") == "pending"
+                   for step in state["approvedSteps"]["steps"][index + 1:])
+
+
+def gate_runs_on_step(gate, state):
+    """False for a `steps: "last"` gate on a feature step that is not the last. `steps` is ignored in single mode."""
+    if not (isinstance(gate, dict) and is_feature(state) and in_step(state)):
+        return True
+    return gate.get("steps", "each") != "last" or on_last_step(state)
+
+
 def selected_gates(config, state):
     """(name, gate) for every gate that holds the current phase, in declared order. A gate that is not an object
     or whose `phases` is not a list of names holds every phase, so it comes out broken instead of being skipped."""
@@ -1643,7 +1660,7 @@ def selected_gates(config, state):
     selected = []
     for name, gate in quality_gates(config).items():
         phases = gate.get("phases", DEFAULT_GATE_PHASES) if isinstance(gate, dict) else None
-        if not _string_list(phases) or phase in phases:
+        if (not _string_list(phases) or phase in phases) and gate_runs_on_step(gate, state):
             selected.append((name, gate))
     return selected
 

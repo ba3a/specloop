@@ -19,6 +19,9 @@ sys.path.insert(0, KIT)
 
 import engine as workflow  # noqa: E402
 
+sys.path.insert(0, HERE)
+import gitfixture  # noqa: E402
+
 # The two example gates of the spec (section 3.2).
 COVERAGE = {"command": "./gradlew koverLog", "metric": {"pattern": "coverage: ([0-9.]+)%", "min": 80}}
 ISSUES = {"command": "./gradlew detekt", "passExitCodes": [0, 2],
@@ -1038,6 +1041,214 @@ class MalformedConfigHooksTest(GateProject):
                     if out.strip():
                         json.loads(out)
                 self.assertEqual("paused", self.state()["status"])
+
+
+
+def step_entry(number):
+    return {"id": number, "title": "Step %d" % number, "description": "Work %d." % number,
+            "acceptance": ["It works"], "status": "pending"}
+
+
+@unittest.skipUnless(gitfixture.git_available(), "git not available")
+class FeatureGateTest(unittest.TestCase):
+    """Gates in feature mode: the implement step phase runs them before review."""
+
+    def setUp(self):
+        self.fx = gitfixture.GitFixture()
+        self.addCleanup(self.fx.cleanup)
+        self.root = self.fx.target
+        self.base = os.path.join(self.root, ".claude", "specloop")
+        shutil.copytree(KIT, self.base)
+        self.write("spec.md", "# Gated feature\n\nDo things.\n")
+        self.fx.git(self.root, "add", "spec.md")
+        self.fx.git(self.root, "commit", "-q", "-m", "initial")
+
+    def write(self, rel, text):
+        path = os.path.join(self.root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def run_file(self, name):
+        return os.path.join(".claude", "specloop", "run", name)
+
+    def state(self):
+        return workflow.load_state(self.root)
+
+    def config(self):
+        return workflow.load_config(self.root)
+
+    def marker(self, name):
+        """How often the gate `name` ran: it appends a line to a marker inside .git, outside the work tree."""
+        path = os.path.join(self.root, ".git", "ran-" + name)
+        if not os.path.exists(path):
+            return 0
+        with open(path) as f:
+            return len(f.read().split())
+
+    def counting(self, name, exit_code=0, **extra):
+        return dict(extra, command="echo x >> .git/ran-%s; echo %s-output; exit %d" % (name, name, exit_code))
+
+    def configure(self, gates, feature=None):
+        config = {"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                  "quality": {"gates": gates}}
+        if feature:
+            config["feature"] = feature
+        with open(os.path.join(self.base, "config.json"), "w") as f:
+            json.dump(config, f)
+
+    def steps(self, count=2):
+        return {"feature": "Gated", "steps": [step_entry(n) for n in range(1, count + 1)]}
+
+    def steps_file(self):
+        with open(os.path.join(self.base, "run", "steps.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def begin(self, gates, count=2, feature=None):
+        """Start a feature run and approve its plan; step 1 is in implement."""
+        self.configure(gates, feature)
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "# Plan")
+        self.write(self.run_file("steps.json"), json.dumps(self.steps(count)))
+        workflow.handle_stop(self.root, {})
+        workflow.cmd_go(self.root)
+        self.assertEqual(("implement", 1), (self.state()["phase"], self.state()["stepId"]))
+
+    def stop(self):
+        return workflow.handle_stop(self.root, {})
+
+    def write_attempt(self, name, text):
+        attempt = os.path.relpath(workflow.attempt_path(self.root, self.state()), self.root)
+        self.write(os.path.join(attempt, name), text)
+
+    def approve_step(self):
+        """The reviewer approves the current step in review, and it is committed."""
+        self.assertEqual("review", self.state()["phase"])
+        self.write_attempt("review.md", "Fine.\nVERDICT: APPROVE")
+        return self.stop()
+
+    def finish_step(self):
+        """Stop in implement with a change to commit, then approve the review."""
+        self.write("work-%d.txt" % self.state()["stepId"], "work\n")
+        out = self.stop()
+        self.assertIn("entering phase 'review'", out["reason"])
+        return self.approve_step()
+
+    def request_replan(self):
+        self.write("wip.txt", "wip\n")
+        self.write_attempt("replan.md", "Rework the plan.\n")
+        return self.stop()
+
+    def test_failing_block_gate_keeps_the_step_in_implement(self):
+        self.begin({"tests": self.counting("tests", 1, hint="Fix it.")})
+        out = self.stop()
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: tests", out["reason"])
+        with open(os.path.join(self.base, "run", "last-failure.md"), encoding="utf-8") as f:
+            self.assertIn("tests-output", f.read())
+        state = self.state()
+        self.assertEqual(("implement", 1, 1), (state["phase"], state["stepId"], state["iter"]))
+        self.assertEqual("fail", state["qualityResults"]["tests"]["result"])
+        self.assertEqual(1, state["qualityResults"]["tests"]["stepId"])
+
+    def test_passing_block_gate_enters_review(self):
+        self.begin({"tests": self.counting("tests")})
+        out = self.stop()
+        self.assertIn("entering phase 'review'", out["reason"])
+        self.assertEqual("review", self.state()["phase"])
+        self.assertEqual("pass", self.state()["qualityResults"]["tests"]["result"])
+        self.assertEqual(1, self.marker("tests"))
+
+    def test_gate_runs_on_every_step_by_default(self):
+        self.begin({"tests": self.counting("tests")})
+        self.finish_step()
+        self.assertEqual(2, self.state()["stepId"])
+        self.finish_step()
+        self.assertEqual(2, self.marker("tests"))
+
+    def test_last_gate_runs_once_on_the_last_step_only(self):
+        self.begin({"final": self.counting("final", steps="last")})
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual(0, self.marker("final"))
+        self.assertNotIn("final", self.state().get("qualityResults", {}))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality", "final.log")))
+        self.approve_step()
+        self.assertEqual(2, self.state()["stepId"])
+        self.write("work.txt", "work\n")
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual(1, self.marker("final"))
+        self.assertEqual(2, self.state()["qualityResults"]["final"]["stepId"])
+        self.approve_step()
+        self.assertEqual("done", self.state()["status"])
+        self.assertEqual(1, self.marker("final"))
+
+    def test_failing_last_gate_blocks_only_the_last_step(self):
+        self.begin({"final": self.counting("final", 1, steps="last")})
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.approve_step()
+        out = self.stop()
+        self.assertIn("Quality gates failed: final", out["reason"])
+        self.assertEqual(("implement", 2), (self.state()["phase"], self.state()["stepId"]))
+
+    def test_last_gate_moves_to_the_step_a_replan_adds(self):
+        self.begin({"final": self.counting("final", steps="last"), "each": self.counting("each")})
+        self.finish_step()
+        self.assertEqual(2, self.state()["stepId"])
+        # Step 2 asks for a replan that adds a third step, so step 2 is no longer the last one.
+        self.assertEqual("stalled", (self.request_replan(), self.state())[1]["status"])
+        data = self.steps_file()
+        data["steps"].append(step_entry(3))
+        self.write(self.run_file("steps.json"), json.dumps(data))
+        workflow.cmd_go(self.root)
+        self.assertEqual(("implement", 2), (self.state()["phase"], self.state()["stepId"]))
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual(0, self.marker("final"))
+        self.assertEqual(2, self.marker("each"))
+        self.approve_step()
+        self.assertEqual(3, self.state()["stepId"])
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual(1, self.marker("final"))
+        self.assertEqual(3, self.state()["qualityResults"]["final"]["stepId"])
+        self.approve_step()
+        self.assertEqual(("done", 1), (self.state()["status"], self.marker("final")))
+
+    def test_steps_is_ignored_in_single_mode(self):
+        self.configure({"final": self.counting("final", 1, steps="last")})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.assertIn("entering phase 'implement'", self.stop()["reason"])
+        out = self.stop()
+        self.assertIn("Quality gates failed: final", out["reason"])
+        self.assertEqual(1, self.marker("final"))
+
+    def test_gates_never_run_in_feature_plan(self):
+        self.configure({"all": self.counting("all", 1)})
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        workflow.cmd_go(self.root)
+        self.assertEqual("feature-plan", self.state()["phase"])
+        self.assertEqual([], workflow.selected_gates(self.config(), self.state()))
+        self.write(self.run_file("plan.md"), "# Plan")
+        self.write(self.run_file("steps.json"), json.dumps(self.steps()))
+        self.stop()
+        self.assertEqual("paused", self.state()["status"])
+        self.assertEqual(0, self.marker("all"))
+        self.assertNotIn("qualityResults", self.state())
+
+    def test_gates_never_run_in_feature_replan(self):
+        self.begin({"tests": self.counting("tests", 1)}, feature={"replan": "auto"})
+        self.assertIn("Quality gates failed", self.stop()["reason"])
+        self.assertEqual(1, self.marker("tests"))
+        self.assertIn("feature-replan", self.request_replan()["reason"])
+        self.assertEqual("feature-replan", self.state()["phase"])
+        self.assertEqual([], workflow.selected_gates(self.config(), self.state()))
+        data = self.steps_file()
+        data["steps"][1]["description"] = "Rewritten."
+        self.write(self.run_file("steps.json"), json.dumps(data))
+        self.assertIn("Replan adopted", self.stop()["reason"])
+        self.assertEqual(1, self.marker("tests"))
+        self.assertEqual("implement", self.state()["phase"])
 
 
 if __name__ == "__main__":
