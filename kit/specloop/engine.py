@@ -32,6 +32,7 @@ import collections
 import contextlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -1686,6 +1687,89 @@ def gate_record(state, name, result, exit_code, duration, **extra):
                  "phase": state["phase"], "stepId": state.get("stepId"), "finishedAt": now()}, **extra)
 
 
+def _metric_number(value):
+    """The finite number `value` stands for, or None. A bool, a string and null are not numbers."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    return None
+
+
+def _number_text(value):
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else "%.10g" % value
+    return str(value)
+
+
+def _metric_from_pattern(metric, text):
+    """(value, None) from the first group of the last match, or (None, why not)."""
+    match = None
+    for match in re.finditer(metric["pattern"], text):
+        pass
+    if match is None:
+        return None, "pattern %r matches nothing in the %s" % (metric["pattern"], metric_source_text(metric))
+    group = match.group(1)
+    try:
+        value = _metric_number(float(group)) if group is not None else None
+    except ValueError:
+        value = None
+    if value is None:
+        return None, "pattern %r captured %r, which is not a number" % (metric["pattern"], group)
+    return value, None
+
+
+def _metric_from_json(metric, text):
+    """(value, None) from the dotted key path of a JSON document, or (None, why not)."""
+    try:
+        node = json.loads(text.lstrip("﻿"))
+    except ValueError as e:
+        return None, "the %s is not valid JSON (%s)" % (metric_source_text(metric), e)
+    path = metric["json"]
+    for key in path.split("."):
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+        elif isinstance(node, list) and key.isdigit() and int(key) < len(node):
+            node = node[int(key)]
+        else:
+            return None, "the JSON key %r is missing in the %s" % (path, metric_source_text(metric))
+    value = _metric_number(node)
+    if value is None:
+        return None, "the JSON value at %r is not a number: %s" % (path, json.dumps(node)[:80])
+    return value, None
+
+
+def metric_source_text(metric):
+    return "file %s" % metric["file"] if metric.get("file") else "gate output"
+
+
+def read_metric(root, metric, output):
+    """Read the number a gate's `metric` asks for. Return (value, None), or (None, reason) when the gate cannot
+    give an answer: a missing or unreadable file, no match, invalid JSON, a missing key or a value that is not a
+    number. Never raises."""
+    try:
+        text = output
+        if metric.get("file"):
+            rel = metric["file"]
+            if os.path.isabs(rel) or os.path.normpath(rel).split(os.sep)[0] == "..":
+                return None, "metric file %s is not inside the project" % rel
+            try:
+                with open(os.path.join(root, rel), "rb") as f:
+                    text = f.read().decode("utf-8", errors="replace")
+            except OSError as e:
+                return None, "metric file %s cannot be read: %s" % (rel, e.strerror or e)
+        return _metric_from_pattern(metric, text) if "pattern" in metric else _metric_from_json(metric, text)
+    except Exception as e:  # a hostile pattern or document must not raise from the hook
+        return None, "the metric cannot be read: %s" % (str(e) or e.__class__.__name__)
+
+
+def metric_limit_message(metric, value):
+    """Why `value` is outside the inclusive limits of `metric`, or None when it is inside."""
+    if "min" in metric and value < metric["min"]:
+        return "metric %s is below the minimum %s" % (_number_text(value), _number_text(metric["min"]))
+    if "max" in metric and value > metric["max"]:
+        return "metric %s is above the maximum %s" % (_number_text(value), _number_text(metric["max"]))
+    return None
+
+
 def run_quality_gate(root, config, state, name, gate, budget_left=None):
     """Run one valid gate with no lock. Return (record, output): the record goes to state.qualityResults, the
     complete output to run/quality/<name>.log. Never raises. A gate that cannot give an answer (exit code 126 or
@@ -1719,15 +1803,30 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None):
         except (OSError, ValueError) as e:
             reason = "the command could not be run: %s" % e
             raw = ("[specloop] %s\n" % reason).encode("utf-8")
-    duration = time.monotonic() - started
-    write_gate_log(root, name, raw)
+    failed_level = "warn" if gate.get("level", "block") == "warn" else "fail"
+    value = None
     if reason:
         result = "broken"
-    elif exit_code == 0:
+    elif exit_code in gate.get("passExitCodes", [0]):
         result = "pass"
+        metric = gate.get("metric")
+        if isinstance(metric, dict):
+            value, why = read_metric(root, metric, raw.decode("utf-8", errors="replace"))
+            if why:
+                result, reason = "broken", why
+                raw += ("\n[specloop] %s\n" % why).encode("utf-8")
+            else:
+                limit = metric_limit_message(metric, value)
+                if limit:
+                    result = failed_level
+                    raw += ("\n[specloop] %s\n" % limit).encode("utf-8")
     else:
-        result = "warn" if gate.get("level", "block") == "warn" else "fail"
+        result = failed_level
+    duration = time.monotonic() - started
+    write_gate_log(root, name, raw)
     record = gate_record(state, name, result, exit_code, duration)
+    if value is not None:
+        record["metric"] = value
     if reason:
         record["reason"] = reason
     if timed_out:

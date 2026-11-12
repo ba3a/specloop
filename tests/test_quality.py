@@ -28,6 +28,34 @@ ISSUES = {"command": "./gradlew detekt", "passExitCodes": [0, 2],
           "metric": {"file": "build/reports/detekt/detekt.json", "json": "summary.total", "max": 0}}
 
 
+# A small Python script that stands in for the tools of the spec's section 3.2. `kover` prints the coverage found in
+# kover.txt like koverLog does; `detekt` writes a JSON report with as many issues as issues.txt says and exits 2
+# when there are any, like detekt with its default maxIssues.
+FAKE_TOOLS = """
+import json, os, sys
+
+def number(name):
+    with open(name) as f:
+        return f.read().strip()
+
+if sys.argv[1] == "kover":
+    print("> Task :koverLog")
+    print("coverage: %s%%" % number("kover.txt"))
+elif sys.argv[1] == "detekt":
+    total = int(number("issues.txt"))
+    os.makedirs("build/reports/detekt", exist_ok=True)
+    with open("build/reports/detekt/detekt.json", "w") as f:
+        json.dump({"summary": {"total": total}}, f)
+    if total:
+        print("Foo.kt:3 MagicNumber (%d issues in total)" % total)
+        sys.exit(2)
+"""
+
+
+def fake_command(tool):
+    return '"%s" fake_tools.py %s' % (sys.executable.replace("\\", "/"), tool)
+
+
 class QualityProject(unittest.TestCase):
     """A throwaway project with the kit installed and no git repository."""
 
@@ -854,6 +882,255 @@ class BrokenGateTest(GateProject):
         self.assertNotIn("qualityResults", state)
 
 
+class MetricGateTest(GateProject):
+    """passExitCodes and metric: the exit code decides, then a number may add a limit."""
+
+    def stop_gate(self, gate, **top):
+        """Run one gate `g` on a Stop of implement and return the Stop's output."""
+        self.configure({"g": gate}, **top)
+        self.start_implement()
+        self.iter0 = self.state()["iter"]
+        return workflow.handle_stop(self.root, {})
+
+    def assertEntersReview(self, out):
+        self.assertIn("entering phase 'review'", out.get("reason", ""))
+        self.assertEqual("review", self.state()["phase"])
+
+    def assertFails(self, out, fragment=None):
+        self.assertEqual("block", out.get("decision"), out)
+        self.assertEqual("implement", self.state()["phase"])
+        self.assertEqual("fail", self.state()["qualityResults"]["g"]["result"])
+        if fragment:
+            self.assertIn(fragment, out["reason"])
+
+    def assertBroken(self, out, fragment, gate="g"):
+        state = self.state()
+        self.assertNotIn("decision", out)
+        self.assertEqual("paused", state["status"])
+        self.assertEqual(gate, state["pausedFor"]["gate"])
+        self.assertIn(fragment, state["pausedFor"]["reason"])
+        self.assertEqual("broken", state["qualityResults"][gate]["result"])
+        self.assertEqual(self.iter0, state["iter"])
+        self.assertNotIn("metric", state["qualityResults"][gate])
+        self.assertIn(fragment, out["systemMessage"])
+
+    def reset(self):
+        self.tearDown()
+        self.setUp()
+
+    # passExitCodes
+
+    def test_a_listed_exit_code_counts_as_a_pass(self):
+        self.assertEntersReview(self.stop_gate({"command": "exit 2", "passExitCodes": [0, 2]}))
+        result = self.state()["qualityResults"]["g"]
+        self.assertEqual(("pass", 2), (result["result"], result["exitCode"]))
+
+    def test_an_unlisted_exit_code_fails(self):
+        self.assertFails(self.stop_gate({"command": "exit 3", "passExitCodes": [0, 2]}), "Quality gates failed: g")
+
+    def test_exit_code_zero_fails_when_it_is_not_listed(self):
+        self.assertFails(self.stop_gate({"command": "exit 0", "passExitCodes": [2]}))
+
+    def test_exit_code_zero_is_the_default(self):
+        self.assertFails(self.stop_gate({"command": "exit 2"}))
+
+    def test_a_failing_exit_code_at_level_warn_only_warns(self):
+        self.assertEntersReview(self.stop_gate({"command": "exit 3", "passExitCodes": [2], "level": "warn"}))
+        self.assertEqual("warn", self.state()["qualityResults"]["g"]["result"])
+
+    def test_127_stays_broken_even_with_pass_exit_codes(self):
+        out = self.stop_gate({"command": "exit 127", "passExitCodes": [0, 2]})
+        self.assertBroken(out, "command not found (exit 127)")
+
+    # pattern
+
+    def test_pattern_uses_the_first_group_of_the_last_match(self):
+        command = "echo 'coverage: 95% of 7'; echo 'coverage: 85.5% of 3'"
+        out = self.stop_gate({"command": command, "metric": {"pattern": r"coverage: ([0-9.]+)% of (\d)", "min": 80}})
+        self.assertEntersReview(out)
+        self.assertEqual(85.5, self.state()["qualityResults"]["g"]["metric"])
+
+    def test_pattern_takes_the_last_match_not_the_best(self):
+        command = "echo 'coverage: 95%'; echo 'coverage: 60%'"
+        out = self.stop_gate({"command": command, "metric": {"pattern": "coverage: ([0-9.]+)%", "min": 80}})
+        self.assertFails(out, "metric 60 is below the minimum 80")
+        self.assertEqual(60, self.state()["qualityResults"]["g"]["metric"])
+
+    def test_pattern_reads_stderr_too(self):
+        out = self.stop_gate({"command": "echo 'value: 5' >&2", "metric": {"pattern": r"value: (\d+)", "max": 5}})
+        self.assertEntersReview(out)
+
+    # json and file
+
+    def test_json_follows_a_dotted_path_in_the_output(self):
+        command = """echo '{"summary": {"total": 4}, "list": [7, 8]}'"""
+        self.assertFails(self.stop_gate({"command": command, "metric": {"json": "summary.total", "max": 3}}),
+                         "metric 4 is above the maximum 3")
+
+    def test_json_path_may_index_a_list(self):
+        command = """echo '{"list": [7, 8]}'"""
+        self.assertEntersReview(self.stop_gate({"command": command, "metric": {"json": "list.1", "min": 8}}))
+        self.assertEqual(8, self.state()["qualityResults"]["g"]["metric"])
+
+    def test_file_is_read_instead_of_the_output(self):
+        with open(os.path.join(self.root, "report.txt"), "w") as f:
+            f.write("coverage: 90%")
+        metric = {"file": "report.txt", "pattern": r"coverage: (\d+)%", "min": 80}
+        self.assertEntersReview(self.stop_gate({"command": "echo 'coverage: 10%'", "metric": metric}))
+        self.assertEqual(90, self.state()["qualityResults"]["g"]["metric"])
+
+    def test_file_is_relative_to_the_project_root(self):
+        os.makedirs(os.path.join(self.root, "build", "reports"))
+        with open(os.path.join(self.root, "build", "reports", "r.json"), "w") as f:
+            f.write('{"n": 2}')
+        out = self.stop_gate({"command": "exit 0", "metric": {"file": "build/reports/r.json", "json": "n", "max": 2}})
+        self.assertEntersReview(out)
+
+    # limits
+
+    def test_limits_are_inclusive(self):
+        for value, limits, passes in ((80, {"min": 80}, True), (79.9, {"min": 80}, False),
+                                      (3, {"max": 3}, True), (3.1, {"max": 3}, False),
+                                      (5, {"min": 5, "max": 5}, True)):
+            with self.subTest(value=value, limits=limits):
+                self.reset()
+                metric = dict(limits, pattern="v=([0-9.]+)")
+                out = self.stop_gate({"command": "echo v=%s" % value, "metric": metric})
+                if passes:
+                    self.assertEntersReview(out)
+                else:
+                    self.assertFails(out)
+
+    def test_the_message_shows_value_and_limit(self):
+        out = self.stop_gate({"command": "echo 'coverage: 75.25%'", "hint": "Add tests.",
+                              "metric": {"pattern": "coverage: ([0-9.]+)%", "min": 80}})
+        self.assertFails(out, "metric 75.25 is below the minimum 80")
+        self.assertIn("Add tests.", out["reason"])
+        self.assertIn("metric 75.25 is below the minimum 80", self.read(self.run_path("last-failure.md")))
+        self.assertIn("metric 75.25 is below the minimum 80", self.read(self.run_path("quality", "g.log")))
+        self.assertEqual(self.iter0 + 1, self.state()["iter"])
+
+    def test_a_value_outside_the_limits_at_level_warn_only_warns(self):
+        out = self.stop_gate({"command": "echo v=9", "level": "warn", "metric": {"pattern": r"v=(\d)", "max": 1}})
+        self.assertEntersReview(out)
+        self.assertEqual("warn", self.state()["qualityResults"]["g"]["result"])
+        self.assertEqual(9, self.state()["qualityResults"]["g"]["metric"])
+
+    def test_the_metric_is_recorded_for_a_passing_gate(self):
+        self.assertEntersReview(self.stop_gate({"command": "echo v=7", "metric": {"pattern": r"v=(\d)", "min": 1}}))
+        result = self.state()["qualityResults"]["g"]
+        self.assertEqual(("pass", 7), (result["result"], result["metric"]))
+
+    def test_a_gate_without_a_metric_records_none(self):
+        self.assertEntersReview(self.stop_gate({"command": "exit 0"}))
+        self.assertNotIn("metric", self.state()["qualityResults"]["g"])
+
+    def test_the_metric_is_not_read_when_the_exit_code_fails(self):
+        out = self.stop_gate({"command": "exit 1", "metric": {"file": "missing.json", "json": "n", "max": 0}})
+        self.assertFails(out)
+        self.assertNotIn("pausedFor", self.state())
+
+    # broken
+
+    def test_a_missing_file_is_broken(self):
+        out = self.stop_gate({"command": "exit 0", "metric": {"file": "build/none.json", "json": "n", "max": 0}})
+        self.assertBroken(out, "build/none.json")
+
+    def test_a_file_outside_the_project_is_broken(self):
+        out = self.stop_gate({"command": "exit 0", "metric": {"file": "../x.json", "json": "n", "max": 0}})
+        self.assertBroken(out, "not inside the project")
+
+    def test_no_match_is_broken(self):
+        out = self.stop_gate({"command": "echo nothing here", "metric": {"pattern": r"coverage: (\d+)", "min": 1}})
+        self.assertBroken(out, "matches nothing")
+
+    def test_a_group_that_is_not_a_number_is_broken(self):
+        out = self.stop_gate({"command": "echo coverage: n/a", "metric": {"pattern": r"coverage: (\S+)", "min": 1}})
+        self.assertBroken(out, "not a number")
+
+    def test_a_group_that_did_not_take_part_is_broken(self):
+        out = self.stop_gate({"command": "echo a", "metric": {"pattern": "a|(b)", "min": 1}})
+        self.assertBroken(out, "not a number")
+
+    def test_invalid_json_is_broken(self):
+        out = self.stop_gate({"command": "echo 'not json'", "metric": {"json": "n", "max": 0}})
+        self.assertBroken(out, "not valid JSON")
+
+    def test_a_missing_key_is_broken(self):
+        out = self.stop_gate({"command": """echo '{"a": {"b": 1}}'""", "metric": {"json": "a.c", "max": 0}})
+        self.assertBroken(out, "a.c")
+
+    def test_a_json_value_that_is_not_a_number_is_broken(self):
+        for text in ('"4"', "true", "null", "[1]", "NaN"):
+            with self.subTest(text=text):
+                self.reset()
+                command = """echo '{"n": %s}'""" % text
+                out = self.stop_gate({"command": command, "metric": {"json": "n", "max": 0}})
+                self.assertBroken(out, "not a number")
+
+    def test_a_broken_metric_at_level_warn_pauses_too(self):
+        out = self.stop_gate({"command": "echo nothing", "level": "warn", "metric": {"pattern": r"(\d+)", "max": 1}})
+        self.assertBroken(out, "matches nothing")
+
+    def test_a_broken_metric_is_logged_and_go_retries(self):
+        out = self.stop_gate({"command": "echo nothing", "metric": {"pattern": r"(\d+)", "max": 1}})
+        self.assertBroken(out, "matches nothing")
+        self.assertIn("matches nothing", self.read(self.run_path("quality", "g.log")))
+        self.assertFalse(os.path.exists(self.run_path("last-failure.md")))
+        self.configure({"g": {"command": "echo 3", "metric": {"pattern": r"(\d+)", "max": 5}}})
+        workflow.cmd_go(self.root)
+        self.assertEntersReview(workflow.handle_stop(self.root, {}))
+
+    # the spec's examples (section 3.2), each with a stand-in for its tool
+
+    def write_tools(self, kover=None, issues=None):
+        with open(os.path.join(self.root, "fake_tools.py"), "w") as f:
+            f.write(FAKE_TOOLS)
+        self.set_tool(kover, issues)
+
+    def set_tool(self, kover=None, issues=None):
+        for name, value in (("kover.txt", kover), ("issues.txt", issues)):
+            if value is not None:
+                with open(os.path.join(self.root, name), "w") as f:
+                    f.write(str(value))
+
+    def test_spec_example_coverage_gate(self):
+        self.configure({"coverage": dict(COVERAGE, command=fake_command("kover"))})
+        self.write_tools(kover="79.9")
+        self.start_implement()
+        out = workflow.handle_stop(self.root, {})
+        self.assertEqual("block", out["decision"])
+        self.assertIn("metric 79.9 is below the minimum 80", out["reason"])
+        self.assertEqual(79.9, self.state()["qualityResults"]["coverage"]["metric"])
+        self.set_tool(kover="80.0")
+        self.assertEntersReview(workflow.handle_stop(self.root, {}))
+        self.assertEqual(80, self.state()["qualityResults"]["coverage"]["metric"])
+
+    def test_spec_example_issues_gate_blocks_implement_until_the_report_shows_zero(self):
+        self.configure({"issues": dict(ISSUES, command=fake_command("detekt"))})
+        self.write_tools(issues=3)
+        self.start_implement()
+        iter0 = self.state()["iter"]
+        for expected_iter in (iter0 + 1, iter0 + 2):
+            out = workflow.handle_stop(self.root, {})
+            self.assertEqual("block", out["decision"])
+            self.assertIn("MagicNumber (3 issues in total)", out["reason"])
+            self.assertIn("metric 3 is above the maximum 0", out["reason"])
+            self.assertEqual(("implement", expected_iter), (self.state()["phase"], self.state()["iter"]))
+        self.set_tool(issues=1)
+        self.assertIn("metric 1 is above", workflow.handle_stop(self.root, {})["reason"])
+        self.set_tool(issues=0)
+        self.assertEntersReview(workflow.handle_stop(self.root, {}))
+        result = self.state()["qualityResults"]["issues"]
+        self.assertEqual(("pass", 0, 0), (result["result"], result["exitCode"], result["metric"]))
+
+    def test_spec_example_issues_gate_without_a_report_is_broken(self):
+        self.configure({"issues": dict(ISSUES, command="exit 2")})
+        self.start_implement()
+        self.iter0 = self.state()["iter"]
+        self.assertBroken(workflow.handle_stop(self.root, {}), "detekt.json", gate="issues")
+
+
 class BudgetTest(GateProject):
     """quality.timeoutSec is one time budget for all gates of a Stop, capped by the installed Stop hook."""
 
@@ -1249,6 +1526,34 @@ class FeatureGateTest(unittest.TestCase):
         self.assertIn("Replan adopted", self.stop()["reason"])
         self.assertEqual(1, self.marker("tests"))
         self.assertEqual("implement", self.state()["phase"])
+
+
+    def test_spec_example_issues_gate_blocks_a_step_until_the_report_shows_zero(self):
+        self.write("fake_tools.py", FAKE_TOOLS)
+        self.begin({"issues": dict(ISSUES, command=fake_command("detekt"))})
+        self.write("issues.txt", "2")
+        out = self.stop()
+        self.assertEqual("block", out["decision"])
+        self.assertIn("Quality gates failed: issues", out["reason"])
+        with open(os.path.join(self.base, "run", "last-failure.md"), encoding="utf-8") as f:
+            findings = f.read()
+        self.assertIn("MagicNumber (2 issues in total)", findings)
+        self.assertIn("metric 2 is above the maximum 0", findings)
+        state = self.state()
+        self.assertEqual(("implement", 1, 1), (state["phase"], state["stepId"], state["iter"]))
+        self.write("issues.txt", "0")
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        result = self.state()["qualityResults"]["issues"]
+        self.assertEqual(("pass", 0, 0, 1), (result["result"], result["exitCode"], result["metric"],
+                                             result["stepId"]))
+        self.assertEqual("review", self.state()["phase"])
+
+    def test_a_broken_metric_pauses_a_step(self):
+        self.begin({"cov": {"command": "echo nothing", "metric": {"pattern": r"(\d+)", "min": 1}}})
+        self.stop()
+        state = self.state()
+        self.assertEqual(("paused", "cov", 0), (state["status"], state["pausedFor"]["gate"], state["iter"]))
+        self.assertIn("matches nothing", state["pausedFor"]["reason"])
 
 
 if __name__ == "__main__":

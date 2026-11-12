@@ -36,12 +36,14 @@ Gate names match `[A-Za-z0-9][A-Za-z0-9_-]*`, because they become file names.
 | `level` | `"block"` | `"block"` fails the phase; `"warn"` reports and lets it pass. |
 | `timeoutSec` | `checkTimeoutSec` | Limit for this gate's command, a positive number of seconds. |
 | `hint` | none | Text added to the failure message, for example how to fix a finding properly. |
+| `passExitCodes` | `[0]` | Exit codes that count as success. 126 and 127 can never be listed; see [Pass criteria](#pass-criteria). |
+| `metric` | none | A threshold on a number the gate reports; see [Pass criteria](#pass-criteria). |
 
 ## Running gates
 
 On a Stop, after the phase's `check` passes, the engine runs every gate whose `phases` list names the current phase, in declared order. Planning phases (`plan`, `feature-plan`, `feature-replan`) never run gates, and a failed `check` stops the Stop before any gate runs. Each gate runs its `command` with `shell` from the project root, with stderr merged into stdout, for at most its `timeoutSec` and the [time budget](#time-budget) that is left. No lock is held while gates run.
 
-- Exit code `0` is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, except 126 and 127, which make it [broken](#broken-gates).
+- An exit code listed in `passExitCodes` (by default only `0`) is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, except 126 and 127, which make it [broken](#broken-gates). A `metric` can still fail a gate that passed by exit code; see [Pass criteria](#pass-criteria).
 - With `failFast: false` every gate runs, so all failures are reported at once. With `failFast: true` the first failing `block` gate ends the run: later gates do not run and keep their previous results. A failing `warn` gate never ends the run.
 - The phase passes only if every `block` gate passes. Failing `warn` gates are named, with their log paths, in the message that announces the next phase.
 
@@ -62,7 +64,47 @@ A failed gate run counts as one failed check, however many gates failed: the sto
 
 The message starts with one line that names every failed gate, for example `Quality gates failed: lint, tests`, so a [delegated phase](delegation.md), which shows only that line, still names them all. Then it lists each failed gate with its `hint` and the end of its output, followed by failing `warn` gates; the whole message stays within `maxOutputChars`. The complete text, with every gate's full output, goes to `run/last-failure.md` (see [Phases](phases.md#runlast-failuremd)).
 
-Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail`, `warn` or `broken`, with a `reason` when broken), `exitCode`, `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
+Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.log`, replaced each time the gate runs. The last result of each gate is stored in `state.json` under `qualityResults`: its `result` (`pass`, `fail`, `warn` or `broken`, with a `reason` when broken), `exitCode`, `metric` (the value read, when the gate has a [metric](#pass-criteria)), `durationSec`, the `phase` and `stepId` it ran for, and `finishedAt`. A result is recorded only if the workflow did not change while the gates ran (see [Several chats in one project](multiple-chats.md#state-files)); a dropped result may leave logs on disk, but state stays as it was.
+
+## Pass criteria
+
+By default the exit code decides, so a tool's own threshold works unchanged, for example detekt's `maxIssues`. Two keys refine that:
+
+- `passExitCodes` lists the exit codes that count as success, `[0]` by default. A tool that exits 2 when it finds issues but writes a report can list `[0, 2]`, so that the report, not the exit code, decides. 126 and 127 can never be listed: they stay [broken](#broken-gates).
+- `metric` adds a number and its limits. It is read only when the exit code is a pass; an exit code that is not listed fails the gate before any metric is read.
+
+| `metric` key | Meaning |
+|--------------|---------|
+| `pattern` | Regular expression whose first group is the number. The last match counts, since summaries come last. The text is the gate's output (stdout and stderr), or the file named by `file`. |
+| `json` | Dotted key path into a JSON document, for example `summary.total`. A numeric segment indexes a list. The document is the gate's output, or the file named by `file`. |
+| `file` | Optional project-relative path (forward slashes, inside the project). Without it the gate's output is read. |
+| `min`, `max` | Inclusive limits; at least one is required. |
+
+Exactly one of `pattern` and `json` is required. A value outside the limits fails the gate at the gate's `level`, and the message and `run/quality/<gate>.log` show the value and the limit, for example `metric 79.9 is below the minimum 80`. A metric that cannot be read makes the gate [broken](#broken-gates), because the agent cannot fix a harness that stopped reporting. The value read is stored in the gate's `qualityResults` entry as `metric`.
+
+A Kotlin project can hold coverage and detekt findings like this. `koverLog` prints a summary, so a pattern reads it; detekt exits 2 when it finds issues, and its JSON report decides:
+
+```json
+{
+  "quality": {
+    "gates": {
+      "coverage": {
+        "command": "./gradlew koverLog",
+        "metric": { "pattern": "coverage: ([0-9.]+)%", "min": 80 },
+        "hint": "Add tests for the code you changed."
+      },
+      "issues": {
+        "command": "./gradlew detekt",
+        "passExitCodes": [0, 2],
+        "metric": { "file": "build/reports/detekt/detekt.json", "json": "summary.total", "max": 0 },
+        "hint": "Fix the findings; do not suppress them."
+      }
+    }
+  }
+}
+```
+
+With the `issues` gate the phase cannot be left, in single mode or in a feature step, while the report shows issues: the agent receives the findings and works on them, and review starts once the report shows 0. If detekt does not write the report, the gate is broken and the run pauses.
 
 ## Broken gates
 
@@ -71,6 +113,7 @@ A gate is `broken` when it cannot give an answer, so neither the agent nor a ret
 - its command exits with 126 or 127, the shell's codes for "not executable" and "not found", for example a tool that is not installed;
 - it runs longer than its `timeoutSec` and is killed with every process it started;
 - its command cannot be started at all, for example because the `shell` does not exist;
+- its [metric](#pass-criteria) cannot be read: the file is missing, the pattern matches nothing, the document is not valid JSON, the key is missing or the value is not a number;
 - its definition is invalid when the Stop hook runs it. `/sl-go` validates the block (see [Validation](#validation)), but `config.json` or `config.local.json` may change afterwards. A gate that is not an object, or whose `phases` is not a list of phase names, counts in every phase that runs gates. An invalid key of the block itself, such as `failFast`, makes every gate of the phase broken, and a `quality` or `gates` value that is not an object pauses the run in every such phase.
 
 Any other exit code is an ordinary failure, even when its cause is a missing plugin or a broken build script: a Gradle wrapper that exits 1 fails the gate, and the agent handles it.
