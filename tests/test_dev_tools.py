@@ -4,6 +4,7 @@ import ast
 import configparser
 import os
 import re
+import subprocess
 import unittest
 
 try:
@@ -115,6 +116,51 @@ class MypyConfigTest(unittest.TestCase):
     def test_sources_carry_no_type_ignore(self):
         for path in ("install.py", os.path.join("kit", "specloop", "engine.py"), os.path.join("tools", "check_rules.py")):
             self.assertNotIn("# type: ignore", read(path), path)
+
+
+class GitignoreTest(unittest.TestCase):
+    def ignored(self, path):
+        # --no-index: answer from the patterns alone, whatever is tracked or exists.
+        return subprocess.run(["git", "check-ignore", "-q", "--no-index", path], cwd=ROOT).returncode == 0
+
+    def test_claude_dir_is_ignored_except_specloop(self):
+        lines = read(".gitignore").splitlines()
+        self.assertIn(".claude/*", lines)
+        self.assertIn("!.claude/specloop/", lines)
+        self.assertNotIn(".claude/", lines)
+
+    def test_runtime_files_and_commands_stay_ignored(self):
+        for path in (".claude/specloop/state.json", ".claude/specloop/run/steps.json", ".claude/commands/sl-go.md",
+                     ".claude/settings.local.json"):
+            self.assertTrue(self.ignored(path), path)
+
+    def test_project_owned_specloop_files_are_not_ignored(self):
+        for path in (".claude/specloop/config.json", ".claude/specloop/overrides/implement.md"):
+            self.assertFalse(self.ignored(path), path)
+
+
+class ClaudeMdTest(unittest.TestCase):
+    def section(self, title):
+        text = read("CLAUDE.md")
+        start = text.index("## " + title)
+        end = text.find("\n## ", start + 1)
+        return text[start:end if end != -1 else len(text)]
+
+    def test_commands_list_dev_requirements_and_gates(self):
+        commands = self.section("Commands")
+        for cmd in ("pip install -r requirements-dev.txt", "python tools/check_rules.py", "python -m ruff check .", "python -m mypy"):
+            self.assertIn(cmd, commands)
+
+    def test_layout_lists_quality_files(self):
+        layout = self.section("Layout")
+        for name in ("kit/specloop/presets/", "kit/commands/quality.md", "tools/", "requirements-dev.txt", "ruff.toml", "mypy.ini"):
+            self.assertIn(name, layout)
+        self.assertEqual(layout.count("tools/check_rules.py"), 1)
+
+    def test_installed_layout_mentions_presets_and_quality_runtime_files(self):
+        text = read("CLAUDE.md")
+        self.assertIn("presets/", text.split("Installed layout in a target")[1])
+        self.assertIn("run/quality", text)
 
 
 if __name__ == "__main__":

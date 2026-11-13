@@ -3,8 +3,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 
-# specloop installed into this repository for testing; generated from kit/
-.claude/
+# specloop installed into this repository for testing; generated from kit/. The managed block
+# below decides inside .claude/specloop/, so config.json and overrides/ can be tracked.
+.claude/*
+!.claude/specloop/
 
 # working specifications for developing specloop itself
 specs/

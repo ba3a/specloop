@@ -16,15 +16,19 @@ VERSION                               kit version, copied into targets
 kit/specloop/engine.py                state machine: hook handlers + manual commands
 kit/specloop/run.sh                   portable launcher used by hooks and commands (finds Python)
 kit/specloop/defaults.json            default config and phase graph (replaced on update)
+kit/specloop/presets/*.json           shipped quality-gate presets, one per language (replaced on update)
 kit/specloop/phases/*.md              shipped phase instructions (replaced on update):
   plan.md, implement.md, review.md      single-mode phases
   feature-plan.md, feature-replan.md    feature-mode planning and replanning
   step-implement.md, step-review.md     feature-mode step cycle
   delegate.md                           orchestration preamble for delegated phases ({brief})
 kit/commands/*.md                     slash command templates; {{prefix}} is substituted on install
-                                      (spec, feature, go, pause, advance, status, reset, update)
+                                      (spec, feature, go, pause, advance, status, reset, update, quality)
                                       kit/commands/update.md is /sl-update (check, skip, never)
-tools/check_rules.py                  enforces the machine-checkable rules below on tracked files (stdlib only)
+                                      kit/commands/quality.md is /sl-quality (init, run, accept)
+tools/check_rules.py                  enforces the machine-checkable rules below on tracked files; development only, not installed
+requirements-dev.txt                  pinned ruff and mypy; development only, never imported by kit/ or install.py
+ruff.toml, mypy.ini                   configuration of the ruff and mypy gates
 tests/                                unittest suites for the engine, the installer and the docs
 tests/run_parallel.py                 runs the suites on several worker processes
 tests/gitfixture.py                   git repositories for update tests: built once per process, copied per test
@@ -34,7 +38,7 @@ docs/README.md                        documentation index: every page listed onc
 docs/<topic>.md                       one page per topic; the owner of the facts it describes
 ```
 
-Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,VERSION,manifest.json}` belong to the kit. `manifest.json` also records `source`: the clone that ran `install.py` (its path, version, remote, branch and `installArgs`, or `checkable: false` with a reason), which the update checker uses. `config.json` and `overrides/` belong to the project. `config.local.json` belongs to the person: a personal layer merged over `config.json`, git-ignored, and never created, changed or removed by the installer (the engine writes it only for `/sl-update never`). `state.json`, `state.lock`, `update.json`, `update.lock` and `run/` (including `run/attempts/`) are runtime state; `update.json` is the update checker's semaphore file.
+Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,presets/,VERSION,manifest.json}` belong to the kit. `manifest.json` also records `source`: the clone that ran `install.py` (its path, version, remote, branch and `installArgs`, or `checkable: false` with a reason), which the update checker uses. `config.json` and `overrides/` belong to the project. `config.local.json` belongs to the person: a personal layer merged over `config.json`, git-ignored, and never created, changed or removed by the installer (the engine writes it only for `/sl-update never`). `state.json` (which also holds the quality-gate keys `qualityBaseline`, `qualityFingerprints`, `qualityResults`, `qualityWaived`, `qualityAccepted` and `qualityAcceptedLog`), `state.lock`, `update.json`, `update.lock` and `run/` (including `run/attempts/`, `run/quality.md`, `run/quality/` and `run/quality-manual/`) are runtime state; `update.json` is the update checker's semaphore file.
 
 ## Commands
 
@@ -42,6 +46,10 @@ Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,
 python tests/run_parallel.py                  # run all tests on every CPU core (-j N, --durations N)
 python -m unittest discover -s tests          # run all tests in one process
 python -m unittest tests.test_engine -v       # one suite
+pip install -r requirements-dev.txt           # development tools: ruff and mypy, pinned
+python tools/check_rules.py                   # the machine-checkable rules below
+python -m ruff check .                        # lint (ruff.toml)
+python -m mypy                                # types (mypy.ini)
 ./install.sh /path/to/sandbox-project         # manual end-to-end check
 ```
 
