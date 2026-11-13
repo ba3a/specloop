@@ -334,9 +334,42 @@ The shipped `review.md` and `step-review.md` tell the reviewer to read `run/qual
 
 Gates can take minutes, longer than the time limit of the `!` line that starts a slash command, so the shipped template tells Claude to run `sh .claude/specloop/run.sh quality run [gate...]` through the Bash tool, in the foreground, with a timeout long enough for the gates. PreToolUse allows that call; only `quality accept` and `advance` are denied (see [Guard rails](guard-rails.md)).
 
+## Example: specloop's own gates
+
+specloop develops itself with four gates. The `quality` block for this repository's `.claude/specloop/config.json` is a complete, real example:
+
+```json
+{
+  "quality": {
+    "gates": {
+      "rules": { "command": "python tools/check_rules.py", "hint": "These are the rules in CLAUDE.md." },
+      "ruff": { "command": "python -m ruff check .", "protect": ["ruff.toml"], "forbid": [{ "pattern": "# noqa", "glob": ["*.py"] }] },
+      "mypy": { "command": "python -m mypy", "protect": ["mypy.ini"], "forbid": [{ "pattern": "# type: ignore", "glob": ["*.py"] }] },
+      "tests": { "command": "python -m unittest discover -s tests -q" }
+    }
+  }
+}
+```
+
+- `rules` runs `tools/check_rules.py`, which enforces the machine-checkable rules of `CLAUDE.md` (Python 3.8 grammar, the import allowlist, no hard-coded command names, line endings).
+- `ruff` and `mypy` are pinned in `requirements-dev.txt`, so `pip install -r requirements-dev.txt` installs them. Their settings are in `ruff.toml` and `mypy.ini`, which are `protect`ed: a run cannot pass a gate by loosening them. `forbid` rejects new `# noqa` and `# type: ignore` comments for the same reason.
+- mypy's `files` and `check_untyped_defs` settings live in the tracked `mypy.ini`, because `engine.py` has no annotations and mypy skips the body of an unannotated function without `check_untyped_defs`. This keeps the gate's command short.
+- `tests` replaces the `phases.implement.check` that this repository used before. A gate runs after a `check`, never instead of it, so the `check` is removed from `config.json`.
+
+The harness cannot be switched on from inside the run that builds it: `config.json` cannot be edited while a run is active (PreToolUse), `.claude/` is git-ignored here, and the installed engine lags behind `kit/`. After the run, by hand:
+
+1. Reinstall the kit into this repository: `./install.sh .`.
+2. Put the block above into `.claude/specloop/config.json` and remove `phases.implement.check` there.
+3. Run `/sl-quality run` and check that every gate passes.
+4. Commit `config.json`. `.gitignore` tracks `.claude/specloop/config.json` and `overrides/` only, so nothing else of the installation is committed.
+
 ## See also
 
 - [Configuration](configuration.md): the configuration files, their layering and `checkTimeoutSec`.
 - [Phases](phases.md): the phase graph and the `check` that runs before the gates.
 - [Feature mode](feature-mode.md): the step cycle that runs the gates before review.
 - [Replanning](replanning.md): how a replan changes which step is the last.
+- [Commands](commands.md#sl-quality): every form of `/sl-quality`.
+- [Guard rails](guard-rails.md#protected-quality-gate-files): the PreToolUse denials of protected files and of `advance` and `quality accept`.
+- [How it works](how-it-works.md#files-and-ownership): `run/quality.md`, `run/quality/`, `presets/` and the state keys the gates use.
+- [Hacks and limitations](limitations.md#pretooluse-is-only-early-feedback): why the denials are only early feedback.

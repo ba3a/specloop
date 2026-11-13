@@ -60,3 +60,4 @@ If specloop is busy (another process holds `state.lock`), a command prints one l
 - [Several chats in one project](multiple-chats.md): which chat may run which command.
 - [Updates](updates.md): the forms of `/sl-update`.
 - [Configuration](configuration.md): `commandPrefix`.
+- [Quality gates](quality-gates.md): what `/sl-quality` lists, runs and accepts.

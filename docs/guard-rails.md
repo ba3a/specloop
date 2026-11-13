@@ -48,3 +48,5 @@ On every Stop during a step, before the phase check runs, the engine compares `r
 - [Replanning](replanning.md): how the approved steps change legitimately.
 - [Delegating a phase](delegation.md): `feature.enforceDelegation` denies the main session's edits in delegated phases.
 - [Several chats in one project](multiple-chats.md): which rules apply in other chats.
+- [Quality gates](quality-gates.md): the `protect` and `forbid` keys behind the protected-file denials, and `/sl-quality accept`.
+- [Hacks and limitations](limitations.md#pretooluse-is-only-early-feedback): why these denials are only early feedback.

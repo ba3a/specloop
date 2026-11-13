@@ -28,4 +28,5 @@ Protection that matters therefore works when a gate runs: the engine compares th
 
 - [Delegating a phase](delegation.md): the key row for `feature.enforceDelegation` and the phase brief.
 - [Guard rails](guard-rails.md): the other PreToolUse rules, including the denials of protected paths and of the commands only the user may run.
+- [Quality gates](quality-gates.md#protected-files): the fingerprint check that protects gate files whatever tool changes them.
 - [Several chats in one project](multiple-chats.md#limits): limits of running several chats in one checkout.

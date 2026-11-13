@@ -12,13 +12,16 @@ The effective configuration is `defaults.json` (shipped with the kit and replace
   "maxIterations": 20,
   "checkTimeoutSec": 1200,
   "blockedCommandsUntilDone": ["git push", "gh pr create", "gh pr merge", "npm publish"],
-  "phases": {
-    "implement": {
-      "check": { "type": "command", "command": "./gradlew test -q && ./gradlew lint -q" }
+  "quality": {
+    "gates": {
+      "lint": { "command": "./gradlew lint -q", "hint": "Fix the findings; do not add suppressions." },
+      "tests": { "command": "./gradlew test -q" }
     }
   }
 }
 ```
+
+The `quality` block runs each tool as its own gate, so one failure does not hide the others, and a gate can have its own timeout, hint and threshold. A phase's `check` still works and runs first; see [Quality gates](quality-gates.md).
 
 ## Top-level keys
 
@@ -69,4 +72,4 @@ Settings that are yours belong in [`config.local.json`](#personal-configuration-
 - [Installation](installation.md): the installer options that create `config.json`.
 - [Phases](phases.md): the phase graph that `phases` configures.
 - [Updates](updates.md): the `update` block and the `CI` variable.
-- [Quality gates](quality-gates.md): the `quality` block and its validation.
+- [Quality gates](quality-gates.md): the `quality` block, its gate keys and its validation.

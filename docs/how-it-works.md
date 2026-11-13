@@ -53,7 +53,7 @@ Files in `<project>/.claude/specloop/`:
 
 Everything in this directory except `config.json` and `overrides/` is git-ignored.
 
-`state.json` holds, besides the workflow position, the state of [quality gates](quality-gates.md). `qualityBaseline` is one key: the value of each [ratchet](quality-gates.md#existing-problems) gate, measured once per run on the Stop that passes the planning phase and kept for the rest of the run. `qualityFingerprints` holds the SHA-256 of each [protected](quality-gates.md#protected-files) file and of the merged `quality` block, stored on the first `/sl-go`; a gate compares against it before its command runs.
+`state.json` holds, besides the workflow position, the state of [quality gates](quality-gates.md). `qualityBaseline` is one key: the value of each [ratchet](quality-gates.md#existing-problems) gate, measured once per run on the Stop that passes the planning phase and kept for the rest of the run. `qualityFingerprints` holds the SHA-256 of each [protected](quality-gates.md#protected-files) file and of the merged `quality` block, stored on the first `/sl-go`; a gate compares against it before its command runs. `qualityResults` is the last result of each gate, `qualityAccepted` the hashes of the forbidden lines a person accepted (with `qualityAcceptedLog`, the accepted changes), and `qualityWaived` the gates `/sl-advance` skipped. `pausedFor` names the gate and the reason while a [broken gate](quality-gates.md#broken-gates) pauses the run. In single mode `baseRef` and `preexistingUntracked`, recorded on the first `/sl-go` in a git repository, give `{changed_files}` its [comparison point](quality-gates.md#changed-files); feature mode records them when it creates its branch.
 
 ## See also
 
@@ -61,3 +61,4 @@ Everything in this directory except `config.json` and `overrides/` is git-ignore
 - [Review attempts](review-attempts.md): how a review is tied to one attempt.
 - [Configuration](configuration.md): how the configuration files are layered.
 - [Commands](commands.md): the slash commands that drive the workflow.
+- [Quality gates](quality-gates.md): the gates, their results, presets and the state keys above.

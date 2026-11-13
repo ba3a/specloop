@@ -54,7 +54,7 @@ When the plan passes its gate, the run pauses. Review or edit `run/plan.md` and 
 
 Each step runs through `feature.stepPhases`, starting at `feature.stepInitialPhase`. The default cycle mirrors single mode: `implement` (delegated, no edit restriction, checked with your test command from `phases.implement.check`), then `review` (delegated, edits limited to `run/`, verdict on `{attempt_dir}/review.md`; `CHANGES_REQUESTED` goes back to `implement`). A step phase without a `check` reuses the check of the top-level phase with the same name. You can add phases (for example a per-step `lint`) or remove one with `null`, as in the top-level graph. Instructions come from `phases/step-<phase>.md` (`step-implement.md`, `step-review.md`), overridable in `overrides/`, with these placeholders on top of `{spec}` and `{run_dir}`: `{step_index}` (1-based), `{step_count}`, `{step_id}`, `{step_title}`, `{step_description}`, `{step_acceptance}` (a bullet list) and `{steps_file}`. `maxIterations` applies per step.
 
-[Quality gates](quality-gates.md) run in the `implement` step phase after its `check` passes and before the step enters `review`: a failing `block` gate keeps the step in `implement`. A gate with `steps: "last"` runs only on the last step, even after a replan adds one (see [Feature mode](quality-gates.md#feature-mode)). Planning and replanning never run gates.
+[Quality gates](quality-gates.md) run in the `implement` step phase after its `check` passes and before the step enters `review`: a failing `block` gate keeps the step in `implement`. A gate with `steps: "last"` runs only on the last step, even after a replan adds one (see [Quality gates in feature mode](quality-gates.md#feature-mode)). Planning and replanning never run gates.
 
 When a step starts, the engine marks it `active`, resets the iteration counter, and moves the previous step's `run/last-failure.md` (and any `run/review*.md` from a fixed `check.path`) into `run/steps/<id>/`. Reviews stay in `run/attempts/` (see [Review attempts](review-attempts.md)). Status and commit changes are written both to `run/steps.json` and to `approvedSteps`.
 
@@ -116,3 +116,4 @@ The `feature` block of the [configuration](configuration.md). The keys for repla
 - [Delegating a phase](delegation.md): why feature phases run in subagents (`feature.enforceDelegation`).
 - [Size warnings](size-warnings.md): when to choose feature mode.
 - [Commands](commands.md): `/sl-feature`, `/sl-go` and `/sl-status`.
+- [Quality gates](quality-gates.md#feature-mode): the gates that run in each step before review, and `steps: "last"`.

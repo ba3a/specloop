@@ -1,3 +1,4 @@
+import ast
 import glob
 import json
 import os
@@ -444,6 +445,65 @@ class DocsTest(unittest.TestCase):
                        "configuration.md", "commands.md"):
             self.assertIn(needle, guide)
         self.assertNotIn("Update `README.md` whenever", guide)
+
+    def test_quality_gates_page_documents_every_key_and_example(self):
+        page = read(ROOT, "docs", "quality-gates.md")
+        rows = "\n".join(table_rows(page))
+        engine = ast.parse(read(ROOT, "kit", "specloop", "engine.py"))
+        keys = {}
+        for node in engine.body:
+            if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") in ("QUALITY_KEYS", "GATE_KEYS"):
+                keys[node.targets[0].id] = ast.literal_eval(node.value)
+        self.assertEqual({"QUALITY_KEYS", "GATE_KEYS"}, set(keys))
+        for key in keys["QUALITY_KEYS"]:
+            self.assertIn("`quality.%s`" % key, rows)
+        for key in keys["GATE_KEYS"]:
+            self.assertIn("| `%s` |" % key, rows)
+        for needle in ("./gradlew detekt", '"passExitCodes": [0, 2]', "detekt.json", "mypy.ini", "check_untyped_defs",
+                       "python tools/check_rules.py", "python -m ruff check .", "python -m mypy",
+                       "python -m unittest discover -s tests -q", "# noqa", "# type: ignore", "./install.sh .",
+                       "/sl-quality run", "phases.implement.check", "already modified", "large tree"):
+            self.assertIn(needle, page)
+
+    def test_quality_gates_page_and_the_pages_it_touches_link_to_each_other(self):
+        page = read(ROOT, "docs", "quality-gates.md")
+        for name in ("configuration", "commands", "phases", "guard-rails", "how-it-works", "feature-mode",
+                     "limitations"):
+            text = read(ROOT, "docs", name + ".md")
+            self.assertIn("(quality-gates.md", text, name)
+            self.assertIn("(%s.md" % name, page, name)
+            see_also = text.split("## See also", 1)[1]
+            self.assertIn("(quality-gates.md", see_also, name)
+        self.assertIn("(quality-gates.md", read(ROOT, "docs", "README.md"))
+
+    def test_the_pages_named_for_quality_gates_cover_their_part(self):
+        parts = {
+            "configuration": ("`quality`", '"quality"'),
+            "commands": ("/sl-quality accept", "/sl-quality init", "/sl-quality run"),
+            "phases": ("{quality_gates}", "Quality gates after the check"),
+            "guard-rails": ("run.sh advance", "run.sh quality accept", "`protect`"),
+            "how-it-works": ("run/quality.md", "run/quality/", "run/quality-manual/", "presets/", "qualityResults",
+                             "qualityBaseline", "qualityFingerprints", "qualityAccepted", "qualityWaived",
+                             "pausedFor", "baseRef"),
+            "feature-mode": ("[Quality gates](quality-gates.md)", 'steps: "last"'),
+            "limitations": ("PreToolUse is only early feedback", "sed -i"),
+        }
+        for name, needles in parts.items():
+            text = read(ROOT, "docs", name + ".md")
+            for needle in needles:
+                self.assertIn(needle, text, "%s: %s" % (name, needle))
+
+    def test_the_configuration_example_shows_a_gate_not_chained_commands(self):
+        text = read(ROOT, "docs", "configuration.md")
+        example = text.split("```json", 1)[1].split("```", 1)[0]
+        self.assertIn('"gates"', example)
+        self.assertNotIn("&&", example)
+
+    def test_the_changelog_has_one_added_section_for_unreleased(self):
+        text = read(ROOT, "CHANGELOG.md")
+        unreleased = text.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]
+        self.assertEqual(1, unreleased.count("### Added"))
+        self.assertIn("quality gates", unreleased.lower())
 
 
 if __name__ == "__main__":
