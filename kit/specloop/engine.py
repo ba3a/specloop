@@ -270,7 +270,7 @@ def load_state(root):
             return None
         except (ValueError, PermissionError) as e:
             if time.monotonic() >= deadline:
-                raise StateCorrupt(str(e))
+                raise StateCorrupt(str(e)) from e
             time.sleep(LOCK_POLL_SEC / 2)
 
 
@@ -1719,9 +1719,8 @@ def _number_text(value):
 
 def _metric_from_pattern(metric, text):
     """(value, None) from the first group of the last match, or (None, why not)."""
-    match = None
-    for match in re.finditer(metric["pattern"], text):
-        pass
+    matches = list(re.finditer(metric["pattern"], text))
+    match = matches[-1] if matches else None
     if match is None:
         return None, "pattern %r matches nothing in the %s" % (metric["pattern"], metric_source_text(metric))
     group = match.group(1)
@@ -2393,7 +2392,7 @@ def forbid_text(hits):
         lines.append("%s:%d: %s%s" % (hit["path"], hit["line"], text, "\n  " + hit["message"] if hit["message"] else ""))
     if len(hits) > len(lines):
         lines.append("... and %d more" % (len(hits) - len(lines)))
-    return "Forbidden patterns were added since the comparison point:\n" + "\n".join("- " + l for l in lines)
+    return "Forbidden patterns were added since the comparison point:\n" + "\n".join("- " + ln for ln in lines)
 
 
 def protection_record(state, name, result, reason, started):
@@ -3009,7 +3008,7 @@ def completion_message(config, state):
              for s in state["approvedSteps"]["steps"]]
     return ("All %d steps are finished on branch %s:\n%s\n\nReview the branch (git log --oneline %s..%s) "
             "and open a pull request when it is ready; specloop never pushes." % (
-                len(lines), state.get("branch"), "\n".join("  " + l for l in lines),
+                len(lines), state.get("branch"), "\n".join("  " + ln for ln in lines),
                 (state.get("baseRef") or "")[:7], state.get("branch")))
 
 

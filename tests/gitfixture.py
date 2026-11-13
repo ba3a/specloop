@@ -18,7 +18,6 @@ The template is packed, so a copy holds a few files instead of one per object.
 """
 
 import atexit
-
 import os
 import shutil
 import subprocess

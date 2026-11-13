@@ -778,7 +778,9 @@ class QualityReportTest(GateProject):
     def test_the_report_has_hooks_for_the_sections_later_steps_add(self):
         self.configure({"tests": {"command": "exit 0"}})
         self.start_implement()
-        with mock.patch.object(workflow, "quality_waived_lines", lambda state: ["## Waived", "- lint"]),                 mock.patch.object(workflow, "quality_accepted_lines", lambda state: ["## Accepted"]),                 mock.patch.object(workflow, "quality_baseline_lines", lambda config, state: ["No baseline."]):
+        with mock.patch.object(workflow, "quality_waived_lines", lambda state: ["## Waived", "- lint"]), \
+                mock.patch.object(workflow, "quality_accepted_lines", lambda state: ["## Accepted"]), \
+                mock.patch.object(workflow, "quality_baseline_lines", lambda config, state: ["No baseline."]):
             workflow.handle_stop(self.root, {})
         report = self.report()
         self.assertLess(report.index("No baseline."), report.index("## Waived"))
@@ -2993,7 +2995,7 @@ class PretoolProtectionTest(GateProject):
         phases.append(self.state()["phase"])
         self.assertEqual(["plan", "implement"], phases)
         for phase in phases:
-            workflow.update_state(self.root, lambda s: s.update(phase=phase))
+            workflow.update_state(self.root, lambda s, phase=phase: s.update(phase=phase))
             for tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
                 with self.subTest(phase=phase, tool=tool):
                     self.assertDenied(self.pretool(tool, self.full("detekt.yml")), "detekt.yml", "/sl-quality accept")
@@ -3471,7 +3473,7 @@ class QualityAcceptTest(ChangedFilesProject):
                 self.write("rules.yml", "maxIssues: 0\n")
                 self.start_implement()
                 self.write("rules.yml", "changed %s\n" % status)
-                workflow.update_state(self.root, lambda s: s.update(status=status))
+                workflow.update_state(self.root, lambda s, status=status: s.update(status=status))
                 self.assertIn("rules.yml (changed)", self.accept())
                 self.assertEqual(status, self.state()["status"])
 
@@ -3852,7 +3854,7 @@ class QualityRunTest(ChangedFilesProject):
             return f.read()
 
     def line(self, out, name):
-        return [l for l in out.splitlines() if l.startswith("  %s: " % name)][0]
+        return [ln for ln in out.splitlines() if ln.startswith("  %s: " % name)][0]
 
     def test_the_template_tells_claude_to_run_it_through_bash_with_a_timeout(self):
         with open(os.path.join(os.path.dirname(KIT), "commands", "quality.md"), encoding="utf-8") as f:

@@ -17,7 +17,7 @@ import ast
 import os
 import subprocess
 import sys
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Iterator, List, Optional, Set, Tuple
 
 # (path, line, rule, message); path uses forward slashes and is relative to the repository root.
 Violation = Tuple[str, int, str, str]

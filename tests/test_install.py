@@ -409,7 +409,7 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(self.fx.clone.replace("\\", "/"), source["path"])
         self.assertEqual(self.fx.read_version(), source["version"])
         self.assertNotIn("commit", source)
-        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        lines = [ln for ln in result.stdout.splitlines() if "update checks unavailable" in ln]
         self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
         self.assertIn("commands", manifest)
 
@@ -423,7 +423,7 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(copy.replace("\\", "/"), source["path"])
         self.assertFalse(source["checkable"])
         self.assertTrue(source["reason"])
-        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        lines = [ln for ln in result.stdout.splitlines() if "update checks unavailable" in ln]
         self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
         self.assertIn("commands", manifest)
         self.assertIn("settings", manifest)
@@ -437,7 +437,7 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(copy.replace("\\", "/"), source["path"])
         self.assertFalse(source["checkable"])
         self.assertIn("not the top of a git work tree", source["reason"])
-        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        lines = [ln for ln in result.stdout.splitlines() if "update checks unavailable" in ln]
         self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
 
 

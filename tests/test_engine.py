@@ -8,8 +8,8 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest import mock
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 KIT = os.path.join(os.path.dirname(HERE), "kit", "specloop")
@@ -631,7 +631,7 @@ class EngineTest(unittest.TestCase):
         files = workflow.phase_brief(self.root, config, state).split("## Files to read")[1]
         expected = ["spec.md", ".claude/specloop/run/plan.md", ".claude/specloop/run/review-2.md",
                     ".claude/specloop/run/review.md", ".claude/specloop/run/last-failure.md"]
-        self.assertEqual(["- `%s`" % p for p in expected], [l for l in files.splitlines() if l.startswith("- ")])
+        self.assertEqual(["- `%s`" % p for p in expected], [ln for ln in files.splitlines() if ln.startswith("- ")])
 
     def test_delegate_override_preamble_wins(self):
         self.write_override("delegate", "CUSTOM ORCHESTRATOR for {spec}\n{brief}")
