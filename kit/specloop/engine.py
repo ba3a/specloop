@@ -865,8 +865,12 @@ def review_file(config, state):
 
 
 def render_phase(text, config, state):
-    """_render for an instruction file, which may also use {review_file}."""
-    return _render(text, state, review_file=review_file(config, state))
+    """_render for an instruction file, which may also use {review_file} and {quality_gates}. A {quality_gates}
+    that renders as nothing takes its line and the blank line after it along, so no gap is left."""
+    gates = quality_gates_text(config, state)
+    if not gates:
+        text = re.sub(r"^\{quality_gates\}[ \t]*\r?\n(?:[ \t]*\r?\n)?", "", text, flags=re.MULTILINE)
+    return _render(text, state, review_file=review_file(config, state), quality_gates=gates)
 
 
 def phase_instructions(root, config, state):
@@ -892,6 +896,8 @@ def phase_brief(root, config, state):
         files.append(_rel("run", "steps.json"))
     if is_feature(state) and os.path.exists(replan_path(root, state)):
         files.append(_rel("run", ATTEMPTS_DIR, attempt_key(state), REPLAN_FILE))
+    if QUALITY_REPORT in names:
+        files.append(_rel("run", QUALITY_REPORT))
     files += [_rel("run", n) for n in names if n.startswith("review") and n.endswith(".md")]
     files += attempt_reviews(root, config, state)
     if FAILURE_FILE in names:
@@ -2242,6 +2248,56 @@ def forbid_entries(gate):
             continue
         entries.append((compiled, globs if _string_list(globs) else None, message if isinstance(message, str) else None))
     return entries
+
+
+def _one_line(text):
+    return " ".join(text.split())
+
+
+def quality_gates_text(config, state):
+    """The {quality_gates} placeholder: a Markdown list of the gates that run in the current phase and step, then
+    the protected paths and the forbidden patterns with their messages. Empty when no gate applies. Never raises."""
+    try:
+        return _quality_gates_text(config, state)
+    except Exception as e:
+        print("[specloop] could not list the quality gates: %s" % (str(e) or e.__class__.__name__), file=sys.stderr)
+        return ""
+
+
+def _quality_gates_text(config, state):
+    selected = [(name, gate) for name, gate in selected_gates(config, state) if isinstance(gate, dict)]
+    if not selected:
+        return ""
+    lines = ["### Quality gates", "",
+             "These gates run when you finish your turn. A `block` gate that fails sends you back; a `warn` gate "
+             "only warns, and the reviewer sees the warning.", ""]
+    for name, gate in selected:
+        command = gate.get("command")
+        line = "- `%s` (%s)" % (name, gate.get("level") if gate.get("level") in GATE_LEVELS else "block")
+        if isinstance(command, str) and command.strip():
+            line += ": `%s`" % _one_line(command)
+        hint = gate.get("hint")
+        if isinstance(hint, str) and hint.strip():
+            line += ". Hint: %s" % _one_line(hint)
+        lines.append(line)
+    protected = [k for k in protected_entries(config) if k not in ("", ".", "..") and not k.startswith("../")]
+    if protected:
+        lines += ["", "Protected paths, which you may not change (edits are denied; only a person can allow a "
+                      "change, with `%s accept`): %s" % (cmd_name(config, "quality"),
+                                                          ", ".join("`%s`" % k for k in protected))]
+    forbidden = []
+    for name, gate in selected:
+        for compiled, globs, message in forbid_entries(gate):
+            line = "- `%s`" % compiled.pattern
+            if globs:
+                line += " in %s" % ", ".join("`%s`" % g for g in globs)
+            line += " (gate `%s`)" % name
+            if message and message.strip():
+                line += ": %s" % _one_line(message)
+            forbidden.append(line)
+    if forbidden:
+        lines += ["", "Forbidden patterns, which fail the gate when you add a matching line:", ""] + forbidden
+    return "\n".join(lines)
 
 
 def _parse_added_lines(diff):

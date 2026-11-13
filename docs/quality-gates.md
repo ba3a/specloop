@@ -281,6 +281,12 @@ Change the block before a run starts. While a run is active, a change to the mer
 
 `/sl-go` checks the merged `quality` block before it starts or resumes a run. It reports every problem it finds and changes nothing until they are fixed. The Stop hook checks the gates it runs again and treats an invalid one as [broken](#broken-gates). The problems are: an unknown key or a wrong type, an unknown `steps`, `level` or `legacy` value, an invalid gate name or regular expression, a phase in `phases` that does not exist or sets `allowEdits`, and a project that is not a git work tree while a gate uses `{changed_files}`, `{changed_files_file}` or `forbid`.
 
+## What the agent and the reviewer see
+
+The shipped `implement.md` and `step-implement.md` contain the placeholder `{quality_gates}` (see [Phases](phases.md#instruction-files)), so the agent sees the rules before it starts. It becomes a `### Quality gates` list with one line per gate that runs in the current phase and step: name, `level`, `command` and `hint`. A `steps: "last"` gate is listed only on the last step. If any gate declares `protect`, a paragraph names the protected paths and says that only a person can allow a change, with `/sl-quality accept`. The `forbid` entries of the listed gates follow, each with its pattern, `glob`, gate and `message`. When no gate applies, for example when none is configured, the placeholder becomes an empty string and takes its line with it. An [override](phases.md#instruction-files) that does not contain `{quality_gates}` renders as before, without the list.
+
+The shipped `review.md` and `step-review.md` tell the reviewer to read `run/quality.md` when it exists (see [Results file](#results-file)). The reviewer judges each warning, asking whether it is a real problem left unfixed, and each accepted change, asking whether the specification justifies it. A [waived gate](#waived-gates) is a finding unless the specification allows it. When `run/quality.md` exists, the [phase brief](delegation.md#the-orchestrator-and-the-phase-brief) of a delegated phase lists it among the files to read.
+
 ## The /sl-quality command
 
 `/sl-quality` with no argument is a read-only overview. It prints:

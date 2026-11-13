@@ -1520,6 +1520,23 @@ class FeatureGateTest(unittest.TestCase):
         self.write_attempt("replan.md", "Rework the plan.\n")
         return self.stop()
 
+    def test_the_step_instructions_list_the_gates_that_run_on_this_step(self):
+        self.begin({"each": {"command": "exit 0", "hint": "Run it."}, "final": {"command": "exit 0", "steps": "last"}})
+        text = workflow.phase_instructions(self.root, self.config(), self.state())
+        self.assertIn("- `each` (block): `exit 0`. Hint: Run it.", text)
+        self.assertNotIn("`final`", text)
+        self.finish_step()
+        text = workflow.phase_instructions(self.root, self.config(), self.state())
+        self.assertIn("`each`", text)
+        self.assertIn("`final`", text)
+
+    def test_the_step_instructions_render_nothing_without_gates(self):
+        self.begin({"final": {"command": "exit 0", "steps": "last"}})
+        text = workflow.phase_instructions(self.root, self.config(), self.state())
+        self.assertNotIn("{quality_gates}", text)
+        self.assertNotIn("Quality gates", text)
+        self.assertNotIn("\n\n\n", text)
+
     def test_failing_block_gate_keeps_the_step_in_implement(self):
         self.begin({"tests": self.counting("tests", 1, hint="Fix it.")})
         out = self.stop()
@@ -3699,6 +3716,117 @@ class WaivedGatesTest(GateProject):
         workflow.update_state(self.root, lambda s: s.update(qualityWaived="x"))
         workflow.cmd_advance(self.root)
         self.assertEqual(["lint"], [w["gate"] for w in self.waived()])
+
+
+class QualityPromptTest(ChangedFilesProject):
+    """{quality_gates} in the implement instructions, quality.md in the review instructions and the brief."""
+
+    GATES = {
+        "detekt": {"command": "./gradlew detekt", "hint": "Fix the finding;\n do not suppress it.",
+                   "protect": ["detekt.yml", "config/detekt/"],
+                   "forbid": [{"pattern": "@Suppress\\(", "glob": ["*.kt"], "message": "No suppressions."}, "TODO"]},
+        "tests": {"command": "exit 0", "level": "warn"},
+    }
+
+    def configure(self, gates, **top):
+        self.set_config(dict(top, phases={"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                             quality={"gates": gates}))
+
+    def run_path(self, *parts):
+        return os.path.join(self.base, "run", *parts)
+
+    def start_implement(self):
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.assertIn("entering phase 'implement'", self.stop()["reason"])
+
+    def instructions(self):
+        return workflow.phase_instructions(self.root, self.config(), self.state())
+
+    def test_implement_lists_the_gates_with_hints_protected_paths_and_forbidden_patterns(self):
+        self.configure(self.GATES)
+        self.start_implement()
+        text = self.instructions()
+        self.assertNotIn("{quality_gates}", text)
+        self.assertIn("- `detekt` (block): `./gradlew detekt`. Hint: Fix the finding; do not suppress it.", text)
+        self.assertIn("- `tests` (warn): `exit 0`", text)
+        self.assertIn("`detekt.yml`, `config/detekt`", text)
+        self.assertIn("`/sl-quality accept`", text)
+        self.assertIn("- `@Suppress\\(` in `*.kt` (gate `detekt`): No suppressions.", text)
+        self.assertIn("- `TODO` (gate `detekt`)", text)
+        self.assertTrue(text.index("Quality gates") < text.index("Finish your turn"))
+
+    def test_the_placeholder_renders_as_nothing_without_gates_and_leaves_no_gap(self):
+        self.start_implement()
+        text = self.instructions()
+        self.assertNotIn("{quality_gates}", text)
+        self.assertNotIn("Quality gates", text)
+        self.assertNotIn("\n\n\n", text)
+        self.assertIn("pull requests.\n\nFinish your turn", text)
+
+    def test_planning_renders_nothing(self):
+        self.configure(self.GATES)
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.assertEqual("[]", workflow.render_phase("[{quality_gates}]", self.config(), self.state()))
+
+    def test_an_override_with_the_placeholder_renders_it_and_one_without_still_renders(self):
+        self.configure(self.GATES)
+        self.start_implement()
+        os.makedirs(os.path.join(self.base, "overrides"))
+        override = os.path.join(self.base, "overrides", "implement.md")
+        with open(override, "w") as f:
+            f.write("Mine for {spec}: {quality_gates}")
+        self.assertIn("Mine for spec.md: ### Quality gates", self.instructions())
+        with open(override, "w") as f:
+            f.write("Mine for {spec}.")
+        self.assertEqual("Mine for spec.md.", self.instructions())
+
+    def test_a_malformed_gate_does_not_break_the_instructions(self):
+        self.configure({"ok": {"command": "exit 0"}})
+        self.start_implement()
+        config = self.config()
+        config["quality"]["gates"].update({"bad": "not an object", "list": {"command": ["x"], "phases": 7},
+                                           "odd": {"command": "exit 0", "protect": 3, "forbid": [7, "("]}})
+        text = workflow.render_phase("{quality_gates}", config, self.state())
+        self.assertIn("- `ok` (block): `exit 0`", text)
+        config["quality"]["gates"] = "broken"
+        self.assertEqual("", workflow.render_phase("{quality_gates}", config, self.state()))
+
+    def test_the_gate_text_is_not_expanded_again(self):
+        self.configure({"g": {"command": "exit 0", "hint": "See {spec} and {run_dir}"}})
+        self.start_implement()
+        self.assertIn("Hint: See {spec} and {run_dir}", self.instructions())
+
+    def test_the_prefix_names_the_accept_command(self):
+        self.configure(self.GATES, commandPrefix="x-")
+        self.start_implement()
+        self.assertIn("`/x-quality accept`", self.instructions())
+
+    def test_review_tells_the_reviewer_to_read_the_report(self):
+        for name in ("review.md", "step-review.md"):
+            with open(os.path.join(KIT, "phases", name), encoding="utf-8") as f:
+                text = f.read()
+            self.assertIn("{run_dir}/quality.md", text)
+            self.assertIn("warning", text)
+            self.assertIn("accepted change", text)
+            self.assertIn("waived gate is a finding", text)
+
+    def test_the_brief_lists_the_report_only_when_it_exists(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        self.start_implement()
+        report = ".claude/specloop/run/quality.md"
+        self.assertNotIn(report, workflow.phase_brief(self.root, self.config(), self.state()))
+        workflow.cmd_advance(self.root)
+        self.assertTrue(os.path.exists(self.run_path("quality.md")))
+        files = workflow.phase_brief(self.root, self.config(), self.state()).split("## Files to read")[1]
+        self.assertIn("- `%s`" % report, files)
+
+    def test_the_shipped_implement_phases_have_the_placeholder(self):
+        for name in ("implement.md", "step-implement.md"):
+            with open(os.path.join(KIT, "phases", name), encoding="utf-8") as f:
+                self.assertIn("{quality_gates}", f.read())
 
 
 if __name__ == "__main__":
