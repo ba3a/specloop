@@ -40,6 +40,8 @@ Delete the state and the `run/` artifacts. Blocked in a chat that is not the own
 
 `/sl-quality` lists the [quality gates](quality-gates.md): for each gate in the order it runs, its phases, level, steps and last result with the metric value. It then prints the configuration errors, a warning when `quality.timeoutSec` is above the budget the installed Stop hook leaves (naming the install command that fixes it), and the programs that gates start but that are neither on `PATH` nor files of the project, judged by the first word of each command. It changes nothing and works from any chat. Any other argument prints the usage. See [Quality gates](quality-gates.md#the-sl-quality-command).
 
+`/sl-quality accept` needs a run (status `active`, `paused` or `stalled`) and refuses with an explanation otherwise. It takes the protected files, the `quality` block and the forbidden lines as they are now as the run's own, so the gates stop reporting them, and prints each change it accepted. Only a person can run it: Claude cannot invoke it, and PreToolUse denies it in Bash. See [Quality gates](quality-gates.md#accepting-changes).
+
 `/sl-status` also prints one line per gate from the last gate run, and the gates a person waived.
 
 ## Notes

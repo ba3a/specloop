@@ -72,7 +72,7 @@ Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.l
 
 ### Results file
 
-After each gate run, `.claude/specloop/run/quality.md` is rewritten from that run's results: a table with one row per gate that ran (name, `result`, duration and the metric value, or `-` when the gate has none), then, for each `warn` result, a section with the end of its output, bounded by `maxOutputChars` across all warnings, then, for each [ratchet](#existing-problems) gate, its baseline or the note that it has none. The reviewer reads this file. It is written together with `qualityResults`, so a dropped result writes nothing, and a run without gates never creates it.
+After each gate run, `.claude/specloop/run/quality.md` is rewritten from that run's results: a table with one row per gate that ran (name, `result`, duration and the metric value, or `-` when the gate has none), then, for each `warn` result, a section with the end of its output, bounded by `maxOutputChars` across all warnings, then, for each [ratchet](#existing-problems) gate, its baseline or the note that it has none, then the changes a person [accepted](#accepting-changes). The reviewer reads this file. It is written together with `qualityResults`, so a dropped result writes nothing, and a run without gates never creates it.
 
 In a feature-mode run, `run/quality.md` and `run/quality/` move to `run/steps/<id>/` when the step finishes, with the step's review files; the next step starts without them. In single mode they stay in `run/`.
 
@@ -179,7 +179,7 @@ Before a gate's command runs, the engine compares the gate's own `protect` paths
 - The message and `run/quality/<gate>.log` list each path with `changed`, `created` or `deleted`, and the gate's command does not run.
 - Restoring the files makes the gate pass on the next stop.
 
-If the merged `quality` block no longer matches its fingerprint, **every** gate of the phase fails, whatever its `level` (`warn` included), and no command runs. This is how a run is kept from weakening its harness by writing `config.json` or `config.local.json` directly. The message says that a person must run `/sl-quality accept` to allow the change. A phase with no gates is not affected.
+If the merged `quality` block no longer matches its fingerprint, **every** gate of the phase fails, whatever its `level` (`warn` included), and no command runs. This is how a run is kept from weakening its harness by writing `config.json` or `config.local.json` directly. The message says that a person must run [`/sl-quality accept`](#accepting-changes) to allow the change. A phase with no gates is not affected.
 
 Fingerprinting reads every byte of every protected file at the start of the run, and the engine walks the protected directories again before each protected gate. Protect configuration files and small directories, not build output or source trees; a large tree makes every stop slower, and keeping that cost down is the maintainer's concern.
 
@@ -208,9 +208,22 @@ Before a gate's command runs, the engine collects the lines this run added, from
 
 A hit fails the gate as an ordinary failure at its `level`, in the same way as a [changed protected file](#protected-files): `block` fails the phase with one iteration, `warn` is reported in the message and `run/quality.md` and lets the phase pass. The message and `run/quality/<gate>.log` list each hit as `path:line: text` with the entry's `message` under it, and the gate's command does not run. If a gate has both protected-file changes and hits, one message lists both. When git cannot answer, the gate is [broken](#broken-gates).
 
-A hit is skipped when the SHA-256 of its path, a NUL character and the text of the line is in `state.qualityAccepted`, a list of such hashes. Only a person adds to it, with `/sl-quality accept`; a line that is changed or moved to another file is a new hit. The function `forbid_hits` in `engine.py` does the scanning for `accept` as well.
+A hit is skipped when the SHA-256 of its path, a NUL character and the text of the line is in `state.qualityAccepted`, a list of such hashes. Only a person adds to it, with [`/sl-quality accept`](#accepting-changes); a line that is changed or moved to another file is a new hit. The function `forbid_hits` in `engine.py` does the scanning for `accept` as well.
 
 A gate with `forbid` needs a git work tree; [validation](#validation) reports it otherwise. In single mode a tracked file that was already modified when the run started counts as changed, so lines already in that diff are reported.
+
+## Accepting changes
+
+A run cannot allow a change to its own harness; a person does, with `/sl-quality accept`. It works while a run is `active`, `paused` or `stalled`, and refuses with an explanation, changing nothing, when no workflow is loaded, a spec is loaded but not started, or the workflow is done. Claude cannot run it (see [Guard rails](guard-rails.md#commands-only-the-user-may-run)).
+
+Accept takes the current state of three things as the run's own:
+
+- **Protected files and the `quality` block.** It fingerprints them again, with no lock, and replaces `state.qualityFingerprints`. A changed, created or deleted protected file and a changed `quality` block (`config.json` or `config.local.json`) no longer fail the gates; a later change fails them again.
+- **Forbidden lines.** It scans the lines the run added for the `forbid` patterns of every gate, whatever the gate's phase, from each gate's own comparison point, and adds the hash of each hit's path and line text to `state.qualityAccepted`. Those lines are not reported again. A new line, or the same text in another file, is a new hit.
+
+Everything is stored in one `update_state` call that rechecks the reloaded state. Nothing is stored, and the command says so, when the run ended meanwhile, when another chat changed the workflow while accept scanned, or when git cannot determine the added lines. When nothing differs from the fingerprints, accept prints that and writes nothing.
+
+The output lists every accepted change: `protected file <path> (changed|created|deleted)`, `the quality block (config.json or config.local.json)` and `forbidden line <path>:<line>: <text>`. The same lines go to `state.qualityAcceptedLog` with a time, and to an `## Accepted changes` section of `run/quality.md` that every later gate run keeps, so the reviewer sees what a person allowed (see [Results file](#results-file)). The log keeps the last 50 accepts.
 
 ## Broken gates
 
@@ -267,7 +280,7 @@ Change the block before a run starts. While a run is active, a change to the mer
 - a warning when `quality.timeoutSec` is above the budget in force (see [Time budget](#time-budget)). It names the install command that fixes it: `python install.py <project>` from the specloop clone, with the options recorded by the installer (`--scope`, `--no-gitignore`) when there are any;
 - the programs gates start that cannot be found. specloop judges the first word of each command (leading `VAR=value` words are skipped) with `shutil.which`; shell builtins and keywords are not judged, and a path such as `./gradlew` counts as found when the file exists in the project. The check uses the `PATH` of the command, which may differ from the shell the gate runs in, so treat it as a hint.
 
-The command never raises: unbalanced quotes in the arguments, a malformed `quality` block or an unreadable state print a message instead. An unknown form prints the usage. `/sl-status` also prints one line per gate from the last gate run (`quality: <gate> <result> (phase <phase>)`) and one line per gate waived by a person, in single mode and in feature mode.
+`/sl-quality accept` is described under [Accepting changes](#accepting-changes). The command never raises: unbalanced quotes in the arguments, a malformed `quality` block or an unreadable state print a message instead. An unknown form prints the usage. `/sl-status` also prints one line per gate from the last gate run (`quality: <gate> <result> (phase <phase>)`) and one line per gate waived by a person, in single mode and in feature mode.
 
 ## See also
 

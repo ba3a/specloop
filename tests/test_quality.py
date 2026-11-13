@@ -3175,7 +3175,7 @@ class QualityCommandTest(GateProject):
             self.assertNotIn(name, tools)
 
     def test_unknown_forms_print_the_usage(self):
-        for args in ("bogus", "run", "init kotlin", "accept", "--help"):
+        for args in ("bogus", "run", "init kotlin", "accept now", "--help"):
             with self.subTest(args=args):
                 out = self.quality(args)
                 self.assertIn("Usage: /sl-quality", out)
@@ -3220,6 +3220,340 @@ class QualityCommandTest(GateProject):
         before = self.state_bytes()
         self.quality()
         self.assertEqual(before, self.state_bytes())
+
+
+class QualityAcceptTest(ChangedFilesProject):
+    """/sl-quality accept: a person allows protected-file changes, a changed quality block and forbidden lines."""
+
+    FORBID = [{"pattern": "TODO", "message": "No TODOs."}]
+
+    def setUp(self):
+        super().setUp()
+        self.write("rules.yml", "maxIssues: 0\n")
+        self.git("add", "rules.yml")
+        self.git("commit", "-q", "-m", "rules")
+
+    def lint(self, **extra):
+        return self.counting("lint", "exit 0", **dict({"protect": ["rules.yml"], "forbid": self.FORBID}, **extra))
+
+    def start_implement(self, gates=None, quality=None, **top):
+        gates = gates if gates is not None else {"lint": self.lint()}
+        self.set_config(dict(top, phases={"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                             quality=dict(quality or {}, gates=gates)))
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.assertIn("entering phase 'implement'", self.stop()["reason"])
+
+    def accept(self, args="accept"):
+        return workflow.cmd_quality(self.root, args)
+
+    def report(self):
+        with open(os.path.join(self.base, "run", "quality.md"), encoding="utf-8") as f:
+            return f.read()
+
+    def state_bytes(self):
+        with open(os.path.join(self.base, "state.json"), "rb") as f:
+            return f.read()
+
+    # refusals
+
+    def test_without_a_workflow_it_refuses_and_changes_nothing(self):
+        self.set_config({"quality": {"gates": {"lint": self.lint()}}})
+        out = self.accept()
+        self.assertIn("Nothing was accepted", out)
+        self.assertIn("no workflow is loaded", out)
+        self.assertIn("/sl-go", out)
+        self.assertFalse(os.path.exists(os.path.join(self.base, "state.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality.md")))
+
+    def test_a_loaded_spec_that_has_not_started_is_refused(self):
+        self.set_config({"quality": {"gates": {"lint": self.lint()}}})
+        workflow.cmd_init(self.root, "spec.md")
+        before = self.state_bytes()
+        out = self.accept()
+        self.assertIn("the workflow is ready", out)
+        self.assertEqual(before, self.state_bytes())
+
+    def test_a_finished_workflow_is_refused(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(status="done"))
+        before = self.state_bytes()
+        self.assertIn("the workflow is done", self.accept())
+        self.assertEqual(before, self.state_bytes())
+
+    def test_the_refusal_uses_the_command_prefix(self):
+        self.set_config({"commandPrefix": "x-", "quality": {"gates": {}}})
+        out = self.accept()
+        self.assertIn("/x-quality accept", out)
+        self.assertIn("/x-go", out)
+        self.assertNotIn("/sl-", out)
+
+    def test_extra_arguments_print_the_usage_and_change_nothing(self):
+        self.start_implement()
+        before = self.state_bytes()
+        self.assertIn("Usage: /sl-quality", self.accept("accept now"))
+        self.assertEqual(before, self.state_bytes())
+
+    # protected files and the quality block
+
+    def test_a_changed_protected_file_fails_until_accepted(self):
+        self.start_implement()
+        self.write("rules.yml", "maxIssues: 99\n")
+        self.assertIn("rules.yml (changed)", self.stop()["reason"])
+        self.assertEqual(0, self.marker("lint"))
+        out = self.accept()
+        self.assertIn("Accepted for this run:", out)
+        self.assertIn("- protected file rules.yml (changed)", out)
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual(1, self.marker("lint"))
+
+    def test_the_fingerprint_is_replaced_so_a_later_change_fails_again(self):
+        self.start_implement()
+        self.write("rules.yml", "maxIssues: 99\n")
+        self.accept()
+        self.assertEqual(workflow.protected_fingerprint(self.root, "rules.yml"),
+                         self.state()["qualityFingerprints"]["protected"]["rules.yml"])
+        self.write("rules.yml", "maxIssues: 100\n")
+        self.assertIn("rules.yml (changed)", self.stop()["reason"])
+
+    def test_a_created_and_a_deleted_protected_file_are_accepted(self):
+        self.start_implement({"lint": self.lint(protect=["rules.yml", "extra.yml"])})
+        self.write("extra.yml", "new\n")
+        os.remove(os.path.join(self.root, "rules.yml"))
+        out = self.accept()
+        self.assertIn("rules.yml (deleted)", out)
+        self.assertIn("extra.yml (created)", out)
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+
+    def test_a_changed_quality_block_fails_every_gate_until_accepted(self):
+        self.start_implement({"lint": self.lint(), "soft": self.counting("soft", "exit 0", level="warn")})
+        self.set_config(dict(phases={"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                             quality={"failFast": True, "gates": {"lint": self.lint(),
+                                                                  "soft": self.counting("soft", "exit 0", level="warn")}}))
+        self.assertIn("Quality gates failed: lint, soft", self.stop()["reason"])
+        out = self.accept()
+        self.assertIn("- the quality block (config.json or config.local.json)", out)
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        self.assertEqual(1, self.marker("lint"))
+        self.assertEqual(1, self.marker("soft"))
+
+    def test_a_change_made_through_config_local_json_is_accepted_too(self):
+        self.start_implement()
+        with open(os.path.join(self.base, "config.local.json"), "w") as f:
+            json.dump({"quality": {"gates": {"lint": {"timeoutSec": 5}}}}, f)
+        self.assertIn("config.local.json", self.stop()["reason"])
+        self.accept()
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+
+    def test_nothing_is_accepted_beyond_what_changed(self):
+        self.start_implement({"lint": self.lint(), "other": self.counting("other", "exit 0", protect=["rules.yml"])})
+        self.write("rules.yml", "changed\n")
+        out = self.accept()
+        self.assertEqual(1, out.count("rules.yml (changed)"))  # one change, however many gates protect the file
+        self.assertNotIn("quality block", out)
+        self.assertNotIn("forbidden line src", out)
+
+    # forbidden lines
+
+    def test_accepted_forbid_hits_are_not_reported_again(self):
+        self.start_implement()
+        self.write("src/a.txt", "ok\nTODO one\nTODO two\n")
+        reason = self.stop()["reason"]
+        self.assertIn("src/a.txt:2: TODO one", reason)
+        out = self.accept()
+        self.assertIn("- forbidden line src/a.txt:2: TODO one", out)
+        self.assertIn("- forbidden line src/a.txt:3: TODO two", out)
+        accepted = self.state()["qualityAccepted"]
+        self.assertEqual({workflow.forbid_hit_hash("src/a.txt", "TODO one"),
+                          workflow.forbid_hit_hash("src/a.txt", "TODO two")}, set(accepted))
+        self.assertEqual(2, len(accepted))
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+
+    def test_a_new_hit_after_accept_is_still_reported(self):
+        self.start_implement()
+        self.write("src/a.txt", "TODO one\n")
+        self.accept()
+        self.write("src/a.txt", "TODO one\nTODO fresh\n")
+        self.write("src/b.txt", "TODO one\n")  # the same text in another file is a new hit
+        reason = self.stop()["reason"]
+        self.assertIn("src/a.txt:2: TODO fresh", reason)
+        self.assertIn("src/b.txt:1: TODO one", reason)
+        self.assertNotIn("src/a.txt:1", reason)
+        self.assertEqual(0, self.marker("lint"))
+
+    def test_a_second_accept_adds_only_the_new_hits(self):
+        self.start_implement()
+        self.write("src/a.txt", "TODO one\n")
+        self.accept()
+        self.write("src/a.txt", "TODO one\nTODO two\n")
+        out = self.accept()
+        self.assertIn("src/a.txt:2: TODO two", out)
+        self.assertNotIn("TODO one", out)
+        self.assertEqual(2, len(self.state()["qualityAccepted"]))
+
+    def test_protected_files_and_hits_are_accepted_together(self):
+        self.start_implement()
+        self.write("rules.yml", "changed\n")
+        self.write("src/a.txt", "TODO one\n")
+        out = self.accept()
+        self.assertIn("rules.yml (changed)", out)
+        self.assertIn("src/a.txt:1: TODO one", out)
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+
+    def test_nothing_to_accept_changes_nothing(self):
+        self.start_implement()
+        before = self.state_bytes()
+        out = self.accept()
+        self.assertIn("Nothing to accept", out)
+        self.assertEqual(before, self.state_bytes())
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality.md")))
+
+    def test_a_run_without_fingerprints_gets_them(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.pop("qualityFingerprints"))
+        out = self.accept()
+        self.assertIn("recorded", out)
+        self.assertIn("rules.yml", self.state()["qualityFingerprints"]["protected"])
+
+    # statuses
+
+    def test_it_works_in_a_paused_and_a_stalled_run(self):
+        for status in ("paused", "stalled"):
+            with self.subTest(status=status):
+                workflow.cmd_reset(self.root)
+                self.write("rules.yml", "maxIssues: 0\n")
+                self.start_implement()
+                self.write("rules.yml", "changed %s\n" % status)
+                workflow.update_state(self.root, lambda s: s.update(status=status))
+                self.assertIn("rules.yml (changed)", self.accept())
+                self.assertEqual(status, self.state()["status"])
+
+    # state
+
+    def test_it_writes_through_update_state(self):
+        self.start_implement()
+        self.write("rules.yml", "changed\n")
+        rev = self.state()["rev"]
+        with mock.patch.object(workflow, "update_state", wraps=workflow.update_state) as spy:
+            self.accept()
+        self.assertEqual(1, spy.call_count)
+        self.assertEqual(rev + 1, self.state()["rev"])
+
+    def test_it_holds_no_lock_while_it_scans(self):
+        self.start_implement()
+        self.write("src/a.txt", "TODO one\n")
+        seen = []
+        original = workflow.forbid_hits
+
+        def spy(*args, **kwargs):
+            seen.append(os.path.exists(os.path.join(self.base, "state.lock")))
+            return original(*args, **kwargs)
+        with mock.patch.object(workflow, "forbid_hits", side_effect=spy):
+            self.accept()
+        self.assertEqual([False], seen)
+
+    def test_a_run_that_ended_meanwhile_is_not_touched(self):
+        self.start_implement()
+        self.write("rules.yml", "changed\n")
+        original = workflow.quality_fingerprints
+
+        def end_the_run(*args, **kwargs):
+            result = original(*args, **kwargs)
+            workflow.update_state(self.root, lambda s: s.update(status="done"))
+            return result
+        with mock.patch.object(workflow, "quality_fingerprints", side_effect=end_the_run):
+            out = self.accept()
+        self.assertIn("the workflow is done", out)
+        state = self.state()
+        self.assertNotIn("qualityAccepted", state)
+        self.assertNotIn("rules.yml (changed)", json.dumps(state))
+        self.assertNotEqual(workflow.protected_fingerprint(self.root, "rules.yml"),
+                            state["qualityFingerprints"]["protected"]["rules.yml"])
+
+    def test_a_workflow_that_changed_meanwhile_is_not_accepted_from_stale_data(self):
+        self.start_implement()
+        self.write("src/a.txt", "TODO one\n")
+        original = workflow.current_forbid_hits
+
+        def move_on(*args, **kwargs):
+            result = original(*args, **kwargs)
+            workflow.update_state(self.root, lambda s: s.update(attempt=s.get("attempt", 0) + 1))
+            return result
+        with mock.patch.object(workflow, "current_forbid_hits", side_effect=move_on):
+            out = self.accept()
+        self.assertIn("changed while /sl-quality accept ran", out)
+        self.assertNotIn("qualityAccepted", self.state())
+
+    def test_git_failing_accepts_nothing(self):
+        self.start_implement()
+        self.write("rules.yml", "changed\n")
+        workflow.update_state(self.root, lambda s: s.update(baseRef="0" * 40))
+        before = self.state_bytes()
+        out = self.accept()
+        self.assertIn("Nothing was accepted: the added lines cannot be determined", out)
+        self.assertEqual(before, self.state_bytes())
+
+    # the report
+
+    def test_quality_md_lists_the_accepted_changes(self):
+        self.start_implement()
+        self.write("rules.yml", "changed\n")
+        self.write("src/a.txt", "TODO one\n")
+        self.accept()
+        text = self.report()
+        self.assertIn("## Accepted changes", text)
+        self.assertIn("- protected file rules.yml (changed) (accepted ", text)
+        self.assertIn("- forbidden line src/a.txt:1: TODO one (accepted ", text)
+
+    def test_the_section_is_kept_when_a_gate_run_rewrites_the_report(self):
+        self.start_implement()
+        self.write("rules.yml", "changed\n")
+        self.accept()
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        text = self.report()
+        self.assertIn("| lint | pass |", text)
+        self.assertEqual(1, text.count("## Accepted changes"))
+        self.assertIn("rules.yml (changed)", text)
+
+    def test_a_second_accept_extends_one_section(self):
+        self.start_implement()
+        self.write("rules.yml", "one\n")
+        self.accept()
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
+        workflow.update_state(self.root, lambda s: s.update(phase="implement"))
+        self.write("rules.yml", "two\n")
+        self.accept()
+        text = self.report()
+        self.assertEqual(1, text.count("## Accepted changes"))
+        self.assertEqual(2, text.count("protected file rules.yml (changed)"))
+        self.assertIn("| lint | pass |", text)
+
+    def test_the_log_in_state_is_bounded_and_survives_garbage(self):
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(qualityAcceptedLog="garbage", qualityAccepted="x"))
+        self.write("rules.yml", "changed\n")
+        self.assertIn("rules.yml (changed)", self.accept())
+        self.assertEqual(1, len(self.state()["qualityAcceptedLog"]))
+        self.assertEqual([], workflow.quality_accepted_lines({"qualityAcceptedLog": [1, {"changes": 3}]}))
+
+    def test_it_works_in_a_feature_mode_step(self):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": {"gates": {"lint": self.lint(), "whole": self.counting(
+                             "whole", "exit 0", steps="last", forbid=["FIXME"])}}})
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "# Plan")
+        self.write(self.run_file("steps.json"), json.dumps({"feature": "F", "steps": [step_entry(1), step_entry(2)]}))
+        self.stop()
+        workflow.cmd_go(self.root)
+        self.write("rules.yml", "changed\n")
+        self.write("one.txt", "TODO one\nFIXME two\n")
+        out = self.accept()
+        self.assertIn("rules.yml (changed)", out)
+        self.assertIn("one.txt:1: TODO one", out)
+        self.assertIn("one.txt:2: FIXME two", out)  # the gate of the last step is accepted too
+        self.assertIn("entering phase 'review'", self.stop()["reason"])
 
 
 class QualityStatusTest(GateProject):

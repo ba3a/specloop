@@ -2185,6 +2185,17 @@ def quality_block_changed(config, state):
     return isinstance(before, str) and before != quality_block_fingerprint(config)
 
 
+def _path_changes(before, current):
+    """Lines `path (changed|created|deleted)` for the files whose hash differs between two {path: hash or None}
+    maps."""
+    lines = []
+    for path in sorted(set(before) | set(current)):
+        old, new = before.get(path), current.get(path)
+        if old != new:
+            lines.append("%s (%s)" % (path, "created" if old is None else "deleted" if new is None else "changed"))
+    return lines
+
+
 def protected_changes(root, state, gate):
     """Lines naming the files in the gate's `protect` paths that differ from the stored fingerprints: changed,
     created (a missing file or a new file in a protected directory) or deleted. Paths whose entry was not
@@ -2196,14 +2207,23 @@ def protected_changes(root, state, gate):
     lines = []
     for key in dict.fromkeys(protect_key(e) for e in entries):
         before = stored.get(key)
-        if not isinstance(before, dict):
-            continue
-        current = protected_fingerprint(root, key)
-        for path in sorted(set(before) | set(current)):
-            old, new = before.get(path), current.get(path)
-            if old != new:
-                lines.append("%s (%s)" % (path, "created" if old is None else "deleted" if new is None else "changed"))
+        if isinstance(before, dict):
+            lines.extend(_path_changes(before, protected_fingerprint(root, key)))
     return lines
+
+
+def fingerprint_changes(before, after):
+    """(protected path lines, quality block changed) between two fingerprint dicts, as state.qualityFingerprints
+    holds them. An entry that only one side fingerprinted is not compared, as in `protected_changes`."""
+    before_protected, after_protected = before.get("protected"), after.get("protected")
+    paths = []
+    if isinstance(before_protected, dict) and isinstance(after_protected, dict):
+        for key, old in before_protected.items():
+            new = after_protected.get(key)
+            if isinstance(old, dict) and isinstance(new, dict):
+                paths.extend(_path_changes(old, new))
+    old_block = before.get("quality")
+    return paths, isinstance(old_block, str) and old_block != after.get("quality")
 
 
 def forbid_entries(gate):
@@ -2499,9 +2519,17 @@ def quality_waived_lines(state):
 
 
 def quality_accepted_lines(state):
-    """Lines of the report's section on changes a person accepted. Added by the step that records accepted
-    changes; empty until then."""
-    return []
+    """Lines of the report's section on the changes a person accepted with `quality accept`, from
+    state.qualityAcceptedLog. Empty when there are none."""
+    log = state.get("qualityAcceptedLog")
+    lines = []
+    for entry in log if isinstance(log, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("changes"), list):
+            continue
+        lines.extend("- %s (accepted %s)" % (change, entry.get("at", "earlier")) for change in entry["changes"])
+    if not lines:
+        return []
+    return ["## Accepted changes", "", "A person accepted these during the run; judge them in the review.", ""] + lines
 
 
 def quality_baseline_lines(config, state):
@@ -3798,7 +3826,110 @@ def quality_overview(root, config):
     return "\n".join(lines)
 
 
-QUALITY_FORMS = {}  # form name -> handler(root, config, args); the forms run, init and accept add theirs
+ACCEPT_STATUSES = ("active", "paused", "stalled")
+ACCEPTED_LOG_LIMIT = 50
+
+
+def accept_refusal(config, state):
+    """Why `quality accept` cannot work on this state, or None when a run is going."""
+    if state and state.get("status") in ACCEPT_STATUSES:
+        return None
+    where = "no workflow is loaded" if not state else "the workflow is %s" % state.get("status", "not started")
+    return ("Nothing was accepted: %s, and %s accepts changes made during a run (status active, paused or "
+            "stalled). Start or resume one with %s." % (where, cmd_name(config, "quality accept"), cmd_name(config, "go")))
+
+
+def current_forbid_hits(root, config, state):
+    """The forbid hits of every gate that are not accepted yet, whatever the gate's phase, once per path and line
+    text. Raises ChangedFilesError when git cannot answer. Holds no lock."""
+    found = collections.OrderedDict()
+    for gate in quality_gates(config).values():
+        for hit in forbid_hits(root, config, state, gate):
+            found.setdefault(hit["hash"], hit)
+    return list(found.values())
+
+
+def accept_summary(paths, block_changed, hits):
+    """The lines of the accepted-changes log and of the command's output, one per accepted change."""
+    changes = ["protected file %s" % path for path in paths]
+    if block_changed:
+        changes.append("the quality block (config.json or config.local.json)")
+    for hit in hits:
+        text = hit["text"].strip()
+        changes.append("forbidden line %s:%d: %s" % (
+            hit["path"], hit["line"], text if len(text) <= MAX_HIT_CHARS else text[:MAX_HIT_CHARS] + "..."))
+    return changes
+
+
+def write_accepted_section(root, config, state):
+    """Put the report's accepted-changes section into run/quality.md, creating the file when no gate has run.
+    Never raises."""
+    path = quality_report_path(root)
+    try:
+        text = ""
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        cut = text.find("\n## Accepted changes\n")
+        text = text[:cut] if cut >= 0 else text or "# Quality gates\n\nNo gate has run yet."
+        text = text.rstrip("\n") + "\n\n" + "\n".join(quality_accepted_lines(state)) + "\n"
+        os.makedirs(run_dir(root), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        print("[specloop] could not write %s: %s" % (QUALITY_REPORT, e), file=sys.stderr)
+
+
+def quality_accept(root, config, args):
+    """/sl-quality accept: take the protected files, the quality block and the current forbid hits as the run's
+    own. Needs a run. Fingerprints and hits are computed with no lock, then stored through update_state, which
+    rechecks the reloaded state."""
+    if args:
+        return quality_usage(config)
+    state = load_state(root)
+    refusal = accept_refusal(config, state)
+    if refusal:
+        return refusal
+    fingerprints = quality_fingerprints(root, config)
+    if fingerprints is None:
+        return "Nothing was accepted: the protected files could not be fingerprinted (see the message above)."
+    try:
+        hits = current_forbid_hits(root, config, state)
+    except (ChangedFilesError, OSError) as e:
+        return "Nothing was accepted: the added lines cannot be determined: %s" % (str(e) or e.__class__.__name__)
+    seen = state.get("rev")
+
+    def apply(current):
+        refusal = accept_refusal(config, current)
+        if refusal:
+            raise Unchanged(refusal)
+        if current.get("rev") != seen:
+            raise Unchanged("Nothing was accepted: the workflow changed while %s ran. Run it again." % cmd_name(
+                config, "quality accept"))
+        paths, block_changed = fingerprint_changes(stored_fingerprints(current), fingerprints)
+        changes = accept_summary(paths, block_changed, hits)
+        if not changes and stored_fingerprints(current) == fingerprints:
+            raise Unchanged("Nothing to accept: the protected files, the quality block and the added lines are "
+                            "as the run (or an earlier accept) left them.")
+        current["qualityFingerprints"] = fingerprints
+        accepted = accepted_hits(current)
+        old = current.get("qualityAccepted")
+        stored = [h for h in old if isinstance(h, str)] if isinstance(old, list) else sorted(accepted)
+        current["qualityAccepted"] = stored + [h["hash"] for h in hits if h["hash"] not in accepted]
+        if changes:
+            log = current.get("qualityAcceptedLog")
+            log = log if isinstance(log, list) else []
+            log.append({"at": now(), "changes": changes})
+            current["qualityAcceptedLog"] = log[-ACCEPTED_LOG_LIMIT:]
+            write_accepted_section(root, config, current)
+        if not changes:
+            return "Accepted: the fingerprints of this run are recorded now. Nothing differed."
+        return ("Accepted for this run:\n%s\nThe gates no longer report these. A later change, or a new forbidden "
+                "line, is reported again." % "\n".join("- " + c for c in changes))
+    return update_state(root, apply)
+
+
+QUALITY_FORMS = {"accept": quality_accept}  # form name -> handler(root, config, args); run and init add theirs
 
 
 def cmd_quality(root, args):
