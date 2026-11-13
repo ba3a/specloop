@@ -1751,6 +1751,35 @@ class FeatureGateTest(unittest.TestCase):
         self.assertIn("quality waived: lint in phase implement, step 1", workflow.cmd_status(self.root))
 
 
+    def test_advance_records_the_waived_gates_with_the_step(self):
+        self.begin({"tests": self.counting("tests", 127)})
+        self.stop()
+        self.assertEqual("paused", self.state()["status"])
+        workflow.cmd_advance(self.root)
+        state = self.state()
+        self.assertEqual("review", state["phase"])
+        self.assertNotIn("pausedFor", state)
+        self.assertEqual("skipped", state["history"][-1]["result"])
+        self.assertEqual(1, len(state["qualityWaived"]))
+        entry = state["qualityWaived"][0]
+        self.assertEqual(("tests", "implement", 1), (entry["gate"], entry["phase"], entry["stepId"]))
+        self.assertIn("quality waived: tests in phase implement, step 1", workflow.cmd_status(self.root))
+        with open(os.path.join(self.base, "run", "quality.md"), encoding="utf-8") as f:
+            self.assertIn("tests in phase implement, step 1 (waived ", f.read())
+
+    def test_a_last_gate_is_waived_only_on_the_last_step(self):
+        self.begin({"final": self.counting("final", steps="last"), "each": self.counting("each")})
+        workflow.cmd_advance(self.root)
+        self.assertEqual(["each"], [w["gate"] for w in self.state()["qualityWaived"]])
+        self.assertEqual(0, self.marker("final"))
+        self.assertEqual(0, self.marker("each"))
+
+    def test_the_last_step_waives_the_last_gate(self):
+        self.begin({"final": self.counting("final", steps="last")}, count=1)
+        workflow.cmd_advance(self.root)
+        self.assertEqual([("final", 1)], [(w["gate"], w["stepId"]) for w in self.state()["qualityWaived"]])
+
+
 @unittest.skipUnless(gitfixture.git_available(), "git not available")
 class ChangedFilesProject(unittest.TestCase):
     """A committed git repository with the kit installed in `self.root`. Holds no tests itself."""
@@ -3594,6 +3623,82 @@ class QualityStatusTest(GateProject):
         lines = workflow.status_output(self.root).splitlines()
         self.assertTrue(lines[-1].startswith("update:"))
         self.assertTrue(any(line.startswith("quality: lint") for line in lines))
+
+
+class WaivedGatesTest(GateProject):
+    """/sl-advance skips the gates of the phase it passes and records them as waived."""
+
+    def waived(self):
+        return self.state().get("qualityWaived")
+
+    def test_a_broken_gate_pauses_and_advance_skips_to_review_with_a_waiver(self):
+        self.configure({"detekt": {"command": "exit 127"}, "tests": {"command": "exit 0"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        self.assertEqual(("paused", "detekt"), (self.state()["status"], self.state()["pausedFor"]["gate"]))
+        out = workflow.cmd_advance(self.root)
+        state = self.state()
+        self.assertIn("Advanced to phase 'review'", out)
+        self.assertEqual("review", state["phase"])
+        self.assertNotIn("pausedFor", state)
+        self.assertEqual("skipped", state["history"][-1]["result"])
+        self.assertEqual(["detekt", "tests"], [w["gate"] for w in state["qualityWaived"]])
+        for entry in state["qualityWaived"]:
+            self.assertEqual("implement", entry["phase"])
+            self.assertNotIn("stepId", entry)
+            self.assertTrue(entry["at"])
+
+    def test_status_and_the_report_list_the_waived_gates(self):
+        self.configure({"detekt": {"command": "exit 127"}})
+        self.start_implement()
+        workflow.handle_stop(self.root, {})
+        workflow.cmd_advance(self.root)
+        self.assertIn("quality waived: detekt in phase implement", workflow.cmd_status(self.root))
+        report = self.read(self.run_path("quality.md"))
+        self.assertIn("## Waived gates", report)
+        self.assertIn("- detekt in phase implement (waived ", report)
+        self.assertIn("| detekt | broken |", report)
+
+    def test_the_report_is_created_when_no_gate_ran(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        self.start_implement()
+        workflow.cmd_advance(self.root)
+        self.assertIn("- lint in phase implement", self.read(self.run_path("quality.md")))
+
+    def test_a_gate_run_report_keeps_the_waived_section(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        self.start_implement()
+        workflow.cmd_advance(self.root)
+        records = [{"name": "lint", "result": "pass", "durationSec": 0}]
+        report = workflow.quality_report(self.config(), self.state(), records, {})
+        self.assertIn("## Waived gates", report)
+        self.assertIn("- lint in phase implement (waived ", report)
+
+    def test_advance_without_gates_records_nothing(self):
+        self.start_implement()
+        workflow.cmd_advance(self.root)
+        self.assertNotIn("qualityWaived", self.state())
+        self.assertFalse(os.path.exists(self.run_path("quality.md")))
+
+    def test_advancing_the_planning_phase_waives_nothing(self):
+        self.configure({"lint": {"command": "exit 1"}, "early": {"command": "exit 1", "phases": ["plan"]}})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        workflow.cmd_advance(self.root)
+        self.assertNotIn("qualityWaived", self.state())
+
+    def test_advance_runs_no_gate(self):
+        self.configure({"lint": {"command": "echo x >> ran.txt; exit 1"}})
+        self.start_implement()
+        workflow.cmd_advance(self.root)
+        self.assertFalse(self.exists("ran.txt"))
+
+    def test_waivers_add_up_and_a_malformed_value_is_replaced(self):
+        self.configure({"lint": {"command": "exit 0"}})
+        self.start_implement()
+        workflow.update_state(self.root, lambda s: s.update(qualityWaived="x"))
+        workflow.cmd_advance(self.root)
+        self.assertEqual(["lint"], [w["gate"] for w in self.waived()])
 
 
 if __name__ == "__main__":

@@ -2513,9 +2513,15 @@ def quality_report_path(root):
 
 
 def quality_waived_lines(state):
-    """Lines of the report's section on gates a person waived with advance. Added by the step that records
-    waivers; empty until then."""
-    return []
+    """Lines of the report's section on gates a person waived with advance, from state.qualityWaived. Empty when
+    there are none."""
+    waived = state.get("qualityWaived")
+    lines = ["- %s (waived %s)" % (_waived_text(entry), entry.get("at", "earlier") if isinstance(entry, dict) else "earlier")
+             for entry in (waived if isinstance(waived, list) else [])]
+    if not lines:
+        return []
+    return ["## Waived gates", "", "A person skipped these with advance, so they never passed. "
+            "Treat each as a finding unless the spec allows it.", ""] + lines
 
 
 def quality_accepted_lines(state):
@@ -3515,6 +3521,28 @@ def cmd_pause(root):
     return update_state(root, apply)
 
 
+def waive_gates(root, config, state):
+    """Record in state.qualityWaived the gates that advancing past the current phase skips: the ones the Stop would
+    run now (same phase and `steps` selection). Reads config and state only; runs no gate and no git call."""
+    try:
+        selected = selected_gates(config, state)
+    except Exception as e:
+        print("[specloop] could not select the gates to waive: %s" % e, file=sys.stderr)
+        return
+    if not selected:
+        return
+    waived = state.get("qualityWaived")
+    waived = waived if isinstance(waived, list) else []
+    step_id = state.get("stepId") if is_feature(state) and in_step(state) else None
+    for name, _ in selected:
+        entry = {"gate": name, "phase": state["phase"], "at": now()}
+        if step_id is not None:
+            entry["stepId"] = step_id
+        waived.append(entry)
+    state["qualityWaived"] = waived
+    write_person_sections(root, state)
+
+
 def cmd_advance(root):
     state = load_state(root)
     if not state or state["phase"] == DONE:
@@ -3532,6 +3560,7 @@ def cmd_advance(root):
         if not current or current["phase"] == DONE:
             raise Unchanged("Nothing to advance.")
         current.pop("pausedFor", None)  # skipping the phase skips its broken gate
+        waive_gates(root, config, current)
         if in_replan(config, current) and replan is not None:
             add_history(current, None, phase=current["phase"], result="skipped")
             if adopt_replan(root, config, current, replan) == "done":
@@ -3861,18 +3890,24 @@ def accept_summary(paths, block_changed, hits):
     return changes
 
 
-def write_accepted_section(root, config, state):
-    """Put the report's accepted-changes section into run/quality.md, creating the file when no gate has run.
-    Never raises."""
+def write_person_sections(root, state):
+    """Put the sections a person's commands add (waived gates, accepted changes) into run/quality.md, creating
+    the file when no gate has run. Writes nothing when there are none. Never raises."""
     path = quality_report_path(root)
     try:
+        lines = []
+        for extra in (quality_waived_lines(state), quality_accepted_lines(state)):
+            if extra:
+                lines += [""] + extra
+        if not lines:
+            return
         text = ""
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 text = f.read()
-        cut = text.find("\n## Accepted changes\n")
-        text = text[:cut] if cut >= 0 else text or "# Quality gates\n\nNo gate has run yet."
-        text = text.rstrip("\n") + "\n\n" + "\n".join(quality_accepted_lines(state)) + "\n"
+        cuts = [c for c in (text.find("\n## Waived gates\n"), text.find("\n## Accepted changes\n")) if c >= 0]
+        text = text[:min(cuts)] if cuts else text or "# Quality gates\n\nNo gate has run yet."
+        text = text.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
         os.makedirs(run_dir(root), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
@@ -3921,7 +3956,7 @@ def quality_accept(root, config, args):
             log = log if isinstance(log, list) else []
             log.append({"at": now(), "changes": changes})
             current["qualityAcceptedLog"] = log[-ACCEPTED_LOG_LIMIT:]
-            write_accepted_section(root, config, current)
+            write_person_sections(root, current)
         if not changes:
             return "Accepted: the fingerprints of this run are recorded now. Nothing differed."
         return ("Accepted for this run:\n%s\nThe gates no longer report these. A later change, or a new forbidden "

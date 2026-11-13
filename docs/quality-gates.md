@@ -243,7 +243,17 @@ A broken gate, at level `block` or `warn`, pauses the run instead of failing the
 Fix the gate or install its tool. If the fix changes the `quality` block while the run is active, a person must also run `/sl-quality accept`, or every gate fails (see [Protected files](#protected-files)). Then:
 
 - `/sl-go` resumes the run and clears `pausedFor`. The next stop runs every gate of the phase again.
-- `/sl-advance` skips the phase, as it does from any pause, and clears `pausedFor`. The run stays paused until `/sl-go`.
+- `/sl-advance` skips the phase, as it does from any pause, clears `pausedFor` and moves to the next phase. The run stays paused until `/sl-go`, and the gates are [waived](#waived-gates).
+
+## Waived gates
+
+`/sl-advance` is the human override and works from any state, including a run paused by a broken gate. When it passes a phase that has gates, it runs none of them. It selects them as the Stop does, from the phase name and, in feature mode, `steps` (a `"last"` gate is waived only on the last step), without running a gate or a git call. The history gets `result: "skipped"` as for any advance, and `state.qualityWaived` gets one entry per gate:
+
+```json
+{ "gate": "detekt", "phase": "implement", "stepId": 3, "at": "2026-11-13T10:00:00+00:00" }
+```
+
+`stepId` is present in feature mode only. `/sl-status` prints one line per entry (`quality waived: detekt in phase implement, step 3`), and `run/quality.md` has a `## Waived gates` section that every later gate run keeps. Advancing a planning phase waives nothing, because gates do not run there.
 
 ## Time budget
 

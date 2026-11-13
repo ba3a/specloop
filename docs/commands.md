@@ -26,7 +26,7 @@ Show the state: the raw state JSON in single mode, a step summary in feature mod
 
 ## `/sl-advance`
 
-Force-pass the current phase. Blocked in a chat that is not the owner while the workflow is `active`.
+Force-pass the current phase. Blocked in a chat that is not the owner while the workflow is `active`. It also works from a run paused by a [broken gate](quality-gates.md#broken-gates): it clears `pausedFor` and moves on. The [quality gates](quality-gates.md#waived-gates) the phase would have run are skipped, not run, and recorded in `qualityWaived` in `state.json`; `/sl-status` and `run/quality.md` list them, and the reviewer treats each as a finding.
 
 ## `/sl-reset`
 
