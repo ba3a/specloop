@@ -148,6 +148,17 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn("{{prefix}}", feature)
         self.assertTrue(os.path.exists(self.path(".claude", "specloop", "phases", "feature-plan.md")))
 
+    def test_presets_are_installed_and_replaced_on_update(self):
+        install.install(self.root, test_command="make test")
+        presets = self.path(".claude", "specloop", "presets")
+        self.assertEqual(["go", "java-gradle", "java-maven", "kotlin-gradle", "node", "python", "rust"],
+                         sorted(n[:-5] for n in os.listdir(presets)))
+        self.write(".claude/specloop/presets/go.json", "edited")
+        self.write(".claude/specloop/presets/stale.json", "{}")
+        install.install(self.root)
+        self.assertEqual("go.mod", self.read_json(".claude", "specloop", "presets", "go.json")["detect"][0])
+        self.assertFalse(os.path.exists(os.path.join(presets, "stale.json")))
+
     def test_no_subagent_stop_hook_installed(self):
         install.install(self.root, test_command="make test")
         self.assertTrue(os.path.exists(self.path(".claude", "specloop", "phases", "delegate.md")))

@@ -1,0 +1,18 @@
+{
+  "detect": ["build.gradle.kts", "settings.gradle.kts", "src/main/kotlin/**/*.kt"],
+  "quality": {
+    "gates": {
+      "detekt": {
+        "command": "./gradlew detekt -q",
+        "hint": "Fix the finding instead of suppressing it or changing the detekt configuration.",
+        "protect": ["detekt.yml", "config/detekt/"],
+        "forbid": [
+          { "pattern": "@Suppress\\(", "glob": ["*.kt", "*.kts"], "message": "Fix the finding instead of suppressing it." }
+        ]
+      },
+      "tests": {
+        "command": "./gradlew test -q"
+      }
+    }
+  }
+}

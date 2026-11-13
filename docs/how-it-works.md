@@ -43,6 +43,7 @@ Files in `<project>/.claude/specloop/`:
 | `config.json` | **project** | Your overrides, deep-merged over `defaults.json`. |
 | `config.local.json` | **person** | Your personal overrides, deep-merged over `config.json`. Git-ignored. See [Configuration](configuration.md#personal-configuration-configlocaljson). |
 | `phases/<phase>.md` | kit (replaced on update) | Shipped phase instructions. |
+| `presets/<name>.json` | kit (replaced on update) | The [quality presets](quality-gates.md#presets-and-guided-setup) `/sl-quality init` offers. Never applied by themselves. |
 | `overrides/<phase>.md` | **project** | Your phase instructions; take precedence over `phases/`. |
 | `state.json`, `state.lock`, `run/` | runtime | Current state, its lock, plan and review files. |
 | `run/quality.md`, `run/quality/` | runtime | The [quality gates](quality-gates.md#results-file) report of the last gate run and each gate's complete output. Both move to `run/steps/<id>/` when a feature-mode step finishes. |

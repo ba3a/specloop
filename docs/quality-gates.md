@@ -265,6 +265,30 @@ After changing `checkTimeoutSec` or `quality.timeoutSec`, run the install comman
 
 A gate mark left by a stop that was killed counts as stale after the same sum, `checkTimeoutSec + quality.timeoutSec + 60` seconds; `/sl-go` clears it at once (see [Several chats in one project](multiple-chats.md#state-files)).
 
+## Presets and guided setup
+
+specloop ships a starting block for common stacks in `presets/<name>.json`. A preset holds a `detect` list of project-relative files (globs such as `src/main/kotlin/**/*.kt` allowed) and a `quality` block that passes [validation](#validation). Presets belong to the kit: an update replaces them, and nothing applies one by itself.
+
+| Preset | Detected by | Gates |
+|--------|-------------|-------|
+| `kotlin-gradle` | `build.gradle.kts`, `settings.gradle.kts`, Kotlin sources | `detekt`, `tests` |
+| `java-gradle` | `build.gradle`, `settings.gradle`, Java sources | `tests` |
+| `java-maven` | `pom.xml` | `tests` |
+| `python` | `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `ruff.toml` | `ruff`, `mypy`, `tests` |
+| `node` | `package.json` | `eslint`, `typecheck`, `tests` |
+| `go` | `go.mod` | `golangci-lint`, `tests` |
+| `rust` | `Cargo.toml` | `clippy`, `tests` |
+
+The linter and type-check gates of a preset also declare `protect` (the tool's configuration files) and `forbid` (the comment or attribute that silences a finding), so a run cannot pass them by weakening the tool. `forbid` needs a git repository (see [Validation](#validation)).
+
+`/sl-quality init [preset]` refuses while a run is going (status `active`, `paused` or `stalled`). Otherwise it prints the presets whose `detect` entries exist in the project, each with its block, or only the named preset whether or not it is detected. An unknown name lists the valid ones. The command changes nothing; the shipped template then has Claude set the block up with you:
+
+1. Read the build files and adapt the preset: keep only the gates whose tasks and tools exist (for Gradle, check the task list), and add gates for tools the project has that the preset lacks.
+2. Propose `protect` and `forbid` entries that fit the project.
+3. Run every gate once with `/sl-quality run`. If the project is not clean today, suggest the tool's own baseline (for example a detekt baseline file) or `legacy: "ratchet"` (see [Existing problems](#existing-problems)).
+4. Show you the block and the results, and write it only after you approve. It changes only the `quality` key of `config.json`, keeps the file's other keys, and never touches `config.local.json`.
+5. If the block's `timeoutSec` is above the [budget in force](#time-budget), say that the install command must be run again.
+
 ## Changing gates in config.local.json
 
 `gates` is an object, not a list, so the deep merge of [`config.local.json`](configuration.md#personal-configuration-configlocaljson) works per gate and per key. Set one key to change it, or set a gate to `null` to remove it for yourself:
@@ -296,7 +320,7 @@ The shipped `review.md` and `step-review.md` tell the reviewer to read `run/qual
 - a warning when `quality.timeoutSec` is above the budget in force (see [Time budget](#time-budget)). It names the install command that fixes it: `python install.py <project>` from the specloop clone, with the options recorded by the installer (`--scope`, `--no-gitignore`) when there are any;
 - the programs gates start that cannot be found. specloop judges the first word of each command (leading `VAR=value` words are skipped) with `shutil.which`; shell builtins and keywords are not judged, and a path such as `./gradlew` counts as found when the file exists in the project. The check uses the `PATH` of the command, which may differ from the shell the gate runs in, so treat it as a hint.
 
-`/sl-quality run` is described under [Trying gates with run](#trying-gates-with-run), and `/sl-quality accept` under [Accepting changes](#accepting-changes). The command never raises: unbalanced quotes in the arguments, a malformed `quality` block or an unreadable state print a message instead. An unknown form prints the usage. `/sl-status` also prints one line per gate from the last gate run (`quality: <gate> <result> (phase <phase>)`) and one line per gate waived by a person, in single mode and in feature mode.
+`/sl-quality init` is described under [Presets and guided setup](#presets-and-guided-setup), `/sl-quality run` under [Trying gates with run](#trying-gates-with-run), and `/sl-quality accept` under [Accepting changes](#accepting-changes). The command never raises: unbalanced quotes in the arguments, a malformed `quality` block or an unreadable state print a message instead. An unknown form prints the usage. `/sl-status` also prints one line per gate from the last gate run (`quality: <gate> <result> (phase <phase>)`) and one line per gate waived by a person, in single mode and in feature mode.
 
 ### Trying gates with run
 

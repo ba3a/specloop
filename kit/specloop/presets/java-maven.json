@@ -1,0 +1,10 @@
+{
+  "detect": ["pom.xml"],
+  "quality": {
+    "gates": {
+      "tests": {
+        "command": "mvn -q -B test"
+      }
+    }
+  }
+}

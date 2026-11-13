@@ -3221,7 +3221,7 @@ class QualityCommandTest(GateProject):
             self.assertNotIn(name, tools)
 
     def test_unknown_forms_print_the_usage(self):
-        for args in ("bogus", "init kotlin", "accept now", "--help"):
+        for args in ("bogus", "init go rust", "accept now", "--help"):
             with self.subTest(args=args):
                 out = self.quality(args)
                 self.assertIn("Usage: /sl-quality", out)
@@ -4036,6 +4036,132 @@ class QualityRunTest(ChangedFilesProject):
         with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.root}), contextlib.redirect_stdout(out):
             self.assertEqual(0, workflow.main(["quality", "run", "lint"]))
         self.assertIn("  lint: pass", out.getvalue())
+
+
+PRESET_NAMES = ["go", "java-gradle", "java-maven", "kotlin-gradle", "node", "python", "rust"]
+
+
+class PresetsTest(GateProject):
+    """kit/specloop/presets/*.json and /sl-quality init."""
+
+    def quality(self, args=""):
+        return workflow.cmd_quality(self.root, args)
+
+    def preset(self, name):
+        with open(os.path.join(KIT, "presets", name + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def touch(self, rel):
+        path = os.path.join(self.root, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("x")
+
+    def test_the_seven_presets_exist(self):
+        self.assertEqual(PRESET_NAMES, sorted(n[:-5] for n in os.listdir(os.path.join(KIT, "presets"))))
+
+    def test_each_preset_has_detect_files_and_a_quality_block_with_gates(self):
+        for name in PRESET_NAMES:
+            data = self.preset(name)
+            self.assertEqual({"detect", "quality"}, set(data), name)
+            self.assertTrue(data["detect"] and all(isinstance(d, str) and d for d in data["detect"]), name)
+            self.assertTrue(data["quality"]["gates"], name)
+
+    def test_each_quality_block_passes_validate_quality(self):
+        self.git_init()  # forbid needs a git repository
+        for name in PRESET_NAMES:
+            self.set_config({"quality": self.preset(name)["quality"]})
+            self.assertEqual([], workflow.validate_quality(self.root, self.config()), name)
+
+    def test_the_gates_the_spec_names_are_there(self):
+        wanted = {"kotlin-gradle": {"detekt", "tests"}, "python": {"ruff", "mypy", "tests"},
+                  "go": {"golangci-lint", "tests"}, "rust": {"clippy", "tests"}}
+        for name, gates in wanted.items():
+            self.assertTrue(gates <= set(self.preset(name)["quality"]["gates"]), name)
+        self.assertEqual({"eslint", "typecheck", "tests"}, set(self.preset("node")["quality"]["gates"]))
+
+    def test_init_lists_the_presets_whose_detect_files_exist_with_their_blocks(self):
+        self.touch("pom.xml")
+        self.touch("go.mod")
+        out = self.quality("init")
+        self.assertIn("Preset java-maven (detected: pom.xml):", out)
+        self.assertIn("Preset go (detected: go.mod):", out)
+        self.assertIn('"command": "mvn -q -B test"', out)
+        self.assertNotIn("Preset rust", out)
+        self.assertNotIn("Preset python", out)
+
+    def test_init_detects_a_glob(self):
+        self.touch("src/main/kotlin/app/Main.kt")
+        self.assertIn("Preset kotlin-gradle (detected: src/main/kotlin/**/*.kt):", self.quality("init"))
+
+    def test_init_without_a_match_says_so_and_lists_the_presets(self):
+        out = self.quality("init")
+        self.assertIn("No preset matches this project", out)
+        for name in PRESET_NAMES:
+            self.assertIn(name, out)
+
+    def test_init_with_a_name_prints_that_preset_whether_or_not_it_is_detected(self):
+        out = self.quality("init rust")
+        self.assertIn("Preset rust:", out)
+        self.assertIn("cargo clippy", out)
+        self.assertNotIn("(detected", out)
+        self.assertNotIn("Preset go", out)
+
+    def test_init_with_an_unknown_name_lists_the_valid_ones(self):
+        out = self.quality("init cobol")
+        self.assertIn("Unknown preset 'cobol'", out)
+        self.assertIn(", ".join(PRESET_NAMES), out)
+
+    def test_init_with_two_names_prints_the_usage(self):
+        self.assertIn("Usage:", self.quality("init go rust"))
+
+    def test_init_writes_nothing(self):
+        self.touch("go.mod")
+        self.set_config({"commandPrefix": "x-"})
+        before = self.read(os.path.join(self.base, "config.json"))
+        self.quality("init go")
+        self.assertEqual(before, self.read(os.path.join(self.base, "config.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "config.local.json")))
+
+    def test_init_refuses_during_a_run(self):
+        self.touch("go.mod")
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        for status in ("active", "paused", "stalled"):
+            workflow.update_state(self.root, lambda s, status=status: s.update(status=status))
+            out = self.quality("init go")
+            self.assertIn("Nothing was set up: the workflow is %s" % status, out)
+            self.assertNotIn("golangci", out)
+
+    def test_init_works_when_the_workflow_is_done_or_there_is_none(self):
+        self.assertIn("golangci", self.quality("init go"))
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.update_state(self.root, lambda s: s.update(status="done"))
+        self.assertIn("golangci", self.quality("init go"))
+
+    def test_init_without_presets_installed_says_so(self):
+        shutil.rmtree(os.path.join(self.base, "presets"))
+        self.assertIn("No presets are installed", self.quality("init"))
+
+    def test_a_broken_preset_file_is_left_out(self):
+        with open(os.path.join(self.base, "presets", "broken.json"), "w") as f:
+            f.write("{")
+        self.assertNotIn("broken", self.quality("init cobol").split("are:")[1])
+
+    def test_the_template_tells_claude_to_adapt_run_and_write_only_the_quality_key_after_approval(self):
+        with open(os.path.join(os.path.dirname(KIT), "commands", "quality.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("Adapt the preset", text)
+        self.assertIn("quality run", text)
+        self.assertIn("protect", text)
+        self.assertIn("forbid", text)
+        self.assertIn('legacy: "ratchet"', text)
+        self.assertIn("baseline", text)
+        self.assertIn("Write nothing before the user approves", text)
+        self.assertIn("`quality` key", text)
+        self.assertIn("Never touch `.claude/specloop/config.local.json`", text)
+        self.assertIn("install command", text)
+        self.assertNotIn("/sl-", text)
 
 
 if __name__ == "__main__":

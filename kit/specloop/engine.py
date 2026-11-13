@@ -33,6 +33,7 @@ Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 import collections
 import contextlib
 import fnmatch
+import glob
 import hashlib
 import io
 import json
@@ -4102,7 +4103,83 @@ def quality_run(root, config, args):
     return manual_run_text(config, runs)
 
 
-QUALITY_FORMS = {"accept": quality_accept, "run": quality_run}  # form name -> handler(root, config, args); init adds its own
+PRESETS_DIR = "presets"
+
+
+def load_presets(root):
+    """The shipped presets as an ordered {name: {"detect": [...], "quality": {...}}}, from presets/*.json. A file
+    that cannot be read or is not an object with a `quality` object is left out. Never raises."""
+    presets = collections.OrderedDict()
+    try:
+        names = sorted(n for n in os.listdir(_path(root, PRESETS_DIR)) if n.endswith(".json"))
+    except OSError:
+        return presets
+    for file_name in names:
+        try:
+            with open(_path(root, PRESETS_DIR, file_name), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("quality"), dict):
+            detect = data.get("detect")
+            presets[file_name[:-len(".json")]] = {
+                "detect": [d for d in detect if isinstance(d, str)] if isinstance(detect, list) else [],
+                "quality": data["quality"]}
+    return presets
+
+
+def preset_detected(root, preset):
+    """The `detect` entries of the preset that match a file or directory of the project (globs allowed)."""
+    found = []
+    for pattern in preset["detect"]:
+        try:
+            if glob.glob(os.path.join(glob.escape(root), *pattern.split("/")), recursive=True):
+                found.append(pattern)
+        except Exception:  # an odd pattern must not break the listing
+            continue
+    return found
+
+
+def preset_lines(name, preset, detected=None):
+    head = "Preset %s" % name
+    if detected:
+        head += " (detected: %s)" % ", ".join(detected)
+    return [head + ":", json.dumps({"quality": preset["quality"]}, indent=2)]
+
+
+def quality_init(root, config, args):
+    """/sl-quality init [preset]: print the presets whose detect files exist, or the named one, for Claude to adapt
+    (see the command template). Refuses during a run. Changes nothing."""
+    quality = cmd_name(config, "quality")
+    if len(args) > 1:
+        return quality_usage(config)
+    try:
+        state = load_state(root)
+    except Exception:  # an unreadable state does not mean a run is going
+        state = None
+    if state and state.get("status") in ACCEPT_STATUSES:
+        return ("Nothing was set up: the workflow is %s, and %s init sets up gates between runs. Finish the run "
+                "or reset it with %s, then try again." % (state["status"], quality, cmd_name(config, "reset")))
+    presets = load_presets(root)
+    if not presets:
+        return "No presets are installed (expected %s/*.json); install specloop again." % _rel(PRESETS_DIR)
+    names = ", ".join(presets)
+    if args:
+        if args[0] not in presets:
+            return "Unknown preset %r. The presets are: %s." % (args[0], names)
+        return "\n".join(preset_lines(args[0], presets[args[0]]))
+    lines = []
+    for name, preset in presets.items():
+        detected = preset_detected(root, preset)
+        if detected:
+            lines += preset_lines(name, preset, detected) + [""]
+    if not lines:
+        return "No preset matches this project. The presets are: %s.\nName one to print it: %s init <preset>." % (
+            names, quality)
+    return "\n".join(lines).rstrip()
+
+
+QUALITY_FORMS = {"accept": quality_accept, "init": quality_init, "run": quality_run}  # form -> handler
 
 
 def cmd_quality(root, args):
