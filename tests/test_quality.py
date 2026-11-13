@@ -3221,7 +3221,7 @@ class QualityCommandTest(GateProject):
             self.assertNotIn(name, tools)
 
     def test_unknown_forms_print_the_usage(self):
-        for args in ("bogus", "run", "init kotlin", "accept now", "--help"):
+        for args in ("bogus", "init kotlin", "accept now", "--help"):
             with self.subTest(args=args):
                 out = self.quality(args)
                 self.assertIn("Usage: /sl-quality", out)
@@ -3827,6 +3827,215 @@ class QualityPromptTest(ChangedFilesProject):
         for name in ("implement.md", "step-implement.md"):
             with open(os.path.join(KIT, "phases", name), encoding="utf-8") as f:
                 self.assertIn("{quality_gates}", f.read())
+
+
+class QualityRunTest(ChangedFilesProject):
+    """/sl-quality run: gates tried now, outside the workflow."""
+
+    def quality(self, args="run"):
+        return workflow.cmd_quality(self.root, args)
+
+    def state_bytes(self):
+        with open(os.path.join(self.base, "state.json"), "rb") as f:
+            return f.read()
+
+    def start_implement(self, gates, **quality):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": dict(quality, gates=gates)})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.assertIn("entering phase 'implement'", self.stop()["reason"])
+
+    def manual_log(self, name):
+        with open(os.path.join(self.base, "run", "quality-manual", name + ".log"), encoding="utf-8") as f:
+            return f.read()
+
+    def line(self, out, name):
+        return [l for l in out.splitlines() if l.startswith("  %s: " % name)][0]
+
+    def test_the_template_tells_claude_to_run_it_through_bash_with_a_timeout(self):
+        with open(os.path.join(os.path.dirname(KIT), "commands", "quality.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("quality run", text)
+        self.assertIn("Bash", text)
+        self.assertIn("timeout", text)
+        self.assertIn("sh .claude/specloop/run.sh quality run", text)
+
+    def test_runs_every_gate_in_declared_order_with_result_duration_and_metric(self):
+        self.set_config({"quality": {"gates": {
+            "zeta": {"command": "echo ok"},
+            "alpha": {"command": "echo coverage: 91.5%", "metric": {"pattern": "coverage: ([0-9.]+)%", "min": 80}},
+            "bad": {"command": "echo boom; exit 1"}}}})
+        out = self.quality()
+        self.assertLess(out.index("zeta"), out.index("alpha"))
+        self.assertLess(out.index("alpha"), out.index("bad"))
+        zeta, alpha, bad = (self.line(out, n) for n in ("zeta", "alpha", "bad"))
+        self.assertRegex(zeta, r"^  zeta: pass, [0-9.]+s, log ")
+        self.assertRegex(alpha, r"^  alpha: pass, [0-9.]+s, metric 91\.5, log ")
+        self.assertRegex(bad, r"^  bad: fail, [0-9.]+s, log ")
+        self.assertIn(".claude/specloop/run/quality-manual/alpha.log", alpha)
+
+    def test_named_gates_only_in_declared_order(self):
+        self.set_config({"quality": {"gates": {name: self.counting(name, "exit 0") for name in ("a", "b", "c")}}})
+        out = self.quality("run c a")
+        self.assertEqual([1, 0, 1], [self.marker(n) for n in ("a", "b", "c")])
+        self.assertLess(out.index("  a: "), out.index("  c: "))
+        self.assertNotIn("  b: ", out)
+
+    def test_logs_go_to_quality_manual_and_quality_is_untouched(self):
+        self.start_implement({"lint": {"command": "echo lint-ran; exit 1"}})
+        self.assertEqual("block", self.stop()["decision"])
+        self.assertIn("lint-ran", self.gate_log("lint"))
+        run = os.path.join(self.base, "run")
+        with open(os.path.join(run, "quality", "lint.log"), "rb") as f:
+            before = f.read()
+        before_files = sorted(os.listdir(os.path.join(run, "quality")))
+        self.set_config({"quality": {"gates": {"lint": {"command": "echo manual-ran"}}}})
+        self.quality()
+        self.assertIn("manual-ran", self.manual_log("lint"))
+        with open(os.path.join(run, "quality", "lint.log"), "rb") as f:
+            self.assertEqual(before, f.read())
+        self.assertEqual(before_files, sorted(os.listdir(os.path.join(run, "quality"))))
+
+    def test_without_a_run_no_quality_directory_appears(self):
+        self.set_config({"quality": {"gates": {"lint": {"command": "echo hi"}}}})
+        self.quality()
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "quality-manual", "lint.log")))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality")))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality.md")))
+
+    def test_state_is_unchanged_during_a_run_and_without_one(self):
+        self.set_config({"quality": {"gates": {"lint": {"command": "exit 1"}, "t": {"command": "exit 127"}}}})
+        self.quality()
+        self.assertFalse(os.path.exists(os.path.join(self.base, "state.json")))
+        self.start_implement({"lint": {"command": "exit 0"}, "t": {"command": "exit 0"}})
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 1"}}},
+                         "quality": {"gates": {"lint": {"command": "exit 1"}, "t": {"command": "exit 127"}}}})
+        before = self.state_bytes()
+        self.quality()
+        self.assertEqual(before, self.state_bytes())
+        self.assertEqual("active", self.state()["status"])
+
+    def test_an_unknown_gate_lists_the_valid_names(self):
+        self.set_config({"quality": {"gates": {"a": self.counting("a", "exit 0"), "b": {"command": "exit 0"}}}})
+        out = self.quality("run a nope")
+        self.assertIn("Unknown gate: nope", out)
+        self.assertIn("a, b", out)
+        self.assertEqual(0, self.marker("a"))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality-manual")))
+
+    def test_a_failing_gate_shows_the_end_of_its_output(self):
+        self.set_config({"maxOutputChars": 300, "quality": {"gates": {
+            "lint": {"command": "for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 "
+                                "29 30; do echo line-$i-padding-padding; done; exit 3"},
+            "fine": {"command": "echo fine-output"}}}})
+        out = self.quality()
+        self.assertIn("### lint (exit code 3)", out)
+        self.assertIn("line-30-padding", out)
+        self.assertNotIn("line-1-padding", out)
+        self.assertNotIn("fine-output", out)
+        self.assertIn("line-1-padding", self.manual_log("lint"))
+
+    def test_a_broken_gate_is_reported_and_the_rest_still_run(self):
+        self.set_config({"quality": {"gates": {"gone": {"command": "exit 127"}, "ok": self.counting("ok", "exit 0")}}})
+        out = self.quality()
+        self.assertRegex(self.line(out, "gone"), r"^  gone: broken \(.*127.*\)")
+        self.assertIn("### gone", out)
+        self.assertEqual(1, self.marker("ok"))
+
+    def test_an_invalid_gate_is_broken_and_does_not_run(self):
+        self.set_config({"quality": {"gates": {"bad": self.counting("bad", "exit 0", level="loud")}}})
+        out = self.quality()
+        self.assertIn("bad: broken (invalid definition", out)
+        self.assertEqual(0, self.marker("bad"))
+
+    def test_a_warning_gate_is_a_warn(self):
+        self.set_config({"quality": {"gates": {"style": {"command": "echo meh; exit 1", "level": "warn"}}}})
+        out = self.quality()
+        self.assertIn("  style: warn", out)
+        self.assertIn("meh", out)
+
+    def test_steps_and_phases_are_not_honoured(self):
+        self.start_implement({"late": self.counting("late", "exit 0", steps="last")})
+        workflow.cmd_advance(self.root)
+        self.assertEqual("review", self.state()["phase"])
+        self.quality()
+        self.assertEqual(1, self.marker("late"))
+
+    def test_protected_files_and_forbidden_lines_are_not_checked(self):
+        self.write("rules.yml", "a\n")
+        self.git("add", "rules.yml")
+        self.git("commit", "-q", "-m", "rules")
+        gate = self.counting("lint", "exit 0", protect=["rules.yml"], forbid=["TODO"])
+        self.start_implement({"lint": gate})
+        self.write("rules.yml", "changed\n")
+        self.write("new.txt", "TODO\n")
+        out = self.quality()
+        self.assertIn("  lint: pass", out)
+        self.assertEqual(1, self.marker("lint"))
+
+    def test_the_time_budget_applies(self):
+        self.set_config({"quality": {"timeoutSec": 1, "gates": {"slow": {"command": "sleep 5"}}}})
+        out = self.quality()
+        self.assertIn("slow: broken (timed out", out)
+
+    def test_a_ratchet_gate_uses_the_recorded_baseline(self):
+        gate = {"command": "echo n: 7", "legacy": "ratchet", "metric": {"pattern": "n: ([0-9]+)", "max": 3}}
+        self.set_config({"quality": {"gates": {"count": gate}}})
+        self.assertIn("  count: fail", self.quality())
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.update_state(self.root, lambda s: s.update(qualityBaseline={"count": 9}))
+        self.assertIn("  count: pass", self.quality())
+
+    def test_changed_files_expand_against_the_base_ref(self):
+        self.write("tracked.txt", "before-run\n")
+        self.git("add", "tracked.txt")
+        self.git("commit", "-q", "-m", "second")
+        base = self.git("rev-parse", "HEAD~1")
+        self.set_config({"quality": {"gates": {"files": {"command": "echo {changed_files}"}}}})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.update_state(self.root, lambda s: s.update(baseRef=base, preexistingUntracked=[]))
+        self.write("fresh.txt")
+        out = self.quality()
+        self.assertIn("  files: pass", out)
+        log = self.manual_log("files")
+        self.assertIn("tracked.txt", log)
+        self.assertIn("fresh.txt", log)
+        self.assertNotIn("gone.txt", log)
+
+    def test_changed_files_file_lives_in_quality_manual(self):
+        self.set_config({"quality": {"gates": {"files": {"command": "cat {changed_files_file}"}}}})
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.update_state(self.root, lambda s: s.update(baseRef=self.git("rev-parse", "HEAD"),
+                                                           preexistingUntracked=[]))
+        self.write("fresh.txt")
+        self.quality()
+        self.assertIn("fresh.txt", self.manual_log("files"))
+        self.assertTrue(os.path.exists(os.path.join(self.base, "run", "quality-manual", "files.files")))
+        self.assertFalse(os.path.exists(os.path.join(self.base, "run", "quality")))
+
+    def test_changed_files_without_a_base_ref_is_skipped_with_a_note(self):
+        self.set_config({"quality": {"gates": {"files": self.counting("files", "echo {changed_files}")}}})
+        out = self.quality()
+        self.assertIn("files: skipped (no baseRef", out)
+        self.assertEqual(0, self.marker("files"))
+        self.assertIn("did not run", self.manual_log("files"))
+
+    def test_no_gates(self):
+        self.assertIn("No quality gates are configured", self.quality())
+
+    def test_the_prefix_is_used_in_the_usage_not_in_run_output(self):
+        self.set_config({"commandPrefix": "x-", "quality": {"gates": {"a": {"command": "exit 0"}}}})
+        self.assertIn("  a: pass", self.quality())
+        self.assertIn("Usage: /x-quality", self.quality("bogus"))
+
+    def test_main_runs_quality_run(self):
+        self.set_config({"quality": {"gates": {"lint": {"command": "exit 0"}}}})
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": self.root}), contextlib.redirect_stdout(out):
+            self.assertEqual(0, workflow.main(["quality", "run", "lint"]))
+        self.assertIn("  lint: pass", out.getvalue())
 
 
 if __name__ == "__main__":

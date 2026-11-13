@@ -296,7 +296,19 @@ The shipped `review.md` and `step-review.md` tell the reviewer to read `run/qual
 - a warning when `quality.timeoutSec` is above the budget in force (see [Time budget](#time-budget)). It names the install command that fixes it: `python install.py <project>` from the specloop clone, with the options recorded by the installer (`--scope`, `--no-gitignore`) when there are any;
 - the programs gates start that cannot be found. specloop judges the first word of each command (leading `VAR=value` words are skipped) with `shutil.which`; shell builtins and keywords are not judged, and a path such as `./gradlew` counts as found when the file exists in the project. The check uses the `PATH` of the command, which may differ from the shell the gate runs in, so treat it as a hint.
 
-`/sl-quality accept` is described under [Accepting changes](#accepting-changes). The command never raises: unbalanced quotes in the arguments, a malformed `quality` block or an unreadable state print a message instead. An unknown form prints the usage. `/sl-status` also prints one line per gate from the last gate run (`quality: <gate> <result> (phase <phase>)`) and one line per gate waived by a person, in single mode and in feature mode.
+`/sl-quality run` is described under [Trying gates with run](#trying-gates-with-run), and `/sl-quality accept` under [Accepting changes](#accepting-changes). The command never raises: unbalanced quotes in the arguments, a malformed `quality` block or an unreadable state print a message instead. An unknown form prints the usage. `/sl-status` also prints one line per gate from the last gate run (`quality: <gate> <result> (phase <phase>)`) and one line per gate waived by a person, in single mode and in feature mode.
+
+### Trying gates with run
+
+`/sl-quality run [gate...]` runs the named gates, or all of them when none is named, in the order they are declared. It uses the same runner, [exit-code and metric rules](#pass-criteria), [ratchet](#existing-problems) baseline (when the state has one) and [time budget](#time-budget) as a run, and changes nothing in the workflow: it writes no state, uses no iteration, pauses nothing and works with or without a run.
+
+- **Logs.** Each gate's complete output goes to `run/quality-manual/<gate>.log`, replaced on each run. `run/quality/` and `run/quality.md` are never touched, so a manual run cannot change what the reviewer sees. `{changed_files_file}` is written to `run/quality-manual/<gate>.files`.
+- **What is ignored.** `steps` and the phase: every named gate runs whatever phase the workflow is in, or without a workflow. [Protected files and forbidden lines](#protected-files) are checked only during a run, so `quality run` does not report them. A gate with an invalid definition is `broken` and does not run. A broken gate does not stop the others, and `failFast` is not applied.
+- **Changed files.** `{changed_files}` and `{changed_files_file}` expand against the `baseRef` the state recorded. With no `baseRef` (no run was started in this repository) the gate is `skipped` and the line says so.
+- **Output.** One line per gate: `<gate>: <result>, <duration>s, metric <value>, log <path>`, with the reason after a `broken` or `skipped` result and the metric only when the gate has one. The end of the output of each gate that failed, warned or broke follows, within `maxOutputChars`.
+- **Unknown names.** A name that is not a gate prints the valid names and runs nothing.
+
+Gates can take minutes, longer than the time limit of the `!` line that starts a slash command, so the shipped template tells Claude to run `sh .claude/specloop/run.sh quality run [gate...]` through the Bash tool, in the foreground, with a timeout long enough for the gates. PreToolUse allows that call; only `quality accept` and `advance` are denied (see [Guard rails](guard-rails.md)).
 
 ## See also
 

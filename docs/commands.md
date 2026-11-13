@@ -42,6 +42,8 @@ Delete the state and the `run/` artifacts. Blocked in a chat that is not the own
 
 `/sl-quality accept` needs a run (status `active`, `paused` or `stalled`) and refuses with an explanation otherwise. It takes the protected files, the `quality` block and the forbidden lines as they are now as the run's own, so the gates stop reporting them, and prints each change it accepted. Only a person can run it: Claude cannot invoke it, and PreToolUse denies it in Bash. See [Quality gates](quality-gates.md#accepting-changes).
 
+`/sl-quality run [gate...]` runs the named gates, or all of them, now and in declared order, with the same runner, exit-code and metric rules and time budget as a run, but with no change to the workflow: no state write, no iteration, no pause. It prints one line per gate with its result, duration, metric value and log path, then the end of the output of each gate that did not pass. Logs go to `run/quality-manual/`; `run/quality/` is untouched. It honours neither `steps` nor the phase, and does not check protected files or forbidden lines. An unknown gate name prints the valid names. Because it can outlast the time limit of a `!` line, the command template has Claude run it through Bash with a suitable timeout. See [Quality gates](quality-gates.md#trying-gates-with-run).
+
 `/sl-status` also prints one line per gate from the last gate run, and the gates a person waived.
 
 ## Notes

@@ -1599,6 +1599,7 @@ def quality_errors_message(config, errors):
 
 
 QUALITY_DIR = "quality"
+QUALITY_MANUAL_DIR = "quality-manual"  # the logs of `quality run`, which never touches QUALITY_DIR
 TRUNCATED = "...(truncated)...\n"
 
 
@@ -1680,17 +1681,18 @@ def selected_gates(config, state):
     return selected
 
 
-def gate_log_path(root, name):
-    return os.path.join(run_dir(root), QUALITY_DIR, name + ".log")
+def gate_log_path(root, name, directory=QUALITY_DIR):
+    return os.path.join(run_dir(root), directory, name + ".log")
 
 
-def write_gate_log(root, name, raw):
-    """Replace run/quality/<name>.log. A name that is not a valid gate name gets no file. Never raises."""
+def write_gate_log(root, name, raw, directory=QUALITY_DIR):
+    """Replace run/<directory>/<name>.log (run/quality/ unless a manual run says otherwise). A name that is not a
+    valid gate name gets no file. Never raises."""
     if not (isinstance(name, str) and GATE_NAME.fullmatch(name)):
         return
     try:
-        os.makedirs(os.path.dirname(gate_log_path(root, name)), exist_ok=True)
-        with open(gate_log_path(root, name), "wb") as f:
+        os.makedirs(os.path.dirname(gate_log_path(root, name, directory)), exist_ok=True)
+        with open(gate_log_path(root, name, directory), "wb") as f:
             f.write(raw)
     except OSError as e:
         print("[specloop] could not write the log of gate '%s': %s" % (name, e), file=sys.stderr)
@@ -1809,7 +1811,8 @@ def no_worse_than(metric, value, baseline):
     return value >= baseline if "min" in metric else value <= baseline
 
 
-def run_quality_gate(root, config, state, name, gate, budget_left=None, command=None, baseline=None, measure=False):
+def run_quality_gate(root, config, state, name, gate, budget_left=None, command=None, baseline=None, measure=False,
+                     log_dir=QUALITY_DIR):
     """Run one valid gate with no lock. Return (record, output): the record goes to state.qualityResults, the
     complete output to run/quality/<name>.log. Never raises. A gate that cannot give an answer (exit code 126 or
     127, a timeout, a command that cannot be started, a used-up time budget) is `broken`, and its record says why
@@ -1817,7 +1820,7 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None, command=
     of that and its own. `command` replaces gate["command"] once its placeholders are expanded. `baseline` is the
     value a ratchet gate was measured at before the first edit. With `measure` the gate is only measured: the
     metric is read whatever the exit code is, no limit is applied and the result is `pass` unless the gate is
-    broken."""
+    broken. The log goes to run/<log_dir>/."""
     timeout = gate.get("timeoutSec", config.get("checkTimeoutSec", 900))
     started = time.monotonic()
     exit_code, timed_out, reason = None, False, None
@@ -1875,7 +1878,7 @@ def run_quality_gate(root, config, state, name, gate, budget_left=None, command=
     else:
         result = failed_level
     duration = time.monotonic() - started
-    write_gate_log(root, name, raw)
+    write_gate_log(root, name, raw, log_dir)
     record = gate_record(state, name, result, exit_code, duration)
     if value is not None:
         record["metric"] = value
@@ -1948,12 +1951,12 @@ def changed_files(root, config, state, gate):
     return paths
 
 
-def changed_files_file_path(name):
-    return _rel("run", QUALITY_DIR, name + ".files")
+def changed_files_file_path(name, directory=QUALITY_DIR):
+    return _rel("run", directory, name + ".files")
 
 
-def write_changed_files_file(root, name, paths):
-    path = os.path.join(root, *changed_files_file_path(name).split("/"))
+def write_changed_files_file(root, name, paths, directory=QUALITY_DIR):
+    path = os.path.join(root, *changed_files_file_path(name, directory).split("/"))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         f.write("".join(p + "\n" for p in paths))
@@ -1965,11 +1968,12 @@ def _unrunnable(state, name, started, result, reason, text):
     return None, record, "[specloop] %s\n" % text
 
 
-def expand_changed_files(root, config, state, name, gate):
+def expand_changed_files(root, config, state, name, gate, directory=QUALITY_DIR):
     """Fill {changed_files} and {changed_files_file} in the gate's command. Return (command, record, output):
     for a gate that can run, the expanded command and no record; otherwise the command is None and the record
     is `skipped` (no changed files) or `broken` (git failed, or the list is too long for a command line), with
-    the text for its log. A command with neither placeholder is returned as it is. Never raises."""
+    the text for its log. A command with neither placeholder is returned as it is. {changed_files_file} lives in
+    run/<directory>/. Never raises."""
     command = gate["command"]
     uses_list, uses_file = (p in command for p in ("{changed_files}", "{changed_files_file}"))
     if not (uses_list or uses_file):
@@ -1978,7 +1982,7 @@ def expand_changed_files(root, config, state, name, gate):
     try:
         paths = changed_files(root, config, state, gate)
         if paths and uses_file:
-            write_changed_files_file(root, name, paths)
+            write_changed_files_file(root, name, paths, directory)
     except (ChangedFilesError, OSError) as e:
         reason = "the changed files cannot be determined: %s" % (str(e) or e.__class__.__name__)
         return _unrunnable(state, name, started, "broken", reason, reason)
@@ -1990,7 +1994,7 @@ def expand_changed_files(root, config, state, name, gate):
         reason = ("{changed_files} would be %d characters long, above the limit of %d; use {changed_files_file} "
                   "(a file with one path per line) in the command instead" % (len(listing), MAX_CHANGED_FILES_CHARS))
         return _unrunnable(state, name, started, "broken", reason, reason)
-    command = command.replace("{changed_files_file}", shlex.quote(changed_files_file_path(name)))
+    command = command.replace("{changed_files_file}", shlex.quote(changed_files_file_path(name, directory)))
     return command.replace("{changed_files}", listing), None, None
 
 
@@ -4020,7 +4024,85 @@ def quality_accept(root, config, args):
     return update_state(root, apply)
 
 
-QUALITY_FORMS = {"accept": quality_accept}  # form name -> handler(root, config, args); run and init add theirs
+def manual_gate_record(name, result, reason, text):
+    """(record, output) for a gate that `quality run` judges without running its command."""
+    return gate_record({"phase": "manual"}, name, result, None, 0, reason=reason), "[specloop] %s\n" % text
+
+
+def manual_gate_run(root, config, state, name, gate, definition_errors, budget_left):
+    """(record, output) of one gate for `quality run`. The log goes to run/quality-manual/. Protected files and
+    forbidden lines are not checked, and nothing is read from or written to the workflow except baseRef,
+    preexistingUntracked and the ratchet baseline, which {changed_files} and a ratchet gate need."""
+    if definition_errors:
+        reason = "invalid definition: %s" % "; ".join(definition_errors)
+        record, output = manual_gate_record(name, "broken", reason, "the gate did not run: %s" % reason)
+    else:
+        command = gate["command"]
+        if ("{changed_files}" in command or "{changed_files_file}" in command) and not state.get("baseRef"):
+            reason = "no baseRef: the workflow has not started a run in this repository, so there is no comparison point"
+            record, output = manual_gate_record(name, "skipped", reason, "skipped: %s; the command did not run" % reason)
+        else:
+            stand_in = {"phase": "manual", "baseRef": state.get("baseRef"),
+                        "preexistingUntracked": state.get("preexistingUntracked", [])}
+            command, record, output = expand_changed_files(root, config, stand_in, name, gate, QUALITY_MANUAL_DIR)
+            if not record:
+                return run_quality_gate(root, config, stand_in, name, gate, budget_left, command,
+                                        _metric_number(baseline_values(state).get(name)), log_dir=QUALITY_MANUAL_DIR)
+    write_gate_log(root, name, output.encode("utf-8"), QUALITY_MANUAL_DIR)
+    return record, output
+
+
+def manual_gate_line(record):
+    text = "  %s: %s" % (record["name"], record["result"])
+    if record.get("reason"):
+        text += " (%s)" % str(record["reason"]).strip().rstrip(".")
+    text += ", %ss" % _seconds_text(record.get("durationSec", 0))
+    if _metric_number(record.get("metric")) is not None:
+        text += ", metric %s" % _number_text(record["metric"])
+    return text + ", log %s" % _rel("run", QUALITY_MANUAL_DIR, record["name"] + ".log")
+
+
+def manual_run_text(config, runs):
+    """The output of `quality run`: a line per gate, then the end of the output of each gate that did not pass."""
+    lines = ["Quality gates run now, outside the workflow (nothing was recorded):"]
+    lines += [manual_gate_line(record) for record, _ in runs]
+    failing = [(r, o.rstrip("\n")) for r, o in runs if r["result"] in ("fail", "warn", "broken")]
+    shares = _shares([len(o) for _, o in failing], config.get("maxOutputChars", 4000))
+    for (record, output), share in zip(failing, shares):
+        lines += ["", "### %s (%s)" % (record["name"], _gate_exit(record)), _clip_tail(output, share)]
+    return "\n".join(lines)
+
+
+def quality_run(root, config, args):
+    """/sl-quality run [gate...]: run the named gates, or all, now and in declared order, with the runner, the
+    exit-code and metric rules and the time budget of a run, but with no change to the workflow: no state write,
+    no iteration, no pause. Logs go to run/quality-manual/, never to run/quality/. `steps` and the phase are not
+    honoured. Takes no lock."""
+    reason = unreadable_quality(config)
+    if reason:
+        return "Nothing ran: %s." % reason
+    gates = quality_gates(config)
+    if not gates:
+        return "No quality gates are configured (see docs/quality-gates.md)."
+    unknown = [a for a in args if a not in gates]
+    if unknown:
+        return "Unknown gate%s: %s.\nThe gates are: %s." % ("s" if len(unknown) > 1 else "", ", ".join(unknown),
+                                                          ", ".join(gates))
+    try:
+        state = load_state(root) or {}
+    except Exception:  # an unreadable state must not stop a gate from being tried
+        state = {}
+    selected = [(name, gate) for name, gate in gates.items() if not args or name in args]
+    invalid = gate_definition_errors(root, config, selected)
+    budget, started = quality_budget(root, config), _clock()
+    runs = []
+    for name, gate in selected:
+        runs.append(manual_gate_run(root, config, state, name, gate, invalid.get(name),
+                                    budget - (_clock() - started)))
+    return manual_run_text(config, runs)
+
+
+QUALITY_FORMS = {"accept": quality_accept, "run": quality_run}  # form name -> handler(root, config, args); init adds its own
 
 
 def cmd_quality(root, args):
