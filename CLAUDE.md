@@ -24,6 +24,7 @@ kit/specloop/phases/*.md              shipped phase instructions (replaced on up
 kit/commands/*.md                     slash command templates; {{prefix}} is substituted on install
                                       (spec, feature, go, pause, advance, status, reset, update)
                                       kit/commands/update.md is /sl-update (check, skip, never)
+tools/check_rules.py                  enforces the machine-checkable rules below on tracked files (stdlib only)
 tests/                                unittest suites for the engine, the installer and the docs
 tests/run_parallel.py                 runs the suites on several worker processes
 tests/gitfixture.py                   git repositories for update tests: built once per process, copied per test
