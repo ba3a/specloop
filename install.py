@@ -205,7 +205,7 @@ def same_path(a, b):
 def describe_source(scope, gitignore):
     """Describe the clone that runs this installer, for update checks (manifest.json 'source')."""
     path = os.path.dirname(KIT)
-    source = {"path": os.path.abspath(path).replace("\\", "/")}
+    source: dict = {"path": os.path.abspath(path).replace("\\", "/")}
     try:
         with open(os.path.join(path, "VERSION"), encoding="utf-8") as f:
             source["version"] = f.read().strip()

@@ -51,6 +51,7 @@ import time
 import unicodedata
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 BASE_DIR = os.path.join(".claude", "specloop")
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -202,7 +203,7 @@ def current_step(state):
 def step_values(state):
     """Placeholder values for the active step; empty when no step is active."""
     index, step = current_step(state) if in_step(state) else (None, None)
-    if step is None:
+    if index is None or step is None:
         return {}
     return {
         "step_index": str(index + 1),
@@ -441,7 +442,7 @@ def run_limited(args, timeout, cwd=None, env=None, merge_stderr=False):
     and killpg on POSIX, taskkill /T on Windows) and returncode is None. stdin is the null device.
     Raises OSError when the executable cannot be started."""
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        kwargs = {} if os.name == "nt" else {"start_new_session": True}
+        kwargs: Any = {} if os.name == "nt" else {"start_new_session": True}
         proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                 stderr=subprocess.STDOUT if merge_stderr else err, **kwargs)
         timed_out = False
@@ -674,7 +675,7 @@ def cmd_update_check(root):
 def spawn_update_check(root):
     """Start `engine.py update-check` for root as a detached process. Return True when started."""
     try:
-        kwargs = {}
+        kwargs: Any = {}
         if os.name == "nt":
             kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
                                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
@@ -964,7 +965,7 @@ def header(state):
             state["phase"], state.get("iter", 0), state.get("spec", "?"))
     index, step = current_step(state) if in_step(state) else (None, None)
     where = ('feature step %d/%d "%s"' % (index + 1, len(state["approvedSteps"]["steps"]), step["title"])
-             if step is not None else "feature planning")
+             if index is not None and step is not None else "feature planning")
     return "[specloop] %s, phase=%s, iteration %d, branch=%s" % (
         where, state["phase"], state.get("iter", 0), state.get("branch") or "-")
 
@@ -1041,7 +1042,7 @@ def validate_steps(data):
             errors.append("%s: id %d is not unique" % (label, step_id))
         else:
             seen.add(step_id)
-        title = step.get("title")
+        title: Any = step.get("title")
         if not _non_empty_string(title):
             errors.append("%s: title must be a non-empty string" % label)
         elif len(title) > MAX_TITLE_LENGTH:
@@ -1203,13 +1204,13 @@ def stale_override_warning(root, config, state):
     """Overrides are never updated, so one can still send a review or a replan to run/, where the gate does not
     look. Return a warning naming each such project file that this run uses, else None."""
     if is_feature(state):
-        graphs = ((config["feature"]["planPhases"], False), (config["feature"]["stepPhases"], True))
+        graphs: tuple = ((config["feature"]["planPhases"], False), (config["feature"]["stepPhases"], True))
     else:
         graphs = ((config["phases"], False),)
     files = [(instruction_file(root, phase, phase_config, step), phase_config)
              for graph, step in graphs for phase, phase_config in graph.items()]
     files.append((_kit_file(root, "delegate"), {}))
-    found = {}
+    found: dict = {}
     for path, phase_config in files:
         if not path or os.path.dirname(path) == _path(root, "phases"):
             continue
@@ -1374,7 +1375,7 @@ def _regex_error(pattern):
 
 def _phase_definitions(config):
     """(where, name, definition) for every phase a gate may name: `phases` and `feature.stepPhases`."""
-    found = []
+    found: list = []
     for where, graph in (("phases", config.get("phases")),
                          ("feature.stepPhases", (config.get("feature") or {}).get("stepPhases")
                           if isinstance(config.get("feature"), dict) else None)):
@@ -1416,7 +1417,7 @@ def _validate_metric(where, metric):
 def _validate_forbid(where, forbid):
     if not isinstance(forbid, list):
         return ["%s.forbid must be a list" % where]
-    errors = []
+    errors: list = []
     for i, entry in enumerate(forbid):
         at = "%s.forbid[%d]" % (where, i)
         if isinstance(entry, dict):
@@ -1676,7 +1677,7 @@ def selected_gates(config, state):
     phase = state["phase"]
     selected = []
     for name, gate in quality_gates(config).items():
-        phases = gate.get("phases", DEFAULT_GATE_PHASES) if isinstance(gate, dict) else None
+        phases: Any = gate.get("phases", DEFAULT_GATE_PHASES) if isinstance(gate, dict) else None
         if (not _string_list(phases) or phase in phases) and gate_runs_on_step(gate, state):
             selected.append((name, gate))
     return selected
@@ -2116,9 +2117,9 @@ def protect_key(entry):
 
 def protected_entries(config):
     """The distinct `protect` entries of every gate, as `protect_key`s in declared order."""
-    keys = []
+    keys: list = []
     for gate in quality_gates(config).values():
-        entries = gate.get("protect") if isinstance(gate, dict) else None
+        entries: Any = gate.get("protect") if isinstance(gate, dict) else None
         if _string_list(entries):
             keys.extend(k for k in dict.fromkeys(protect_key(e) for e in entries) if k not in keys)
     return keys
@@ -2210,11 +2211,11 @@ def protected_changes(root, state, gate):
     """Lines naming the files in the gate's `protect` paths that differ from the stored fingerprints: changed,
     created (a missing file or a new file in a protected directory) or deleted. Paths whose entry was not
     fingerprinted are not compared, because a changed quality block fails the gate on its own."""
-    entries = gate.get("protect") if isinstance(gate, dict) else None
-    stored = stored_fingerprints(state).get("protected")
+    entries: Any = gate.get("protect") if isinstance(gate, dict) else None
+    stored: Any = stored_fingerprints(state).get("protected")
     if not (_string_list(entries) and isinstance(stored, dict)):
         return []
-    lines = []
+    lines: list = []
     for key in dict.fromkeys(protect_key(e) for e in entries):
         before = stored.get(key)
         if isinstance(before, dict):
@@ -2242,6 +2243,7 @@ def forbid_entries(gate):
     entries = []
     forbid = gate.get("forbid") if isinstance(gate, dict) else None
     for entry in forbid if isinstance(forbid, list) else []:
+        pattern: Any = None
         if isinstance(entry, dict):
             pattern, globs, message = entry.get("pattern"), entry.get("glob"), entry.get("message")
         else:
@@ -2324,7 +2326,7 @@ def added_lines(root, config, state, gate):
     when the run started. Binary files are skipped. Raises ChangedFilesError when git cannot answer. Holds no
     lock."""
     point, tracked, untracked = changed_file_sets(root, config, state, gate)
-    found = []
+    found: list = []
     for path in tracked:
         ok, out = git(root, config, "diff", "--unified=0", "--no-color", "--no-ext-diff", "--no-renames",
                       point, "--", path, raw=True)
@@ -2484,7 +2486,8 @@ def measure_baselines(root, config, state, outcome):
     pending = [(name, gate) for name, gate in pending if name not in invalid]  # run as broken in implement
     if not pending:
         return outcome
-    measured, runs = {}, []
+    measured: dict = {}
+    runs: list = []
     budget = quality_budget(root, config)
     started = _clock()
     for name, gate in pending:
@@ -2588,7 +2591,7 @@ def quality_accepted_lines(state):
     """Lines of the report's section on the changes a person accepted with `quality accept`, from
     state.qualityAcceptedLog. Empty when there are none."""
     log = state.get("qualityAcceptedLog")
-    lines = []
+    lines: list = []
     for entry in log if isinstance(log, list) else []:
         if not isinstance(entry, dict) or not isinstance(entry.get("changes"), list):
             continue
@@ -3931,7 +3934,7 @@ def accept_refusal(config, state):
 def current_forbid_hits(root, config, state):
     """The forbid hits of every gate that are not accepted yet, whatever the gate's phase, once per path and line
     text. Raises ChangedFilesError when git cannot answer. Holds no lock."""
-    found = collections.OrderedDict()
+    found: collections.OrderedDict = collections.OrderedDict()
     for gate in quality_gates(config).values():
         for hit in forbid_hits(root, config, state, gate):
             found.setdefault(hit["hash"], hit)
@@ -4108,7 +4111,7 @@ PRESETS_DIR = "presets"
 def load_presets(root):
     """The shipped presets as an ordered {name: {"detect": [...], "quality": {...}}}, from presets/*.json. A file
     that cannot be read or is not an object with a `quality` object is left out. Never raises."""
-    presets = collections.OrderedDict()
+    presets: collections.OrderedDict = collections.OrderedDict()
     try:
         names = sorted(n for n in os.listdir(_path(root, PRESETS_DIR)) if n.endswith(".json"))
     except OSError:

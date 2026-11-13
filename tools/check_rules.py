@@ -17,7 +17,7 @@ import ast
 import os
 import subprocess
 import sys
-from typing import Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 # (path, line, rule, message); path uses forward slashes and is relative to the repository root.
 Violation = Tuple[str, int, str, str]
@@ -155,8 +155,8 @@ def check_line_endings(rel: str, data: bytes) -> List[Violation]:
 
 def check_repo(root: str) -> List[Violation]:
     tracked = tracked_files(root)
-    found = []  # type: List[Violation]
-    trees = {}  # type: Dict[str, ast.AST]
+    found: List[Violation] = []
+    trees: Dict[str, ast.AST] = {}
     for rel in tracked:
         if rel.endswith(".py") and starts_with_any(rel, PY_GRAMMAR_ROOTS):
             tree, problems = parse_py(rel, read_bytes(root, rel))

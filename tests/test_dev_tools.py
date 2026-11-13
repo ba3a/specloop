@@ -1,6 +1,7 @@
 """The development tools (ruff, mypy) are pinned and configured; the kit never imports them."""
 
 import ast
+import configparser
 import os
 import re
 import unittest
@@ -84,6 +85,36 @@ class RuffConfigTest(unittest.TestCase):
                     "#" in line or (i > 0 and lines[i - 1].lstrip().startswith("#")),
                     "ignore without a comment: %r" % line,
                 )
+
+
+class MypyConfigTest(unittest.TestCase):
+    def sections(self):
+        parser = configparser.ConfigParser()
+        parser.read_string(read("mypy.ini"))
+        return parser
+
+    def test_runs_on_engine_installer_and_tools_without_arguments(self):
+        files = [f.strip() for f in self.sections()["mypy"]["files"].split(",")]
+        self.assertEqual(["kit/specloop/engine.py", "install.py", "tools"], files)
+        for f in files:
+            self.assertTrue(os.path.exists(os.path.join(ROOT, f)), f)
+
+    def test_checks_untyped_defs(self):
+        self.assertTrue(self.sections()["mypy"].getboolean("check_untyped_defs"))
+
+    def test_every_silenced_error_has_a_comment(self):
+        lines = read("mypy.ini").splitlines()
+        for i, line in enumerate(lines):
+            if re.match(r"\s*(?:disable_error_code|ignore_errors|ignore_missing_imports|follow_imports)\s*=", line) \
+                    or line.startswith("[mypy-"):
+                self.assertTrue(
+                    "#" in line or (i > 0 and lines[i - 1].lstrip().startswith("#")),
+                    "silenced without a comment: %r" % line,
+                )
+
+    def test_sources_carry_no_type_ignore(self):
+        for path in ("install.py", os.path.join("kit", "specloop", "engine.py"), os.path.join("tools", "check_rules.py")):
+            self.assertNotIn("# type: ignore", read(path), path)
 
 
 if __name__ == "__main__":
