@@ -1,0 +1,4 @@
+# Development tools only. Nothing in kit/ or install.py imports them and they are
+# never installed into a target project.
+ruff==0.17.5
+mypy==1.19.1

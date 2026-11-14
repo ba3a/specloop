@@ -56,17 +56,78 @@ class InstallTest(unittest.TestCase):
         settings = self.read_json(".claude", "settings.json")
         for event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "Stop"):
             self.assertEqual(1, len(self.specloop_groups(settings, event)), event)
-        self.assertEqual(960, settings["hooks"]["Stop"][0]["hooks"][0]["timeout"])
+        self.assertEqual(900 + 1800 + 60, settings["hooks"]["Stop"][0]["hooks"][0]["timeout"])
+        self.assertEqual(900 + 1800 + 60, self.read_json(".claude", "specloop", "manifest.json")["stopTimeoutSec"])
         config = self.read_json(".claude", "specloop", "config.json")
         self.assertEqual("make test", config["phases"]["implement"]["check"]["command"])
 
+    def stop_timeout(self, scope="project"):
+        name = "settings.json" if scope == "project" else "settings.local.json"
+        return self.read_json(".claude", name)["hooks"]["Stop"][0]["hooks"][0]["timeout"]
+
+    def test_stop_timeout_is_check_plus_quality_budget_plus_a_minute(self):
+        self.write(".claude/specloop/config.json", json.dumps({"checkTimeoutSec": 100, "quality": {"timeoutSec": 200}}))
+        install.install(self.root)
+        manifest = self.read_json(".claude", "specloop", "manifest.json")
+        self.assertEqual(100 + 200 + 60, self.stop_timeout())
+        self.assertEqual(360, manifest["stopTimeoutSec"])
+
+    def test_stop_timeout_uses_the_defaults_for_missing_keys(self):
+        self.write(".claude/specloop/config.json", json.dumps({"checkTimeoutSec": 100}))
+        install.install(self.root)
+        self.assertEqual(100 + 1800 + 60, self.stop_timeout())
+        self.write(".claude/specloop/config.json", json.dumps({"quality": {"timeoutSec": 50}}))
+        install.install(self.root)
+        self.assertEqual(900 + 50 + 60, self.stop_timeout())
+        self.assertEqual(1010, self.read_json(".claude", "specloop", "manifest.json")["stopTimeoutSec"])
+
+    def test_stop_timeout_ignores_malformed_settings(self):
+        self.write(".claude/specloop/config.json", json.dumps({"checkTimeoutSec": "x", "quality": {"timeoutSec": -1}}))
+        install.install(self.root)
+        self.assertEqual(900 + 1800 + 60, self.stop_timeout())
+        self.write(".claude/specloop/config.json", json.dumps({"quality": ["x"]}))
+        install.install(self.root)
+        self.assertEqual(900 + 1800 + 60, self.stop_timeout())
+
+    def test_reinstall_resizes_the_hook_and_the_manifest_together(self):
+        install.install(self.root)
+        self.write(".claude/specloop/config.json", json.dumps({"quality": {"timeoutSec": 3000}}))
+        install.install(self.root)
+        self.assertEqual(900 + 3000 + 60, self.stop_timeout())
+        manifest = self.read_json(".claude", "specloop", "manifest.json")
+        self.assertEqual(self.stop_timeout(), manifest["stopTimeoutSec"])
+        self.assertIn("commands", manifest)
+        self.assertIn("settings", manifest)
+        self.assertIn("source", manifest)
+
+    def test_local_scope_writes_the_same_timeout(self):
+        install.install(self.root, scope="local")
+        self.assertEqual(2760, self.stop_timeout("local"))
+        self.assertEqual(2760, self.read_json(".claude", "specloop", "manifest.json")["stopTimeoutSec"])
+
+    def test_test_command_still_writes_the_implement_check(self):
+        install.install(self.root, test_command="make test")
+        config = self.read_json(".claude", "specloop", "config.json")
+        self.assertEqual({"type": "command", "command": "make test"}, config["phases"]["implement"]["check"])
+        self.assertNotIn("quality", config)
+
     def test_commands_that_change_the_workflow_are_only_for_the_user(self):
         install.install(self.root, test_command="make test")
-        for name in ("spec", "feature", "go", "advance", "pause", "reset", "update"):
+        for name in ("spec", "feature", "go", "advance", "pause", "reset", "update", "quality"):
             with open(self.path(".claude", "commands", "sl-%s.md" % name), encoding="utf-8") as f:
                 self.assertIn("disable-model-invocation: true\n", f.read(), name)
         with open(self.path(".claude", "commands", "sl-status.md"), encoding="utf-8") as f:
             self.assertNotIn("disable-model-invocation", f.read())
+
+    def test_quality_command_installed_with_prefix(self):
+        install.install(self.root, test_command="make test", prefix="x-")
+        with open(self.path(".claude", "commands", "x-quality.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn('run.sh quality "$ARGUMENTS"', text)
+        self.assertIn("/x-quality", text)
+        self.assertNotIn("{{prefix}}", text)
+        manifest = self.read_json(".claude", "specloop", "manifest.json")
+        self.assertIn(".claude/commands/x-quality.md", manifest["commands"])
 
     def test_update_command_installed_with_prefix(self):
         install.install(self.root, test_command="make test")
@@ -86,6 +147,17 @@ class InstallTest(unittest.TestCase):
         self.assertIn("/sl-go", feature)
         self.assertNotIn("{{prefix}}", feature)
         self.assertTrue(os.path.exists(self.path(".claude", "specloop", "phases", "feature-plan.md")))
+
+    def test_presets_are_installed_and_replaced_on_update(self):
+        install.install(self.root, test_command="make test")
+        presets = self.path(".claude", "specloop", "presets")
+        self.assertEqual(["go", "java-gradle", "java-maven", "kotlin-gradle", "node", "python", "rust"],
+                         sorted(n[:-5] for n in os.listdir(presets)))
+        self.write(".claude/specloop/presets/go.json", "edited")
+        self.write(".claude/specloop/presets/stale.json", "{}")
+        install.install(self.root)
+        self.assertEqual("go.mod", self.read_json(".claude", "specloop", "presets", "go.json")["detect"][0])
+        self.assertFalse(os.path.exists(os.path.join(presets, "stale.json")))
 
     def test_no_subagent_stop_hook_installed(self):
         install.install(self.root, test_command="make test")
@@ -337,7 +409,7 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(self.fx.clone.replace("\\", "/"), source["path"])
         self.assertEqual(self.fx.read_version(), source["version"])
         self.assertNotIn("commit", source)
-        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        lines = [ln for ln in result.stdout.splitlines() if "update checks unavailable" in ln]
         self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
         self.assertIn("commands", manifest)
 
@@ -351,7 +423,7 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(copy.replace("\\", "/"), source["path"])
         self.assertFalse(source["checkable"])
         self.assertTrue(source["reason"])
-        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        lines = [ln for ln in result.stdout.splitlines() if "update checks unavailable" in ln]
         self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
         self.assertIn("commands", manifest)
         self.assertIn("settings", manifest)
@@ -365,7 +437,7 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(copy.replace("\\", "/"), source["path"])
         self.assertFalse(source["checkable"])
         self.assertIn("not the top of a git work tree", source["reason"])
-        lines = [l for l in result.stdout.splitlines() if "update checks unavailable" in l]
+        lines = [ln for ln in result.stdout.splitlines() if "update checks unavailable" in ln]
         self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
 
 

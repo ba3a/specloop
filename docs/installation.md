@@ -52,7 +52,7 @@ cd ~/tools/specloop && git pull
 ./install.sh ~/code/my-project
 ```
 
-An update replaces the engine, launcher, `defaults.json` and the shipped `phases/`. Your `config.json`, `config.local.json` and `overrides/` are never touched. Instead of doing this by hand, you can let specloop [check for updates and apply them](updates.md).
+An update replaces the engine, launcher, `defaults.json` and the shipped `phases/` and `presets/`. Your `config.json`, `config.local.json` and `overrides/` are never touched. Instead of doing this by hand, you can let specloop [check for updates and apply them](updates.md).
 
 An override written for 0.2.0 or earlier may still send a review to `{run_dir}/review.md` or a replan request to `{run_dir}/replan.md`. The gate no longer reads those files, so the phase would never pass. `/sl-go` prints a warning naming each such file in use. Change it to `{review_file}` for a review and `{attempt_dir}/replan.md` for a replan request (see [Review attempts](review-attempts.md)).
 

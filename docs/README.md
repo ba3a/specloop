@@ -20,6 +20,7 @@
 - [Size warnings](size-warnings.md): the warnings for specs and plans that are too big for single mode.
 - [Several chats in one project](multiple-chats.md): who drives the workflow, what other chats see and how to take over.
 - [Updates](updates.md): update checks, safe points and the `/sl-update` command.
+- [Quality gates](quality-gates.md): named checks such as linters, tests and coverage that hold a phase until they pass.
 
 ## Reference
 

@@ -1,0 +1,10 @@
+{
+  "detect": ["build.gradle", "settings.gradle", "src/main/java/**/*.java"],
+  "quality": {
+    "gates": {
+      "tests": {
+        "command": "./gradlew test -q"
+      }
+    }
+  }
+}

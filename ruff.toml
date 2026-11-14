@@ -1,0 +1,8 @@
+target-version = "py38"
+# The existing code wraps at about 120 columns, but a few lines (long messages, SVG
+# path data, one mock.patch line in a test) run longer. 160 lets them stand without a rewrite.
+line-length = 160
+
+[lint]
+select = ["E", "F", "W", "I", "B"]
+# No rule is ignored. Findings were fixed in place.

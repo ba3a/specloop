@@ -26,7 +26,7 @@ Show the state: the raw state JSON in single mode, a step summary in feature mod
 
 ## `/sl-advance`
 
-Force-pass the current phase. Blocked in a chat that is not the owner while the workflow is `active`.
+Force-pass the current phase. Blocked in a chat that is not the owner while the workflow is `active`. It also works from a run paused by a [broken gate](quality-gates.md#broken-gates): it clears `pausedFor` and moves on. The [quality gates](quality-gates.md#waived-gates) the phase would have run are skipped, not run, and recorded in `qualityWaived` in `state.json`; `/sl-status` and `run/quality.md` list them, and the reviewer treats each as a finding.
 
 ## `/sl-reset`
 
@@ -36,9 +36,21 @@ Delete the state and the `run/` artifacts. Blocked in a chat that is not the own
 
 `/sl-update [check|skip|never]` checks for a newer kit and applies it, or only reports (`check`), or silences a version (`skip`, `never`). Refused while a workflow is busy. See [Updates](updates.md#the-sl-update-command) for the forms.
 
+## `/sl-quality`
+
+`/sl-quality` lists the [quality gates](quality-gates.md): for each gate in the order it runs, its phases, level, steps and last result with the metric value. It then prints the configuration errors, a warning when `quality.timeoutSec` is above the budget the installed Stop hook leaves (naming the install command that fixes it), and the programs that gates start but that are neither on `PATH` nor files of the project, judged by the first word of each command. It changes nothing and works from any chat. Any other argument prints the usage. See [Quality gates](quality-gates.md#the-sl-quality-command).
+
+`/sl-quality accept` needs a run (status `active`, `paused` or `stalled`) and refuses with an explanation otherwise. It takes the protected files, the `quality` block and the forbidden lines as they are now as the run's own, so the gates stop reporting them, and prints each change it accepted. Only a person can run it: Claude cannot invoke it, and PreToolUse denies it in Bash. See [Quality gates](quality-gates.md#accepting-changes).
+
+`/sl-quality init [preset]` starts guided setup of the `quality` block. It refuses while a run is going (status `active`, `paused` or `stalled`). Otherwise it prints the [presets](quality-gates.md#presets-and-guided-setup) whose detect files exist in the project, or the named preset, each with its block; an unknown name lists the valid ones. It changes nothing: the command template then has Claude adapt the preset, try the gates with `quality run` and write the `quality` key of `config.json` only after you approve. See [Quality gates](quality-gates.md#presets-and-guided-setup).
+
+`/sl-quality run [gate...]` runs the named gates, or all of them, now and in declared order, with the same runner, exit-code and metric rules and time budget as a run, but with no change to the workflow: no state write, no iteration, no pause. It prints one line per gate with its result, duration, metric value and log path, then the end of the output of each gate that did not pass. Logs go to `run/quality-manual/`; `run/quality/` is untouched. It honours neither `steps` nor the phase, and does not check protected files or forbidden lines. An unknown gate name prints the valid names. Because it can outlast the time limit of a `!` line, the command template has Claude run it through Bash with a suitable timeout. See [Quality gates](quality-gates.md#trying-gates-with-run).
+
+`/sl-status` also prints one line per gate from the last gate run, and the gates a person waived.
+
 ## Notes
 
-Claude cannot run `/sl-spec`, `/sl-feature`, `/sl-go`, `/sl-advance`, `/sl-pause`, `/sl-reset` or `/sl-update` itself: their templates set `disable-model-invocation: true`, so taking over a workflow or force-passing a phase is always your decision.
+Claude cannot run `/sl-spec`, `/sl-feature`, `/sl-go`, `/sl-advance`, `/sl-pause`, `/sl-reset`, `/sl-quality` or `/sl-update` itself: their templates set `disable-model-invocation: true`, so taking over a workflow or force-passing a phase is always your decision.
 
 If specloop is busy (another process holds `state.lock`), a command prints one line asking you to retry and changes nothing.
 
@@ -48,3 +60,4 @@ If specloop is busy (another process holds `state.lock`), a command prints one l
 - [Several chats in one project](multiple-chats.md): which chat may run which command.
 - [Updates](updates.md): the forms of `/sl-update`.
 - [Configuration](configuration.md): `commandPrefix`.
+- [Quality gates](quality-gates.md): what `/sl-quality` lists, runs and accepts.

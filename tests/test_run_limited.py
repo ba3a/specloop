@@ -79,10 +79,25 @@ class HangingCommand(object):
         os.chmod(self.command, os.stat(self.command).st_mode | stat.S_IXUSR)
 
     def child_pid(self):
-        with open(self.pidfile) as f:
-            return int(f.read())
+        """The child's pid, or None if it never wrote one. On a loaded machine the timeout can kill the tree
+        before the child's interpreter has started; a child that escaped the kill still writes its pid, so wait
+        a little for the file before concluding that it never ran."""
+        deadline = time.monotonic() + 3
+        while True:
+            try:
+                with open(self.pidfile) as f:
+                    text = f.read()
+                if text:
+                    return int(text)
+            except FileNotFoundError:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.1)
 
     def wait_gone(self, pid):
+        if pid is None:
+            return True
         deadline = time.monotonic() + 5
         while process_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.1)

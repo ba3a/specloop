@@ -1,0 +1,26 @@
+{
+  "detect": ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "ruff.toml"],
+  "quality": {
+    "gates": {
+      "ruff": {
+        "command": "python -m ruff check .",
+        "hint": "Fix the finding instead of silencing it or changing the ruff configuration.",
+        "protect": ["ruff.toml", ".ruff.toml"],
+        "forbid": [
+          { "pattern": "# noqa", "glob": ["*.py"], "message": "Fix the finding instead of silencing it." }
+        ]
+      },
+      "mypy": {
+        "command": "python -m mypy .",
+        "hint": "Fix the types instead of ignoring the error or changing the mypy configuration.",
+        "protect": ["mypy.ini"],
+        "forbid": [
+          { "pattern": "# type: ignore", "glob": ["*.py"], "message": "Fix the types instead of ignoring the error." }
+        ]
+      },
+      "tests": {
+        "command": "python -m pytest -q"
+      }
+    }
+  }
+}

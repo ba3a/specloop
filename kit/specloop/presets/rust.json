@@ -1,0 +1,18 @@
+{
+  "detect": ["Cargo.toml"],
+  "quality": {
+    "gates": {
+      "clippy": {
+        "command": "cargo clippy --all-targets -- -D warnings",
+        "hint": "Fix the finding instead of allowing the lint or changing the clippy configuration.",
+        "protect": ["clippy.toml", ".clippy.toml"],
+        "forbid": [
+          { "pattern": "#!?\\[allow\\(", "glob": ["*.rs"], "message": "Fix the finding instead of allowing the lint." }
+        ]
+      },
+      "tests": {
+        "command": "cargo test"
+      }
+    }
+  }
+}

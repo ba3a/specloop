@@ -1,0 +1,18 @@
+{
+  "detect": ["go.mod"],
+  "quality": {
+    "gates": {
+      "golangci-lint": {
+        "command": "golangci-lint run ./...",
+        "hint": "Fix the finding instead of silencing it or changing the golangci-lint configuration.",
+        "protect": [".golangci.yml", ".golangci.yaml", ".golangci.toml", ".golangci.json"],
+        "forbid": [
+          { "pattern": "//\\s*nolint", "glob": ["*.go"], "message": "Fix the finding instead of silencing it." }
+        ]
+      },
+      "tests": {
+        "command": "go test ./..."
+      }
+    }
+  }
+}

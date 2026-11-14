@@ -22,3 +22,4 @@ The current step's uncommitted work stays in the working tree either way; the en
 - [Feature mode](feature-mode.md): the step cycle that a replan restarts.
 - [Guard rails](guard-rails.md): the rules a replanned `steps.json` must satisfy.
 - [Phases](phases.md): the `steps` check type.
+- [Quality gates](quality-gates.md#feature-mode): a `steps: "last"` gate moves to the new last step.

@@ -17,6 +17,8 @@ Manual commands (used by slash commands):
     engine.py reset              delete state and run artifacts
     engine.py update [check|skip|never]
                                  check for kit updates now and report, skip or silence them
+    engine.py quality [run|init|accept]
+                                 list the quality gates, or run, set up or accept them
     engine.py update-check       background update check (run detached; prints nothing)
 
 Configuration is layered, later layers winning in a deep merge:
@@ -30,10 +32,16 @@ Set SPECLOOP_DISABLED=1 to turn every hook into a no-op.
 
 import collections
 import contextlib
+import fnmatch
+import glob
+import hashlib
 import io
 import json
+import math
 import os
+import posixpath
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -43,6 +51,7 @@ import time
 import unicodedata
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 BASE_DIR = os.path.join(".claude", "specloop")
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -201,7 +210,7 @@ def current_step(state):
 def step_values(state):
     """Placeholder values for the active step; empty when no step is active."""
     index, step = current_step(state) if in_step(state) else (None, None)
-    if step is None:
+    if index is None or step is None:
         return {}
     return {
         "step_index": str(index + 1),
@@ -269,7 +278,7 @@ def load_state(root):
             return None
         except (ValueError, PermissionError) as e:
             if time.monotonic() >= deadline:
-                raise StateCorrupt(str(e))
+                raise StateCorrupt(str(e)) from e
             time.sleep(LOCK_POLL_SEC / 2)
 
 
@@ -440,7 +449,7 @@ def run_limited(args, timeout, cwd=None, env=None, merge_stderr=False):
     and killpg on POSIX, taskkill /T on Windows) and returncode is None. stdin is the null device.
     Raises OSError when the executable cannot be started."""
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        kwargs = {} if os.name == "nt" else {"start_new_session": True}
+        kwargs: Any = {} if os.name == "nt" else {"start_new_session": True}
         proc = subprocess.Popen(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=out,
                                 stderr=subprocess.STDOUT if merge_stderr else err, **kwargs)
         timed_out = False
@@ -673,7 +682,7 @@ def cmd_update_check(root):
 def spawn_update_check(root):
     """Start `engine.py update-check` for root as a detached process. Return True when started."""
     try:
-        kwargs = {}
+        kwargs: Any = {}
         if os.name == "nt":
             kwargs["creationflags"] = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
                                        | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
@@ -865,8 +874,12 @@ def review_file(config, state):
 
 
 def render_phase(text, config, state):
-    """_render for an instruction file, which may also use {review_file}."""
-    return _render(text, state, review_file=review_file(config, state))
+    """_render for an instruction file, which may also use {review_file} and {quality_gates}. A {quality_gates}
+    that renders as nothing takes its line and the blank line after it along, so no gap is left."""
+    gates = quality_gates_text(config, state)
+    if not gates:
+        text = re.sub(r"^\{quality_gates\}[ \t]*\r?\n(?:[ \t]*\r?\n)?", "", text, flags=re.MULTILINE)
+    return _render(text, state, review_file=review_file(config, state), quality_gates=gates)
 
 
 def phase_instructions(root, config, state):
@@ -892,6 +905,8 @@ def phase_brief(root, config, state):
         files.append(_rel("run", "steps.json"))
     if is_feature(state) and os.path.exists(replan_path(root, state)):
         files.append(_rel("run", ATTEMPTS_DIR, attempt_key(state), REPLAN_FILE))
+    if QUALITY_REPORT in names:
+        files.append(_rel("run", QUALITY_REPORT))
     files += [_rel("run", n) for n in names if n.startswith("review") and n.endswith(".md")]
     files += attempt_reviews(root, config, state)
     if FAILURE_FILE in names:
@@ -957,7 +972,7 @@ def header(state):
             state["phase"], state.get("iter", 0), state.get("spec", "?"))
     index, step = current_step(state) if in_step(state) else (None, None)
     where = ('feature step %d/%d "%s"' % (index + 1, len(state["approvedSteps"]["steps"]), step["title"])
-             if step is not None else "feature planning")
+             if index is not None and step is not None else "feature planning")
     return "[specloop] %s, phase=%s, iteration %d, branch=%s" % (
         where, state["phase"], state.get("iter", 0), state.get("branch") or "-")
 
@@ -1034,7 +1049,7 @@ def validate_steps(data):
             errors.append("%s: id %d is not unique" % (label, step_id))
         else:
             seen.add(step_id)
-        title = step.get("title")
+        title: Any = step.get("title")
         if not _non_empty_string(title):
             errors.append("%s: title must be a non-empty string" % label)
         elif len(title) > MAX_TITLE_LENGTH:
@@ -1258,13 +1273,13 @@ def stale_override_warning(root, config, state):
     """Overrides are never updated, so one can still send a review or a replan to run/, where the gate does not
     look. Return a warning naming each such project file that this run uses, else None."""
     if is_feature(state):
-        graphs = ((config["feature"]["planPhases"], False), (config["feature"]["stepPhases"], True))
+        graphs: tuple = ((config["feature"]["planPhases"], False), (config["feature"]["stepPhases"], True))
     else:
         graphs = ((config["phases"], False),)
     files = [(instruction_file(root, phase, phase_config, step), phase_config)
              for graph, step in graphs for phase, phase_config in graph.items()]
     files.append((_kit_file(root, "delegate"), {}))
-    found = {}
+    found: dict = {}
     for path, phase_config in files:
         if not path or os.path.dirname(path) == _path(root, "phases"):
             continue
@@ -1373,6 +1388,1375 @@ def late_reviews(root, config, state):
     return lines
 
 
+# --- quality gates ---------------------------------------------------------------
+
+GATE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+QUALITY_KEYS = ("timeoutSec", "failFast", "legacy", "gates")
+GATE_KEYS = ("command", "phases", "steps", "level", "timeoutSec", "hint", "passExitCodes", "metric", "legacy",
+             "changedGlob", "protect", "forbid")
+METRIC_KEYS = ("pattern", "json", "file", "min", "max")
+FORBID_KEYS = ("pattern", "glob", "message")
+GATE_STEPS = ("each", "last")
+GATE_LEVELS = ("block", "warn")
+LEGACY_MODES = ("baseline", "ratchet")
+# Shell conventions for "not executable" and "not found": a gate exiting so is broken, never passed.
+SHELL_EXIT_REASONS = {126: "command not executable (exit 126)", 127: "command not found (exit 127)"}
+SHELL_EXIT_CODES = tuple(sorted(SHELL_EXIT_REASONS))
+CHANGED_FILES_PLACEHOLDERS = ("{changed_files}", "{changed_files_file}")
+MAX_CHANGED_FILES_CHARS = 8000
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+DEFAULT_GATE_PHASES = ["implement"]
+
+
+def quality_block(config):
+    block = (config or {}).get("quality") if isinstance(config, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def quality_gates(config):
+    """The merged gates in declared order. A gate set to null (for example in config.local.json) is removed."""
+    gates = quality_block(config).get("gates")
+    if not isinstance(gates, dict):
+        return collections.OrderedDict()
+    return collections.OrderedDict((name, gate) for name, gate in gates.items() if gate is not None)
+
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _string_list(value):
+    return isinstance(value, list) and all(_non_empty_string(item) for item in value)
+
+
+def _regex_error(pattern):
+    """None when `pattern` compiles, else the reason."""
+    try:
+        re.compile(pattern)
+    except Exception as e:  # re.error, but also RecursionError or OverflowError on hostile input
+        return str(e) or e.__class__.__name__
+    return None
+
+
+def _phase_definitions(config):
+    """(where, name, definition) for every phase a gate may name: `phases` and `feature.stepPhases`."""
+    found: list = []
+    for where, graph in (("phases", config.get("phases")),
+                         ("feature.stepPhases", (config.get("feature") or {}).get("stepPhases")
+                          if isinstance(config.get("feature"), dict) else None)):
+        if isinstance(graph, dict):
+            found.extend((where, name, phase) for name, phase in graph.items() if phase)
+    return found
+
+
+def _validate_metric(where, metric):
+    if not isinstance(metric, dict):
+        return ["%s.metric must be an object" % where]
+    errors = ["%s.metric has an unknown key %r" % (where, key) for key in metric if key not in METRIC_KEYS]
+    sources = [key for key in ("pattern", "json") if key in metric]
+    if len(sources) != 1:
+        errors.append("%s.metric needs exactly one of 'pattern' and 'json'" % where)
+    if "pattern" in metric:
+        pattern = metric["pattern"]
+        if not _non_empty_string(pattern):
+            errors.append("%s.metric.pattern must be a non-empty string" % where)
+        else:
+            reason = _regex_error(pattern)
+            if reason:
+                errors.append("%s.metric.pattern is not a valid regular expression: %s" % (where, reason))
+            elif re.compile(pattern).groups < 1:
+                errors.append("%s.metric.pattern needs a group that captures the number" % where)
+    if "json" in metric and not _non_empty_string(metric["json"]):
+        errors.append("%s.metric.json must be a non-empty dotted key path" % where)
+    if "file" in metric and not _non_empty_string(metric["file"]):
+        errors.append("%s.metric.file must be a non-empty string" % where)
+    limits = [key for key in ("min", "max") if key in metric]
+    if not limits:
+        errors.append("%s.metric needs at least one of 'min' and 'max'" % where)
+    for key in limits:
+        if not _is_number(metric[key]):
+            errors.append("%s.metric.%s must be a number" % (where, key))
+    return errors
+
+
+def _validate_forbid(where, forbid):
+    if not isinstance(forbid, list):
+        return ["%s.forbid must be a list" % where]
+    errors: list = []
+    for i, entry in enumerate(forbid):
+        at = "%s.forbid[%d]" % (where, i)
+        if isinstance(entry, dict):
+            errors.extend("%s has an unknown key %r" % (at, key) for key in entry if key not in FORBID_KEYS)
+            pattern = entry.get("pattern")
+            if "glob" in entry and not _string_list(entry["glob"]):
+                errors.append("%s.glob must be a list of non-empty strings" % at)
+            if "message" in entry and not isinstance(entry["message"], str):
+                errors.append("%s.message must be a string" % at)
+            at += ".pattern"
+        else:
+            pattern = entry
+        if not _non_empty_string(pattern):
+            errors.append("%s must be a non-empty string (a regular expression)" % at)
+            continue
+        reason = _regex_error(pattern)
+        if reason:
+            errors.append("%s is not a valid regular expression: %s" % (at, reason))
+    return errors
+
+
+def _validate_gate_phases(where, phases, definitions):
+    if not _string_list(phases):
+        return ["%s.phases must be a list of phase names" % where]
+    errors = []
+    for name in phases:
+        matches = [(graph, phase) for graph, phase_name, phase in definitions if phase_name == name]
+        if not matches:
+            errors.append("%s.phases names %r, which is in neither phases nor feature.stepPhases" % (where, name))
+        for graph, phase in matches:
+            if isinstance(phase, dict) and phase.get("allowEdits"):
+                errors.append("%s.phases names %r, but %s.%s sets allowEdits, so the agent could not fix a "
+                              "failure there" % (where, name, graph, name))
+    return errors
+
+
+def _validate_gate(where, gate, default_legacy, definitions):
+    """Errors of one gate, and whether it needs git ({changed_files} or forbid)."""
+    if not isinstance(gate, dict):
+        return ["%s must be an object" % where], False
+    errors = ["%s has an unknown key %r" % (where, key) for key in gate if key not in GATE_KEYS]
+    command = gate.get("command")
+    if not _non_empty_string(command):
+        errors.append("%s.command is required and must be a non-empty string" % where)
+    errors.extend(_validate_gate_phases(where, gate.get("phases", DEFAULT_GATE_PHASES), definitions))
+    for key, allowed in (("steps", GATE_STEPS), ("level", GATE_LEVELS), ("legacy", LEGACY_MODES)):
+        if key in gate and gate[key] not in allowed:
+            errors.append("%s.%s must be one of %s" % (where, key, ", ".join('"%s"' % a for a in allowed)))
+    if "timeoutSec" in gate and not (_is_int(gate["timeoutSec"]) and gate["timeoutSec"] > 0):
+        errors.append("%s.timeoutSec must be a positive integer" % where)
+    if "hint" in gate and not isinstance(gate["hint"], str):
+        errors.append("%s.hint must be a string" % where)
+    if "passExitCodes" in gate:
+        codes = gate["passExitCodes"]
+        if not (isinstance(codes, list) and codes and all(_is_int(c) for c in codes)):
+            errors.append("%s.passExitCodes must be a non-empty list of integers" % where)
+        elif any(c in SHELL_EXIT_CODES for c in codes):
+            errors.append("%s.passExitCodes may not contain 126 or 127 (the shell's 'not executable' and "
+                          "'not found')" % where)
+    for key in ("changedGlob", "protect"):
+        if key in gate and not _string_list(gate[key]):
+            errors.append("%s.%s must be a list of non-empty strings" % (where, key))
+    if "forbid" in gate:
+        errors.extend(_validate_forbid(where, gate["forbid"]))
+    metric = gate.get("metric")
+    if "metric" in gate:
+        errors.extend(_validate_metric(where, metric))
+    legacy = gate.get("legacy", default_legacy)
+    if legacy == "ratchet":
+        if not isinstance(metric, dict):
+            if "legacy" in gate:
+                errors.append('%s sets legacy "ratchet", which needs a metric with exactly one of \'min\' and '
+                              '\'max\'' % where)
+        elif ("min" in metric) == ("max" in metric):
+            errors.append('%s uses legacy "ratchet", so its metric needs exactly one of \'min\' (higher is '
+                          'better) and \'max\' (lower is better)' % where)
+    needs_git = (isinstance(command, str) and any(p in command for p in CHANGED_FILES_PLACEHOLDERS)) or \
+        bool(gate.get("forbid"))
+    return errors, needs_git
+
+
+def is_git_work_tree(root, config):
+    ok, out = git(root, config, "rev-parse", "--is-inside-work-tree")
+    return ok and out == "true"
+
+
+def validate_quality(root, config):
+    """Validate the merged `quality` block. Return a list of error strings (empty means valid); never raises."""
+    try:
+        return _validate_quality(root, config)
+    except Exception as e:  # validation must never break a hook or a command
+        return ["quality could not be validated: %s" % (str(e) or e.__class__.__name__)]
+
+
+def unreadable_quality(config):
+    """Why no gate can be read from the quality block, or None when the gates can be listed."""
+    if not isinstance(config, dict) or "quality" not in config:
+        return None
+    if not isinstance(config["quality"], dict):
+        return "quality must be an object"
+    if not isinstance(config["quality"].get("gates", {}), dict):
+        return "quality.gates must be an object that maps gate names to gates"
+    return None
+
+
+def _quality_key_errors(block):
+    """Errors of the quality block's own keys other than `gates`."""
+    errors = ["quality has an unknown key %r" % key for key in block if key not in QUALITY_KEYS]
+    if "timeoutSec" in block and not (_is_int(block["timeoutSec"]) and block["timeoutSec"] > 0):
+        errors.append("quality.timeoutSec must be a positive integer")
+    if "failFast" in block and not isinstance(block["failFast"], bool):
+        errors.append("quality.failFast must be true or false")
+    if block.get("legacy", "baseline") not in LEGACY_MODES:
+        errors.append("quality.legacy must be one of %s" % ", ".join('"%s"' % a for a in LEGACY_MODES))
+    return errors
+
+
+def _named_gate_errors(name, gate, block, definitions):
+    """Errors of one gate including its name, and whether it needs git."""
+    errors = []
+    if not (isinstance(name, str) and GATE_NAME.fullmatch(name)):
+        errors.append("gate name %r must match [A-Za-z0-9][A-Za-z0-9_-]* (it becomes a file name)" % name)
+    gate_errors, needs_git = _validate_gate("quality.gates.%s" % name, gate, block.get("legacy", "baseline"),
+                                            definitions)
+    return errors + gate_errors, needs_git
+
+
+def _git_errors(names):
+    return ["quality.gates.%s uses {changed_files}, {changed_files_file} or forbid, which need a git work tree, "
+            "but the project is not one" % name for name in names]
+
+
+def _validate_quality(root, config):
+    if not isinstance(config, dict) or "quality" not in config:
+        return []
+    block = config["quality"]
+    if not isinstance(block, dict):
+        return [unreadable_quality(config)]
+    errors = _quality_key_errors(block)
+    if unreadable_quality(config):
+        return errors + [unreadable_quality(config)]
+    definitions = _phase_definitions(config)
+    git_users = []
+    for name, gate in quality_gates(config).items():
+        gate_errors, needs_git = _named_gate_errors(name, gate, block, definitions)
+        errors.extend(gate_errors)
+        if needs_git:
+            git_users.append(name)
+    if git_users and not is_git_work_tree(root, config):
+        errors.extend(_git_errors(git_users))
+    return errors
+
+
+def gate_definition_errors(root, config, selected):
+    """{name: errors} for the selected gates whose definition is invalid now. The config may have changed since
+    /sl-go validated it, so the Stop hook checks again; errors of the block's own keys count for every gate.
+    Never raises."""
+    try:
+        block = quality_block(config)
+        common = _quality_key_errors(block)
+        definitions = _phase_definitions(config)
+        problems, git_users = collections.OrderedDict(), []
+        for name, gate in selected:
+            errors, needs_git = _named_gate_errors(name, gate, block, definitions)
+            if needs_git:
+                git_users.append(name)
+            if common or errors:
+                problems[name] = common + errors
+        if git_users and not is_git_work_tree(root, config):
+            for name, error in zip(git_users, _git_errors(git_users)):
+                problems.setdefault(name, []).append(error)
+        return problems
+    except Exception as e:  # validation must never break a hook
+        reason = "could not be validated: %s" % (str(e) or e.__class__.__name__)
+        return collections.OrderedDict((name, [reason]) for name, _ in selected)
+
+
+def quality_errors_message(config, errors):
+    return ("Not started: the quality configuration is invalid:\n%s\n\nFix it in %s (or %s), then run %s again." % (
+        "\n".join("- " + e for e in errors), _rel("config.json"), _rel("config.local.json"), cmd_name(config, "go")))
+
+
+QUALITY_DIR = "quality"
+QUALITY_MANUAL_DIR = "quality-manual"  # the logs of `quality run`, which never touches QUALITY_DIR
+TRUNCATED = "...(truncated)...\n"
+
+
+STOP_MARGIN_SEC = 60
+DEFAULT_QUALITY_TIMEOUT_SEC = 1800
+
+
+def _seconds(value, default):
+    return value if _is_number(value) and value > 0 else default
+
+
+def quality_timeout(config):
+    """quality.timeoutSec as configured: the limit for all gates of one Stop together."""
+    return _seconds(quality_block(config).get("timeoutSec"), DEFAULT_QUALITY_TIMEOUT_SEC)
+
+
+def stop_limit(config):
+    """Seconds a Stop may take, as install.py sizes the hook: the check, all gates and a margin. A mark left by a
+    Stop that was killed is stale after this long."""
+    check = _seconds((config or {}).get("checkTimeoutSec", 900), 900)
+    return check + quality_timeout(config) + STOP_MARGIN_SEC
+
+
+def quality_budget(root, config):
+    """Seconds all gates of one Stop may use together: quality.timeoutSec, but never more than the Stop hook
+    installed in settings.json leaves after the check. install.py records that hook's timeout in manifest.json as
+    stopTimeoutSec; an old manifest has none, and then the configured value is used."""
+    configured = quality_timeout(config)
+    hosted = _read_json_tolerant(_path(root, "manifest.json")).get("stopTimeoutSec")
+    if not _is_number(hosted):
+        return configured
+    check = _seconds((config or {}).get("checkTimeoutSec", 900), 900)
+    return min(configured, hosted - check - STOP_MARGIN_SEC)
+
+
+def _clock():
+    return time.monotonic()
+
+
+def _seconds_text(value):
+    return ("%.1f" % value).rstrip("0").rstrip(".") if isinstance(value, float) else str(value)
+
+
+def planning_phase(config, state):
+    """True in a planning or replanning phase, where gates never run."""
+    if in_replan(config, state):
+        return True
+    return not in_step(state) if is_feature(state) else state["phase"] == "plan"
+
+
+def on_last_step(state):
+    """True in a feature step when no step after the current one in approvedSteps is still pending. Read on each
+    Stop, so a replan that adds a step moves the answer to the new last step."""
+    index, _ = current_step(state)
+    if index is None:
+        return True
+    return not any(isinstance(step, dict) and step.get("status") == "pending"
+                   for step in state["approvedSteps"]["steps"][index + 1:])
+
+
+def gate_runs_on_step(gate, state):
+    """False for a `steps: "last"` gate on a feature step that is not the last. `steps` is ignored in single mode."""
+    if not (isinstance(gate, dict) and is_feature(state) and in_step(state)):
+        return True
+    return gate.get("steps", "each") != "last" or on_last_step(state)
+
+
+def selected_gates(config, state):
+    """(name, gate) for every gate that holds the current phase, in declared order. A gate that is not an object
+    or whose `phases` is not a list of names holds every phase, so it comes out broken instead of being skipped."""
+    if planning_phase(config, state):
+        return []
+    phase = state["phase"]
+    selected = []
+    for name, gate in quality_gates(config).items():
+        phases: Any = gate.get("phases", DEFAULT_GATE_PHASES) if isinstance(gate, dict) else None
+        if (not _string_list(phases) or phase in phases) and gate_runs_on_step(gate, state):
+            selected.append((name, gate))
+    return selected
+
+
+def gate_log_path(root, name, directory=QUALITY_DIR):
+    return os.path.join(run_dir(root), directory, name + ".log")
+
+
+def write_gate_log(root, name, raw, directory=QUALITY_DIR):
+    """Replace run/<directory>/<name>.log (run/quality/ unless a manual run says otherwise). A name that is not a
+    valid gate name gets no file. Never raises."""
+    if not (isinstance(name, str) and GATE_NAME.fullmatch(name)):
+        return
+    try:
+        os.makedirs(os.path.dirname(gate_log_path(root, name, directory)), exist_ok=True)
+        with open(gate_log_path(root, name, directory), "wb") as f:
+            f.write(raw)
+    except OSError as e:
+        print("[specloop] could not write the log of gate '%s': %s" % (name, e), file=sys.stderr)
+
+
+def gate_record(state, name, result, exit_code, duration, **extra):
+    return dict({"name": name, "result": result, "exitCode": exit_code, "durationSec": round(duration, 2),
+                 "phase": state["phase"], "stepId": state.get("stepId"), "finishedAt": now()}, **extra)
+
+
+def _metric_number(value):
+    """The finite number `value` stands for, or None. A bool, a string and null are not numbers."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return value
+    return None
+
+
+def _number_text(value):
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else "%.10g" % value
+    return str(value)
+
+
+def _metric_from_pattern(metric, text):
+    """(value, None) from the first group of the last match, or (None, why not)."""
+    matches = list(re.finditer(metric["pattern"], text))
+    match = matches[-1] if matches else None
+    if match is None:
+        return None, "pattern %r matches nothing in the %s" % (metric["pattern"], metric_source_text(metric))
+    group = match.group(1)
+    try:
+        value = _metric_number(float(group)) if group is not None else None
+    except ValueError:
+        value = None
+    if value is None:
+        return None, "pattern %r captured %r, which is not a number" % (metric["pattern"], group)
+    return value, None
+
+
+def _metric_from_json(metric, text):
+    """(value, None) from the dotted key path of a JSON document, or (None, why not)."""
+    try:
+        node = json.loads(text.lstrip("﻿"))
+    except ValueError as e:
+        return None, "the %s is not valid JSON (%s)" % (metric_source_text(metric), e)
+    path = metric["json"]
+    for key in path.split("."):
+        if isinstance(node, dict) and key in node:
+            node = node[key]
+        elif isinstance(node, list) and key.isdigit() and int(key) < len(node):
+            node = node[int(key)]
+        else:
+            return None, "the JSON key %r is missing in the %s" % (path, metric_source_text(metric))
+    value = _metric_number(node)
+    if value is None:
+        return None, "the JSON value at %r is not a number: %s" % (path, json.dumps(node)[:80])
+    return value, None
+
+
+def metric_source_text(metric):
+    return "file %s" % metric["file"] if metric.get("file") else "gate output"
+
+
+def read_metric(root, metric, output):
+    """Read the number a gate's `metric` asks for. Return (value, None), or (None, reason) when the gate cannot
+    give an answer: a missing or unreadable file, no match, invalid JSON, a missing key or a value that is not a
+    number. Never raises."""
+    try:
+        text = output
+        if metric.get("file"):
+            rel = metric["file"]
+            if os.path.isabs(rel) or os.path.normpath(rel).split(os.sep)[0] == "..":
+                return None, "metric file %s is not inside the project" % rel
+            try:
+                with open(os.path.join(root, rel), "rb") as f:
+                    text = f.read().decode("utf-8", errors="replace")
+            except OSError as e:
+                return None, "metric file %s cannot be read: %s" % (rel, e.strerror or e)
+        return _metric_from_pattern(metric, text) if "pattern" in metric else _metric_from_json(metric, text)
+    except Exception as e:  # a hostile pattern or document must not raise from the hook
+        return None, "the metric cannot be read: %s" % (str(e) or e.__class__.__name__)
+
+
+def metric_limit_message(metric, value):
+    """Why `value` is outside the inclusive limits of `metric`, or None when it is inside."""
+    if "min" in metric and value < metric["min"]:
+        return "metric %s is below the minimum %s" % (_number_text(value), _number_text(metric["min"]))
+    if "max" in metric and value > metric["max"]:
+        return "metric %s is above the maximum %s" % (_number_text(value), _number_text(metric["max"]))
+    return None
+
+
+def baseline_values(state):
+    """state.qualityBaseline as a dict: {gate: number measured before the first edit}."""
+    values = state.get("qualityBaseline")
+    return values if isinstance(values, dict) else {}
+
+
+def gate_legacy(config, gate):
+    """How the gate treats existing problems: its own `legacy`, else quality.legacy, else "baseline"."""
+    own = gate.get("legacy") if isinstance(gate, dict) else None
+    chosen = own if own is not None else quality_block(config).get("legacy", "baseline")
+    return chosen if chosen in LEGACY_MODES else "baseline"
+
+
+def is_ratchet_gate(config, gate):
+    """True for a gate whose legacy mode is "ratchet" and whose metric has exactly one numeric limit."""
+    metric = gate.get("metric") if isinstance(gate, dict) else None
+    return (gate_legacy(config, gate) == "ratchet" and isinstance(metric, dict)
+            and ("min" in metric) != ("max" in metric) and _is_number(metric.get("min", metric.get("max"))))
+
+
+def no_worse_than(metric, value, baseline):
+    """True when `value` is at least the baseline for a `min` metric (higher is better), at most for `max`."""
+    return value >= baseline if "min" in metric else value <= baseline
+
+
+def run_quality_gate(root, config, state, name, gate, budget_left=None, command=None, baseline=None, measure=False,
+                     log_dir=QUALITY_DIR):
+    """Run one valid gate with no lock. Return (record, output): the record goes to state.qualityResults, the
+    complete output to run/quality/<name>.log. Never raises. A gate that cannot give an answer (exit code 126 or
+    127, a timeout, a command that cannot be started, a used-up time budget) is `broken`, and its record says why
+    in `reason`. `budget_left` is what remains of the time budget of this Stop; the gate's timeout is the smaller
+    of that and its own. `command` replaces gate["command"] once its placeholders are expanded. `baseline` is the
+    value a ratchet gate was measured at before the first edit. With `measure` the gate is only measured: the
+    metric is read whatever the exit code is, no limit is applied and the result is `pass` unless the gate is
+    broken. The log goes to run/<log_dir>/."""
+    timeout = gate.get("timeoutSec", config.get("checkTimeoutSec", 900))
+    started = time.monotonic()
+    exit_code, timed_out, reason = None, False, None
+    limited_by_budget = False
+    if not _is_number(timeout) or timeout <= 0:
+        reason = "timeoutSec is not a positive number: %r" % (timeout,)
+        raw = ("[specloop] %s\n" % reason).encode("utf-8")
+    elif budget_left is not None and budget_left <= 0:
+        reason = "the time budget for all gates (quality.timeoutSec) is exhausted"
+        raw = ("[specloop] %s; the gate did not run\n" % reason).encode("utf-8")
+    else:
+        if budget_left is not None and budget_left < timeout:
+            timeout, limited_by_budget = budget_left, True
+        try:
+            shell_command = command or gate["command"]
+            proc = run_limited([resolve_shell(config), "-c", shell_command], timeout, cwd=root, merge_stderr=True)
+            raw, exit_code, timed_out = proc.stdout, proc.returncode, proc.timed_out
+            if timed_out:
+                reason = "timed out after %s seconds" % _seconds_text(timeout)
+                if limited_by_budget:
+                    reason += " (all that was left of the time budget for all gates)"
+            else:
+                reason = SHELL_EXIT_REASONS.get(exit_code)
+            if reason:
+                raw += ("\n[specloop] %s\n" % reason).encode("utf-8")
+        except (OSError, ValueError) as e:
+            reason = "the command could not be run: %s" % e
+            raw = ("[specloop] %s\n" % reason).encode("utf-8")
+    failed_level = "warn" if gate.get("level", "block") == "warn" else "fail"
+    value = None
+    if reason:
+        result = "broken"
+    elif measure or exit_code in gate.get("passExitCodes", [0]):
+        result = "pass"
+        metric = gate.get("metric")
+        if isinstance(metric, dict):
+            value, why = read_metric(root, metric, raw.decode("utf-8", errors="replace"))
+            if why:
+                result, reason = "broken", why
+                raw += ("\n[specloop] %s\n" % why).encode("utf-8")
+            elif not measure:
+                limit = metric_limit_message(metric, value)
+                held = _metric_number(baseline) if is_ratchet_gate(config, gate) else None
+                if limit and held is not None:
+                    if no_worse_than(metric, value, held):
+                        raw += ("\n[specloop] %s, but no worse than the baseline %s (ratchet)\n" % (
+                            limit, _number_text(held))).encode("utf-8")
+                        limit = None
+                    else:
+                        limit = "%s and %s the baseline %s (ratchet)" % (
+                            limit, "below" if "min" in metric else "above", _number_text(held))
+                if limit:
+                    result = failed_level
+                    raw += ("\n[specloop] %s\n" % limit).encode("utf-8")
+    else:
+        result = failed_level
+    duration = time.monotonic() - started
+    write_gate_log(root, name, raw, log_dir)
+    record = gate_record(state, name, result, exit_code, duration)
+    if value is not None:
+        record["metric"] = value
+    if baseline is not None and not measure and is_ratchet_gate(config, gate):
+        record["baseline"] = baseline
+    if reason:
+        record["reason"] = reason
+    if timed_out:
+        record["timedOut"] = True
+    return record, raw.decode("utf-8", errors="replace")
+
+
+class ChangedFilesError(Exception):
+    """The set of changed files cannot be determined."""
+
+
+def changed_files_base(state, gate):
+    """The comparison point of {changed_files}: HEAD for a feature-mode gate that runs on each step (the files
+    changed since the last step commit), else the run's baseRef. A run with no baseRef (one that started before
+    single mode recorded it) falls back to HEAD."""
+    if is_feature(state) and in_step(state) and gate.get("steps", "each") != "last":
+        return "HEAD"
+    return state.get("baseRef") or "HEAD"
+
+
+def untracked_files(root, config):
+    """Untracked files, as paths relative to the repository's top directory. Raises ChangedFilesError."""
+    ok, error, entries = _git_status(root, config)
+    if not ok:
+        raise ChangedFilesError("git status failed: %s" % error)
+    return [path for code, path in entries if code == "??"]
+
+
+def changed_file_sets(root, config, state, gate):
+    """(comparison point, tracked, untracked): the project-relative paths, with forward slashes and sorted, of
+    the files this run changed. `tracked` holds tracked changes against the comparison point
+    (`changed_files_base`), staged and unstaged, without deleted files; `untracked` holds untracked files that
+    were not already untracked when the run started (`preexistingUntracked`). .claude/specloop/ is left out.
+    The comparison point is EMPTY_TREE in a repository with no commits. Raises ChangedFilesError when git cannot
+    answer. Holds no lock."""
+    ok, prefix = git(root, config, "rev-parse", "--show-prefix")
+    if not ok:
+        raise ChangedFilesError("git rev-parse --show-prefix failed: %s" % prefix)
+    point = changed_files_base(state, gate)
+    if point == "HEAD" and not git(root, config, "rev-parse", "--verify", "--quiet", "HEAD")[0]:
+        point = EMPTY_TREE  # no commits yet: everything staged counts as changed
+    ok, out = git(root, config, "diff", "--name-only", "--diff-filter=d", "-z", point, "--", raw=True)
+    if not ok:
+        raise ChangedFilesError("git diff %s failed: %s" % (point[:12], out.strip()))
+    tracked = set(p for p in out.split("\0") if p)
+    untracked = set(untracked_files(root, config))
+    own_dir = prefix + _rel() + "/"
+    preexisting = set(state.get("preexistingUntracked", []))
+
+    def project_paths(found):
+        return sorted(p[len(prefix):] for p in found - preexisting if p.startswith(prefix) and not p.startswith(own_dir))
+    return point, project_paths(tracked), project_paths(untracked - tracked)
+
+
+def changed_files(root, config, state, gate):
+    """Project-relative paths, with forward slashes and sorted, of the files this run changed, for the
+    placeholders {changed_files} and {changed_files_file}: the tracked and untracked files of
+    `changed_file_sets`, narrowed by the gate's `changedGlob` patterns. Raises ChangedFilesError when git cannot
+    answer. Holds no lock."""
+    _, tracked, untracked = changed_file_sets(root, config, state, gate)
+    paths = sorted(tracked + untracked)
+    patterns = gate.get("changedGlob")
+    if patterns:
+        paths = [p for p in paths if any(fnmatch.fnmatchcase(p, pattern) for pattern in patterns)]
+    return paths
+
+
+def changed_files_file_path(name, directory=QUALITY_DIR):
+    return _rel("run", directory, name + ".files")
+
+
+def write_changed_files_file(root, name, paths, directory=QUALITY_DIR):
+    path = os.path.join(root, *changed_files_file_path(name, directory).split("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("".join(p + "\n" for p in paths))
+
+
+def _unrunnable(state, name, started, result, reason, text):
+    """(None, record, log text) for a gate that does not run because of its changed-file set."""
+    record = gate_record(state, name, result, None, time.monotonic() - started, reason=reason)
+    return None, record, "[specloop] %s\n" % text
+
+
+def expand_changed_files(root, config, state, name, gate, directory=QUALITY_DIR):
+    """Fill {changed_files} and {changed_files_file} in the gate's command. Return (command, record, output):
+    for a gate that can run, the expanded command and no record; otherwise the command is None and the record
+    is `skipped` (no changed files) or `broken` (git failed, or the list is too long for a command line), with
+    the text for its log. A command with neither placeholder is returned as it is. {changed_files_file} lives in
+    run/<directory>/. Never raises."""
+    command = gate["command"]
+    uses_list, uses_file = (p in command for p in ("{changed_files}", "{changed_files_file}"))
+    if not (uses_list or uses_file):
+        return command, None, None
+    started = time.monotonic()
+    try:
+        paths = changed_files(root, config, state, gate)
+        if paths and uses_file:
+            write_changed_files_file(root, name, paths, directory)
+    except (ChangedFilesError, OSError) as e:
+        reason = "the changed files cannot be determined: %s" % (str(e) or e.__class__.__name__)
+        return _unrunnable(state, name, started, "broken", reason, reason)
+    if not paths:
+        reason = "no changed files%s" % (" match changedGlob" if gate.get("changedGlob") else "")
+        return _unrunnable(state, name, started, "skipped", reason, "skipped: %s; the command did not run" % reason)
+    listing = " ".join(shlex.quote(p) for p in paths)
+    if uses_list and len(listing) > MAX_CHANGED_FILES_CHARS:
+        reason = ("{changed_files} would be %d characters long, above the limit of %d; use {changed_files_file} "
+                  "(a file with one path per line) in the command instead" % (len(listing), MAX_CHANGED_FILES_CHARS))
+        return _unrunnable(state, name, started, "broken", reason, reason)
+    command = command.replace("{changed_files_file}", shlex.quote(changed_files_file_path(name, directory)))
+    return command.replace("{changed_files}", listing), None, None
+
+
+def invalid_gate_record(root, state, name, errors):
+    """The broken record of a gate whose definition is invalid; its command does not run."""
+    reason = "invalid definition: %s" % "; ".join(errors)
+    write_gate_log(root, name, ("[specloop] the gate did not run: %s\n" % reason).encode("utf-8"))
+    return gate_record(state, name, "broken", None, 0, reason=reason)
+
+
+def broken_outcome(records, paused_for, outputs=None):
+    """The outcome of a Stop whose gates could not give an answer. `records` are every gate that ran or was
+    judged; the details name each broken gate and its reason. `outputs` maps gate names to their output."""
+    broken = [r for r in records if r["result"] == "broken"]
+    if broken:
+        lines = ["Quality gate '%s' is broken: %s" % (r["name"], r["reason"]) for r in broken]
+    else:
+        lines = ["The quality configuration is broken: %s" % paused_for["reason"]]
+    details = "\n".join(lines)
+    return {"result": "broken", "details": details, "full": details, "quality": records, "pausedFor": paused_for,
+            "qualityOutputs": outputs or {}}
+
+
+def _gate_exit(record):
+    if record.get("protection"):
+        return "protection"
+    if record.get("timedOut"):
+        return "timed out"
+    if record["exitCode"] is None:
+        return "could not be run"
+    return "exit code %d" % record["exitCode"]
+
+
+def _shares(lengths, budget):
+    """Split budget over texts of the given lengths: short texts take what they need, long ones share the rest."""
+    shares = [0] * len(lengths)
+    remaining = max(budget, 0)
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    for done, i in enumerate(order):
+        shares[i] = min(lengths[i], remaining // (len(order) - done))
+        remaining -= shares[i]
+    return shares
+
+
+def _clip_tail(text, size):
+    if len(text) <= size:
+        return text
+    return TRUNCATED + text[len(text) - (size - len(TRUNCATED)):] if size > len(TRUNCATED) else ""
+
+
+def gate_failure(config, runs):
+    """(details, full) for a gate run with failed block gates. `runs` is a list of (record, output). The first
+    line names every failed gate; details stay within maxOutputChars, full holds every output complete."""
+    gates = quality_gates(config)
+    failed = [(r, o) for r, o in runs if r["result"] == "fail"]
+    warned = [(r, o) for r, o in runs if r["result"] == "warn"]
+    first = "Quality gates failed: %s\n" % ", ".join(r["name"] for r, _ in failed)
+    first += "The complete output of each gate is in %s.\n" % _rel("run", QUALITY_DIR, "<gate>.log")
+    sections = []
+    for record, output in failed + warned:
+        if record["result"] == "warn":
+            title = "\n### %s (%s; a warning, it does not block)\n" % (record["name"], _gate_exit(record))
+        else:
+            title = "\n### %s (%s)\n" % (record["name"], _gate_exit(record))
+        hint = (gates.get(record["name"]) or {}).get("hint")
+        if isinstance(hint, str) and hint:
+            title += "Hint: %s\n" % hint
+        sections.append((title, output.rstrip("\n")))
+    full = first + "".join(title + output + "\n" for title, output in sections)
+    limit = config.get("maxOutputChars", 4000)
+    fixed = len(first) + sum(len(title) + 1 for title, _ in sections)
+    shares = _shares([len(output) for _, output in sections], limit - fixed)
+    details = first + "".join(title + _clip_tail(output, share) + "\n"
+                              for (title, output), share in zip(sections, shares))
+    return details[:limit], full
+
+
+def gate_pass_details(details, runs):
+    """The check's details plus a note on the gates that passed and those that only warned."""
+    passed = [r["name"] for r, _ in runs if r["result"] == "pass"]
+    warned = ["%s (%s, see %s)" % (r["name"], _gate_exit(r), _rel("run", QUALITY_DIR, r["name"] + ".log"))
+              for r, _ in runs if r["result"] == "warn"]
+    notes = []
+    if passed:
+        notes.append("quality gates passed: %s" % ", ".join(passed))
+    if warned:
+        notes.append("quality gate warnings: %s" % ", ".join(warned))
+    return "; ".join([details] + notes)
+
+
+def _outputs_of(runs):
+    return {record["name"]: output for record, output in runs}
+
+
+UNREADABLE = "unreadable"  # stands for the hash of a protected file that cannot be read
+FINGERPRINT_CHUNK = 1 << 16
+MAX_LISTED_PATHS = 20
+MAX_HIT_CHARS = 200
+BINARY_SNIFF_BYTES = 8000
+HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(FINGERPRINT_CHUNK), b""):
+                digest.update(chunk)
+    except OSError:
+        return UNREADABLE
+    return digest.hexdigest()
+
+
+def protect_key(entry):
+    """A `protect` entry as a project-relative path with forward slashes and no trailing slash."""
+    key = posixpath.normpath(entry.strip().replace("\\", "/"))
+    return key[2:] if key.startswith("./") else key
+
+
+def protected_entries(config):
+    """The distinct `protect` entries of every gate, as `protect_key`s in declared order."""
+    keys: list = []
+    for gate in quality_gates(config).values():
+        entries: Any = gate.get("protect") if isinstance(gate, dict) else None
+        if _string_list(entries):
+            keys.extend(k for k in dict.fromkeys(protect_key(e) for e in entries) if k not in keys)
+    return keys
+
+
+def is_protected_path(config, rel):
+    """True when the project-relative path `rel` is a `protect` entry of any gate or lies under one."""
+    if not rel:
+        return False
+    rel = os.path.normcase(rel).replace("\\", "/")
+    for key in protected_entries(config):
+        key = os.path.normcase(key).replace("\\", "/")
+        if key in ("", ".", "..") or key.startswith("../"):
+            continue
+        if rel == key or rel.startswith(key + "/"):
+            return True
+    return False
+
+
+GUARDED_COMMANDS = re.compile(r"""run\.sh["']?\s+(?:advance\b|quality\s+accept\b)""")
+
+
+def protected_fingerprint(root, key):
+    """{project-relative path: SHA-256, or None when the path is missing} for one protect entry. A directory is
+    walked recursively and contributes each file in it; a missing entry contributes itself with None."""
+    full = os.path.join(root, *key.split("/"))
+    if not os.path.isdir(full):
+        return {key: _sha256_file(full) if os.path.isfile(full) else None}
+    found = {}
+    for dirpath, dirnames, filenames in os.walk(full):
+        dirnames.sort()
+        for file_name in sorted(filenames):
+            path = os.path.join(dirpath, file_name)
+            found[key + "/" + os.path.relpath(path, full).replace(os.sep, "/")] = _sha256_file(path)
+    return found
+
+
+def _without_nulls(value):
+    if isinstance(value, dict):
+        return dict((k, _without_nulls(v)) for k, v in value.items() if v is not None)
+    if isinstance(value, list):
+        return [_without_nulls(v) for v in value]
+    return value
+
+
+def quality_block_fingerprint(config):
+    """SHA-256 of the merged quality block with null values removed, so a gate set to null in config.local.json
+    and a gate that was never declared are the same."""
+    text = json.dumps(_without_nulls(quality_block(config)), sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def quality_fingerprints(root, config):
+    """What state.qualityFingerprints holds: the fingerprint of the quality block and, per protected path of any
+    gate, the hash of each file. The work grows with the size of the protected trees. Holds no lock. Returns None
+    when it cannot be computed, and never raises."""
+    try:
+        return {"quality": quality_block_fingerprint(config),
+                "protected": dict((key, protected_fingerprint(root, key)) for key in protected_entries(config))}
+    except Exception as e:
+        print("[specloop] could not fingerprint the quality gates: %s" % (str(e) or e.__class__.__name__),
+              file=sys.stderr)
+        return None
+
+
+def stored_fingerprints(state):
+    stored = state.get("qualityFingerprints")
+    return stored if isinstance(stored, dict) else {}
+
+
+def quality_block_changed(config, state):
+    """True when the merged quality block differs from the one fingerprinted at the run's first /go."""
+    before = stored_fingerprints(state).get("quality")
+    return isinstance(before, str) and before != quality_block_fingerprint(config)
+
+
+def _path_changes(before, current):
+    """Lines `path (changed|created|deleted)` for the files whose hash differs between two {path: hash or None}
+    maps."""
+    lines = []
+    for path in sorted(set(before) | set(current)):
+        old, new = before.get(path), current.get(path)
+        if old != new:
+            lines.append("%s (%s)" % (path, "created" if old is None else "deleted" if new is None else "changed"))
+    return lines
+
+
+def protected_changes(root, state, gate):
+    """Lines naming the files in the gate's `protect` paths that differ from the stored fingerprints: changed,
+    created (a missing file or a new file in a protected directory) or deleted. Paths whose entry was not
+    fingerprinted are not compared, because a changed quality block fails the gate on its own."""
+    entries: Any = gate.get("protect") if isinstance(gate, dict) else None
+    stored: Any = stored_fingerprints(state).get("protected")
+    if not (_string_list(entries) and isinstance(stored, dict)):
+        return []
+    lines: list = []
+    for key in dict.fromkeys(protect_key(e) for e in entries):
+        before = stored.get(key)
+        if isinstance(before, dict):
+            lines.extend(_path_changes(before, protected_fingerprint(root, key)))
+    return lines
+
+
+def fingerprint_changes(before, after):
+    """(protected path lines, quality block changed) between two fingerprint dicts, as state.qualityFingerprints
+    holds them. An entry that only one side fingerprinted is not compared, as in `protected_changes`."""
+    before_protected, after_protected = before.get("protected"), after.get("protected")
+    paths = []
+    if isinstance(before_protected, dict) and isinstance(after_protected, dict):
+        for key, old in before_protected.items():
+            new = after_protected.get(key)
+            if isinstance(old, dict) and isinstance(new, dict):
+                paths.extend(_path_changes(old, new))
+    old_block = before.get("quality")
+    return paths, isinstance(old_block, str) and old_block != after.get("quality")
+
+
+def forbid_entries(gate):
+    """The gate's `forbid` entries as (compiled pattern, glob list or None, message or None). An entry that is
+    not valid is left out: validation reports it."""
+    entries = []
+    forbid = gate.get("forbid") if isinstance(gate, dict) else None
+    for entry in forbid if isinstance(forbid, list) else []:
+        pattern: Any = None
+        if isinstance(entry, dict):
+            pattern, globs, message = entry.get("pattern"), entry.get("glob"), entry.get("message")
+        else:
+            pattern, globs, message = entry, None, None
+        try:
+            compiled = re.compile(pattern)
+        except (re.error, TypeError):
+            continue
+        entries.append((compiled, globs if _string_list(globs) else None, message if isinstance(message, str) else None))
+    return entries
+
+
+def _one_line(text):
+    return " ".join(text.split())
+
+
+def quality_gates_text(config, state):
+    """The {quality_gates} placeholder: a Markdown list of the gates that run in the current phase and step, then
+    the protected paths and the forbidden patterns with their messages. Empty when no gate applies. Never raises."""
+    try:
+        return _quality_gates_text(config, state)
+    except Exception as e:
+        print("[specloop] could not list the quality gates: %s" % (str(e) or e.__class__.__name__), file=sys.stderr)
+        return ""
+
+
+def _quality_gates_text(config, state):
+    selected = [(name, gate) for name, gate in selected_gates(config, state) if isinstance(gate, dict)]
+    if not selected:
+        return ""
+    lines = ["### Quality gates", "",
+             "These gates run when you finish your turn. A `block` gate that fails sends you back; a `warn` gate "
+             "only warns, and the reviewer sees the warning.", ""]
+    for name, gate in selected:
+        command = gate.get("command")
+        line = "- `%s` (%s)" % (name, gate.get("level") if gate.get("level") in GATE_LEVELS else "block")
+        if isinstance(command, str) and command.strip():
+            line += ": `%s`" % _one_line(command)
+        hint = gate.get("hint")
+        if isinstance(hint, str) and hint.strip():
+            line += ". Hint: %s" % _one_line(hint)
+        lines.append(line)
+    protected = [k for k in protected_entries(config) if k not in ("", ".", "..") and not k.startswith("../")]
+    if protected:
+        lines += ["", "Protected paths, which you may not change (edits are denied; only a person can allow a "
+                      "change, with `%s accept`): %s" % (cmd_name(config, "quality"),
+                                                          ", ".join("`%s`" % k for k in protected))]
+    forbidden = []
+    for name, gate in selected:
+        for compiled, globs, message in forbid_entries(gate):
+            line = "- `%s`" % compiled.pattern
+            if globs:
+                line += " in %s" % ", ".join("`%s`" % g for g in globs)
+            line += " (gate `%s`)" % name
+            if message and message.strip():
+                line += ": %s" % _one_line(message)
+            forbidden.append(line)
+    if forbidden:
+        lines += ["", "Forbidden patterns, which fail the gate when you add a matching line:", ""] + forbidden
+    return "\n".join(lines)
+
+
+def _parse_added_lines(diff):
+    """[(line number, text)] of the lines a `git diff --unified=0` of one file adds, numbered by the hunk headers."""
+    added, number = [], None
+    for line in diff.split("\n"):
+        if line.startswith("@@"):
+            match = HUNK_HEADER.match(line)
+            number = int(match.group(1)) if match else None
+        elif number is not None and line.startswith("+"):
+            added.append((number, line[1:].rstrip("\r")))
+            number += 1
+    return added
+
+
+def added_lines(root, config, state, gate):
+    """[(project-relative path, line number, text)] of the lines this run added, from the changed-file set of
+    `changed_file_sets` (the gate's `changedGlob` does not narrow it): `git diff --unified=0` against the
+    comparison point for tracked files, and the whole text of untracked files that were not already untracked
+    when the run started. Binary files are skipped. Raises ChangedFilesError when git cannot answer. Holds no
+    lock."""
+    point, tracked, untracked = changed_file_sets(root, config, state, gate)
+    found: list = []
+    for path in tracked:
+        ok, out = git(root, config, "diff", "--unified=0", "--no-color", "--no-ext-diff", "--no-renames",
+                      point, "--", path, raw=True)
+        if not ok:
+            raise ChangedFilesError("git diff %s failed for %s: %s" % (point[:12], path, out.strip()))
+        found.extend((path, number, text) for number, text in _parse_added_lines(out))
+    for path in untracked:
+        try:
+            with open(os.path.join(root, *path.split("/")), "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue  # gone, a directory or unreadable: there is no text to scan
+        if b"\0" in raw[:BINARY_SNIFF_BYTES]:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        found.extend((path, number, line.rstrip("\r")) for number, line in enumerate(text.split("\n"), 1))
+    return found
+
+
+def forbid_hit_hash(path, text):
+    """The hash by which an accepted hit is recorded in state.qualityAccepted: SHA-256 of the project-relative
+    path, a NUL character and the text of the line (without its line ending)."""
+    return hashlib.sha256((path + "\0" + text).encode("utf-8", errors="replace")).hexdigest()
+
+
+def accepted_hits(state):
+    accepted = state.get("qualityAccepted")
+    return set(h for h in accepted if isinstance(h, str)) if isinstance(accepted, (list, dict)) else set()
+
+
+def forbid_hits(root, config, state, gate, include_accepted=False, lines=None):
+    """The added lines that match the gate's `forbid` entries, as dicts with path, line, text, message, pattern
+    and hash, in file and line order (a line that matches two entries is listed for each). A hit whose hash is
+    in state.qualityAccepted is left out unless `include_accepted` is true. `lines` are the added lines to scan
+    when the caller has them already. Raises ChangedFilesError when git cannot answer. Holds no lock."""
+    entries = forbid_entries(gate)
+    if not entries:
+        return []
+    if lines is None:
+        lines = added_lines(root, config, state, gate)
+    accepted = set() if include_accepted else accepted_hits(state)
+    hits = []
+    for path, number, text in lines:
+        digest = None
+        for compiled, globs, message in entries:
+            if globs and not any(fnmatch.fnmatchcase(path, g) for g in globs):
+                continue
+            if not compiled.search(text):
+                continue
+            digest = digest or forbid_hit_hash(path, text)
+            if digest in accepted:
+                continue
+            hits.append({"path": path, "line": number, "text": text, "message": message,
+                         "pattern": compiled.pattern, "hash": digest})
+    return hits
+
+
+def forbid_text(hits):
+    """The report of forbid hits: one `path:line: text` per hit, with the entry's message under it."""
+    lines = []
+    for hit in hits[:MAX_LISTED_PATHS]:
+        text = hit["text"].strip()
+        if len(text) > MAX_HIT_CHARS:
+            text = text[:MAX_HIT_CHARS] + "..."
+        lines.append("%s:%d: %s%s" % (hit["path"], hit["line"], text, "\n  " + hit["message"] if hit["message"] else ""))
+    if len(hits) > len(lines):
+        lines.append("... and %d more" % (len(hits) - len(lines)))
+    return "Forbidden patterns were added since the comparison point:\n" + "\n".join("- " + ln for ln in lines)
+
+
+def protection_record(state, name, result, reason, started):
+    return gate_record(state, name, result, None, time.monotonic() - started, reason=reason, protection=True)
+
+
+def _listing(lines):
+    shown = lines[:MAX_LISTED_PATHS]
+    if len(lines) > len(shown):
+        shown.append("... and %d more" % (len(lines) - len(shown)))
+    return "\n".join("- " + line for line in shown)
+
+
+def protection_text(config, what, lines):
+    return "%s\n%s" % (what, _listing(lines))
+
+
+def protection_footer(config, what):
+    return ("The gate's command did not run. %s Only a person can allow the change, by running %s accept."
+            % (what, cmd_name(config, "quality")))
+
+
+def block_changed_runs(root, config, state, selected):
+    """(record, output) for every selected gate, all `fail` whatever their level, when the quality block changed
+    since the run started. No command runs."""
+    text = ("The quality configuration (config.json or config.local.json) changed since the run started, so a "
+            "gate may have been weakened. The gate's command did not run. Only a person can allow the change, by "
+            "running %s accept." % cmd_name(config, "quality"))
+    runs = []
+    for name, _ in selected:
+        started = time.monotonic()
+        write_gate_log(root, name, ("[specloop] %s\n" % text).encode("utf-8"))
+        runs.append((protection_record(state, name, "fail", "the quality configuration changed", started), text))
+    return runs
+
+
+def protection_run(root, config, state, name, gate):
+    """(record, output) for a gate whose protected files changed or to which forbidden lines were added, or None
+    when neither happened. Its command does not run; the failure is at the gate's level. Git failing makes the
+    gate broken, because the agent cannot fix it."""
+    started = time.monotonic()
+    changes = protected_changes(root, state, gate)
+    try:
+        hits = forbid_hits(root, config, state, gate)
+    except (ChangedFilesError, OSError) as e:
+        reason = "the added lines cannot be determined: %s" % (str(e) or e.__class__.__name__)
+        write_gate_log(root, name, ("[specloop] %s\n" % reason).encode("utf-8"))
+        return protection_record(state, name, "broken", reason, started), reason
+    if not (changes or hits):
+        return None
+    parts, reasons, restore = [], [], []
+    if changes:
+        parts.append(protection_text(config, "Protected files changed since the run started:", changes))
+        reasons.append("protected files changed: %s" % ", ".join(changes[:5]))
+        restore.append("Restore the files.")
+    if hits:
+        parts.append(forbid_text(hits))
+        reasons.append("forbidden lines added: %s" % ", ".join("%s:%d" % (h["path"], h["line"]) for h in hits[:5]))
+        restore.append("Remove the lines.")
+    text = "\n".join(parts + [protection_footer(config, " ".join(restore))])
+    write_gate_log(root, name, ("[specloop] %s\n" % text).encode("utf-8"))
+    result = "warn" if gate.get("level", "block") == "warn" else "fail"
+    record = protection_record(state, name, result, "; ".join(reasons), started)
+    if hits:
+        record["forbidden"] = len(hits)
+    return record, text
+
+
+def baseline_phase(config, state):
+    """True in the last planning phase, where ratchet values are measured: `plan` in single mode, the feature's
+    planning phase in feature mode. Never feature-replan, and never a graph that has neither."""
+    if in_replan(config, state):
+        return False
+    return is_plan_phase(config, state) if is_feature(state) else state["phase"] == "plan"
+
+
+def measure_baselines(root, config, state, outcome):
+    """On the Stop that passes the last planning phase, measure every ratchet gate that has no baseline yet.
+    Planning leaves the source untouched, so the values are those from before the run's first edit. Holds no
+    lock; the values go into state.qualityBaseline in apply_gate. Returns the outcome with `qualityBaseline`
+    ({gate: value}) added, or a broken outcome when a value cannot be read. The measurements share the time
+    budget of the Stop. A gate whose command lists changed files, and finds none, is not measured."""
+    if unreadable_quality(config):
+        return outcome
+    have = baseline_values(state)
+    pending = [(name, gate) for name, gate in quality_gates(config).items()
+               if is_ratchet_gate(config, gate) and _metric_number(have.get(name)) is None]
+    invalid = gate_definition_errors(root, config, pending) if pending else {}
+    pending = [(name, gate) for name, gate in pending if name not in invalid]  # run as broken in implement
+    if not pending:
+        return outcome
+    measured: dict = {}
+    runs: list = []
+    budget = quality_budget(root, config)
+    started = _clock()
+    for name, gate in pending:
+        command, record, output = expand_changed_files(root, config, state, name, gate)
+        if record:
+            write_gate_log(root, name, output.encode("utf-8"))
+            if record["result"] == "skipped":
+                continue
+        else:
+            record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
+                                              command, measure=True)
+        if record["result"] == "broken":
+            record["reason"] = "the baseline could not be measured before the first edit: %s" % record["reason"]
+            runs.append((record, output))
+            broken = broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},
+                                    _outputs_of(runs))
+            return dict(broken, qualityBaseline=measured)
+        runs.append((record, output))
+        measured[name] = record["metric"]
+    return dict(outcome, qualityBaseline=measured) if measured else outcome
+
+
+def run_quality_gates(root, config, state, outcome):
+    """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record.
+
+    Definitions are checked first: an invalid gate is broken and no command runs. The first gate that breaks
+    while running ends the run of gates, because the run pauses and every gate runs again after /sl-go."""
+    if planning_phase(config, state):
+        return measure_baselines(root, config, state, outcome) if baseline_phase(config, state) else outcome
+    unreadable = unreadable_quality(config)
+    if unreadable:
+        return broken_outcome([], {"reason": "invalid quality configuration: %s" % unreadable})
+    selected = selected_gates(config, state)
+    if not selected:
+        return outcome
+    invalid = gate_definition_errors(root, config, selected)
+    if invalid:
+        records = [invalid_gate_record(root, state, name, errors) for name, errors in invalid.items()]
+        return broken_outcome(records, {"gate": records[0]["name"], "reason": records[0]["reason"]})
+    fail_fast = quality_block(config).get("failFast") is True
+    runs = []
+    budget = quality_budget(root, config)
+    started = _clock()
+    baselines = baseline_values(state)
+    if quality_block_changed(config, state):
+        runs = block_changed_runs(root, config, state, selected)
+        details, full = gate_failure(config, runs)
+        return {"result": "fail", "details": details, "full": full, "quality": [r for r, _ in runs],
+                "qualityOutputs": _outputs_of(runs)}
+    for name, gate in selected:
+        protected = protection_run(root, config, state, name, gate)
+        if protected:
+            runs.append(protected)
+            if protected[0]["result"] == "broken":
+                return broken_outcome([r for r, _ in runs], {"gate": name, "reason": protected[0]["reason"]},
+                                      _outputs_of(runs))
+            if fail_fast and protected[0]["result"] == "fail":
+                break
+            continue
+        command, record, output = expand_changed_files(root, config, state, name, gate)
+        if record:
+            write_gate_log(root, name, output.encode("utf-8"))
+        else:
+            record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
+                                              command, _metric_number(baselines.get(name)))
+        runs.append((record, output))
+        if record["result"] == "broken":
+            return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},
+                                  _outputs_of(runs))
+        if fail_fast and record["result"] == "fail":
+            break
+    records = [record for record, _ in runs]
+    if any(record["result"] == "fail" for record in records):
+        details, full = gate_failure(config, runs)
+        return {"result": "fail", "details": details, "full": full, "quality": records,
+                "qualityOutputs": _outputs_of(runs)}
+    return dict(outcome, details=gate_pass_details(outcome["details"], runs), quality=records,
+                qualityOutputs=_outputs_of(runs))
+
+
+QUALITY_REPORT = "quality.md"
+
+
+def quality_report_path(root):
+    return os.path.join(run_dir(root), QUALITY_REPORT)
+
+
+def quality_waived_lines(state):
+    """Lines of the report's section on gates a person waived with advance, from state.qualityWaived. Empty when
+    there are none."""
+    waived = state.get("qualityWaived")
+    lines = ["- %s (waived %s)" % (_waived_text(entry), entry.get("at", "earlier") if isinstance(entry, dict) else "earlier")
+             for entry in (waived if isinstance(waived, list) else [])]
+    if not lines:
+        return []
+    return ["## Waived gates", "", "A person skipped these with advance, so they never passed. "
+            "Treat each as a finding unless the spec allows it.", ""] + lines
+
+
+def quality_accepted_lines(state):
+    """Lines of the report's section on the changes a person accepted with `quality accept`, from
+    state.qualityAcceptedLog. Empty when there are none."""
+    log = state.get("qualityAcceptedLog")
+    lines: list = []
+    for entry in log if isinstance(log, list) else []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("changes"), list):
+            continue
+        lines.extend("- %s (accepted %s)" % (change, entry.get("at", "earlier")) for change in entry["changes"])
+    if not lines:
+        return []
+    return ["## Accepted changes", "", "A person accepted these during the run; judge them in the review.", ""] + lines
+
+
+def quality_baseline_lines(config, state):
+    """Lines on the ratchet gates: the value each was measured at before the first edit, or that it has none and
+    uses its limit only (no planning phase, or a run that started without one)."""
+    ratchets = [name for name, gate in quality_gates(config).items() if is_ratchet_gate(config, gate)]
+    if not ratchets:
+        return []
+    have = baseline_values(state)
+    lines = ["## Ratchet baselines", ""]
+    for name in ratchets:
+        value = _metric_number(have.get(name))
+        if value is None:
+            lines.append("- %s: no baseline was measured, so the gate uses its limit only." % name)
+        else:
+            lines.append("- %s: baseline %s, measured before the first edit." % (name, _number_text(value)))
+    return lines
+
+
+def _fenced(text):
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return "%s\n%s\n%s" % (fence, text, fence)
+
+
+def quality_report(config, state, records, outputs):
+    """The text of run/quality.md: a row per gate that ran, the end of each warning's output, then the sections
+    other steps fill. Built only from the records and outputs of one gate run."""
+    where = "phase `%s`" % state["phase"]
+    if state.get("stepId") is not None:
+        where += ", step %s" % state["stepId"]
+    lines = ["# Quality gates", "", "Last gate run: %s." % where, "",
+             "| Gate | Result | Duration | Metric |", "|------|--------|----------|--------|"]
+    for record in records:
+        metric = record.get("metric")
+        lines.append("| %s | %s | %ss | %s |" % (
+            record["name"], record["result"], _seconds_text(record.get("durationSec", 0)),
+            "-" if metric is None else _number_text(metric)))
+    warned = [r for r in records if r["result"] == "warn"]
+    if warned:
+        texts = [(outputs.get(r["name"]) or "").rstrip("\n") for r in warned]
+        limit = config.get("maxOutputChars", 4000)
+        for record, text, share in zip(warned, texts, _shares([len(t) for t in texts], limit)):
+            lines += ["", "## Warning: %s" % record["name"], "",
+                      "The end of its output; the complete output is in `%s`." % _rel("run", QUALITY_DIR, record["name"] + ".log"),
+                      "", _fenced(_clip_tail(text, share))]
+    for extra in (quality_baseline_lines(config, state), quality_waived_lines(state), quality_accepted_lines(state)):
+        if extra:
+            lines += [""] + list(extra)
+    return "\n".join(lines) + "\n"
+
+
+def write_quality_report(root, config, state, outcome):
+    """Rewrite run/quality.md from the gate run in `outcome`. Called where the run's result is recorded, so the
+    file never comes from a run that state dropped. Without gate records nothing is written. Never raises."""
+    records = outcome.get("quality")
+    if not records:
+        return
+    try:
+        text = quality_report(config, state, records, outcome.get("qualityOutputs") or {})
+        os.makedirs(run_dir(root), exist_ok=True)
+        with open(quality_report_path(root), "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        print("[specloop] could not write %s: %s" % (QUALITY_REPORT, e), file=sys.stderr)
+
+
+def record_quality(state, records):
+    """Store the last result of each gate that ran in state.qualityResults."""
+    results = state.get("qualityResults")
+    results = results if isinstance(results, dict) else {}
+    for record in records:
+        results[record["name"]] = {key: value for key, value in record.items() if key != "name"}
+    state["qualityResults"] = results
+
+
+def record_baseline(state, measured):
+    """Store measured ratchet values in state.qualityBaseline. A gate that already has a value keeps it: the
+    reloaded state decides, so a value is measured once per run."""
+    if not measured:
+        return
+    stored = dict(baseline_values(state))
+    for name, value in measured.items():
+        if _metric_number(stored.get(name)) is None:
+            stored[name] = value
+    state["qualityBaseline"] = stored
+
+
 # --- feature mode ----------------------------------------------------------------
 
 def git(root, config, *args, raw=False):
@@ -1455,6 +2839,25 @@ def start_feature_branch(root, config, state):
         return "could not create branch %s: %s" % (name, out)
     state.update(branch=name, baseRef=base, preexistingUntracked=untracked)
     return None
+
+
+def single_mode_baseline(root, config):
+    """baseRef (HEAD) and preexistingUntracked for a single-mode run's first /go, which {changed_files} compares
+    with. It does not need a clean tree: a tracked file that is already modified counts as changed later. Outside
+    a git work tree, in a repository with no commits or when git fails nothing is recorded ({} comes back), and
+    the run starts as it always did. Holds no lock."""
+    try:
+        if not is_git_work_tree(root, config):
+            return {}
+        ok, base = git(root, config, "rev-parse", "--verify", "HEAD")
+        ok_prefix, prefix = git(root, config, "rev-parse", "--show-prefix")
+        if not (ok and ok_prefix):
+            return {}
+        own_dir = prefix + _rel() + "/"
+        untracked = sorted(p for p in untracked_files(root, config) if not p.startswith(own_dir))
+    except ChangedFilesError:
+        return {}
+    return {"baseRef": base, "preexistingUntracked": untracked}
 
 
 def check_feature_branch(root, config, state):
@@ -1585,15 +2988,18 @@ def save_steps(root, state):
 
 
 def archive_step_files(root, step_id):
-    """Move the finished step's review*.md and last-failure.md into run/steps/<id>/."""
+    """Move the finished step's review*.md, last-failure.md, quality.md and quality/ into run/steps/<id>/."""
     names = [n for n in os.listdir(run_dir(root))
-             if (n.startswith("review") and n.endswith(".md")) or n == FAILURE_FILE]
+             if (n.startswith("review") and n.endswith(".md")) or n in (FAILURE_FILE, QUALITY_REPORT, QUALITY_DIR)]
     if not names:
         return
     dest = os.path.join(run_dir(root), "steps", str(step_id))
     os.makedirs(dest, exist_ok=True)
     for name in names:
-        os.replace(os.path.join(run_dir(root), name), os.path.join(dest, name))
+        target = os.path.join(dest, name)
+        if os.path.isdir(target):
+            shutil.rmtree(target, ignore_errors=True)
+        os.replace(os.path.join(run_dir(root), name), target)
 
 
 def start_next_step(root, config, state):
@@ -1674,7 +3080,7 @@ def completion_message(config, state):
              for s in state["approvedSteps"]["steps"]]
     return ("All %d steps are finished on branch %s:\n%s\n\nReview the branch (git log --oneline %s..%s) "
             "and open a pull request when it is ready; specloop never pushes." % (
-                len(lines), state.get("branch"), "\n".join("  " + l for l in lines),
+                len(lines), state.get("branch"), "\n".join("  " + ln for ln in lines),
                 (state.get("baseRef") or "")[:7], state.get("branch")))
 
 
@@ -1741,7 +3147,7 @@ def take_gate(root, config, hook_input):
         if state.get("status") != "active" or not is_owner(state, hook_input):
             raise Unchanged((None, None))
         running = state.get("gate") or {}
-        if seconds_since(running.get("at")) < config.get("checkTimeoutSec", 900) + 60:
+        if seconds_since(running.get("at")) < stop_limit(config):
             raise Unchanged((None, {"systemMessage": (
                 "[specloop] a check is marked as running since %s, so this stop ran none. If no check is running, "
                 "%s clears the mark." % (running.get("at"), cmd_name(config, "go")))}))
@@ -1762,7 +3168,7 @@ def release_gate(root):
 
 
 def evaluate_gate(root, config, state):
-    """Steps file checks, phase check and replan validation. Holds no lock and records nothing."""
+    """Steps file checks, phase check, quality gates and replan validation. Holds no lock and records nothing."""
     replanning = in_replan(config, state)
     if in_step(state) and not replanning and os.path.exists(replan_path(root, state)):
         return {"result": "replan"}
@@ -1772,6 +3178,10 @@ def evaluate_gate(root, config, state):
         return {"result": "fail", "details": head(violation, limit), "full": violation}
     result, details, full = check_phase(root, config, phase_graph(config, state)[state["phase"]], state)
     outcome = {"result": result, "details": details, "full": full}
+    if result == "pass":
+        outcome = run_quality_gates(root, config, state, outcome)
+        if outcome["result"] != "pass":
+            return outcome
     if result == "pass" and replanning:
         data, errors = replan_candidate(root, state)
         if errors:
@@ -1840,7 +3250,13 @@ def apply_gate(root, config, state, outcome, hook_input):
     if outcome["result"] == "replan":
         return request_replan(root, config, state, session)
     result, details, full = outcome["result"], outcome["details"], outcome["full"]
+    record_baseline(state, outcome.get("qualityBaseline"))
+    if outcome.get("quality"):
+        record_quality(state, outcome["quality"])
+        write_quality_report(root, config, state, outcome)
     phase = state["phase"]
+    if result == "broken":
+        return pause_for_broken_gate(config, state, session, outcome)
     graph = phase_graph(config, state)
     state["iter"] = state.get("iter", 0) + 1
     add_history(state, session, phase=phase, result=result, iter=state["iter"])
@@ -1906,6 +3322,18 @@ def apply_gate(root, config, state, outcome, hook_input):
             reason = "Phase '%s' is not complete yet. %s\n\nKeep working on phase '%s'.\n\n%s" % (
                 phase, details, phase, phase_instructions(root, config, state))
     return block_or_stall(root, config, state, phase, reason)
+
+
+def pause_for_broken_gate(config, state, session, outcome):
+    """A gate could not give an answer: pause with no iteration used and no failure for the agent to act on.
+    The message is for the user."""
+    phase = state["phase"]
+    state.update(status="paused", pausedFor=outcome["pausedFor"])
+    add_history(state, session, phase=phase, result="broken", iter=state.get("iter", 0))
+    return {"systemMessage": (
+        "[specloop] %s\nThe workflow is paused in phase '%s'; no iteration was used. Fix the gate or install "
+        "its tool, then run %s to run the gates again, or run %s to skip the phase." % (
+            outcome["details"], phase, cmd_name(config, "go"), cmd_name(config, "advance")))}
 
 
 def block_or_stall(root, config, state, phase, reason):
@@ -1980,6 +3408,9 @@ def handle_pretool(root, hook_input):
                 return deny("%s/ belongs to the chat that drives the workflow. Run %s here to take it over." % (
                     _rel("run"), cmd_name(config, "go")))
             return None
+        if is_protected_path(config, rel):
+            return deny("%s is protected by a quality gate. Only a person may allow a change, with %s." % (
+                rel, cmd_name(config, "quality accept")))
         allowed = phase_graph(config, state).get(phase, {}).get("allowEdits")
         if allowed is not None and (rel is None or not any(rel.startswith(p) for p in allowed)):
             return deny("phase '%s' only allows editing %s, not %s." % (
@@ -1992,6 +3423,9 @@ def handle_pretool(root, hook_input):
 
     if tool == "Bash":
         command = tool_input.get("command", "")
+        if isinstance(command, str) and GUARDED_COMMANDS.search(command):
+            return deny("only the user may run 'run.sh advance' and 'run.sh quality accept'. Ask them to type %s or %s." % (
+                cmd_name(config, "advance"), cmd_name(config, "quality accept")))
         for blocked in config.get("blockedCommandsUntilDone", []) if owner else []:
             if blocked in command:
                 return deny("'%s' is not allowed until the workflow is done (phase '%s')." % (blocked, phase))
@@ -2135,6 +3569,9 @@ def cmd_go(root):
     if state["status"] == "done":
         return "Workflow already done. Run %s and %s to start a new one." % (
             cmd_name(config, "reset"), cmd_name(config, "spec"))
+    errors = validate_quality(root, config)
+    if errors:
+        return quality_errors_message(config, errors)
     plan, replan = None, None
     if is_feature(state):
         if state.get("branch"):
@@ -2153,12 +3590,17 @@ def cmd_go(root):
                 return "The replan cannot be adopted yet:\n%s\n\nFix %s, then run %s again." % (
                     "\n".join(errors), _rel("run", "steps.json"), cmd_name(config, "go"))
     branch = {k: state[k] for k in ("branch", "baseRef", "preexistingUntracked") if k in state}
+    if not is_feature(state) and "baseRef" not in state:
+        branch.update(single_mode_baseline(root, config))
+    fingerprints = None if "qualityFingerprints" in state else quality_fingerprints(root, config)
 
     def apply(current):
         if not current or current["status"] == "done":
             raise Unchanged("The workflow changed while %s ran. Run %s to see it." % (
                 cmd_name(config, "go"), cmd_name(config, "status")))
         current.update(branch)
+        if fingerprints is not None and "qualityFingerprints" not in current:
+            current["qualityFingerprints"] = fingerprints
         return resume(root, config, current, plan, replan)
     out = update_state(root, apply)
     warning = stale_override_warning(root, config, state)
@@ -2168,6 +3610,7 @@ def cmd_go(root):
 def resume(root, config, state, plan, replan):
     """Everything cmd_go changes in the state, on the reloaded state. Return the command's output."""
     state.pop("gate", None)  # left behind by a killed Stop hook, it would hold every later check back
+    state.pop("pausedFor", None)  # a broken gate runs again on the next stop
     if plan is not None:
         approve_plan(root, config, state, plan)
     if replan is not None and adopt_replan(root, config, state, replan) == "done":
@@ -2210,6 +3653,28 @@ def cmd_pause(root):
     return update_state(root, apply)
 
 
+def waive_gates(root, config, state):
+    """Record in state.qualityWaived the gates that advancing past the current phase skips: the ones the Stop would
+    run now (same phase and `steps` selection). Reads config and state only; runs no gate and no git call."""
+    try:
+        selected = selected_gates(config, state)
+    except Exception as e:
+        print("[specloop] could not select the gates to waive: %s" % e, file=sys.stderr)
+        return
+    if not selected:
+        return
+    waived = state.get("qualityWaived")
+    waived = waived if isinstance(waived, list) else []
+    step_id = state.get("stepId") if is_feature(state) and in_step(state) else None
+    for name, _ in selected:
+        entry = {"gate": name, "phase": state["phase"], "at": now()}
+        if step_id is not None:
+            entry["stepId"] = step_id
+        waived.append(entry)
+    state["qualityWaived"] = waived
+    write_person_sections(root, state)
+
+
 def cmd_advance(root):
     state = load_state(root)
     if not state or state["phase"] == DONE:
@@ -2226,6 +3691,8 @@ def cmd_advance(root):
     def apply(current):
         if not current or current["phase"] == DONE:
             raise Unchanged("Nothing to advance.")
+        current.pop("pausedFor", None)  # skipping the phase skips its broken gate
+        waive_gates(root, config, current)
         if in_replan(config, current) and replan is not None:
             add_history(current, None, phase=current["phase"], result="skipped")
             if adopt_replan(root, config, current, replan) == "done":
@@ -2278,9 +3745,10 @@ def cmd_status(root):
     if not state:
         return "No workflow state."
     late = late_reviews(root, load_config(root), state)
+    quality = quality_status_lines(state)
     if is_feature(state):
-        return "\n".join([feature_status(root, state)] + late)
-    return json.dumps(dict(state, lateReviews=late) if late else state, indent=2)
+        return "\n".join([feature_status(root, state)] + late + quality)
+    return "\n".join([json.dumps(dict(state, lateReviews=late) if late else state, indent=2)] + quality)
 
 
 def feature_status(root, state):
@@ -2312,6 +3780,48 @@ def feature_status(root, state):
     for step_id, status, sha, title in rows:
         lines.append("  %s  %s  %-7s  %s" % (step_id.rjust(width_id), status.ljust(width_status), sha, title))
     return "\n".join(lines)
+
+
+def _result_text(record):
+    """'pass', 'fail, metric 70' or 'broken (command not found)' for one entry of state.qualityResults."""
+    result = str(record.get("result", "?"))
+    if _metric_number(record.get("metric")) is not None:
+        result += ", metric %s" % _number_text(record["metric"])
+    if record.get("reason") and result.split(",")[0] in ("broken", "skipped"):
+        result += " (%s)" % str(record["reason"]).strip().rstrip(".")
+    return result
+
+
+def _waived_text(entry):
+    if isinstance(entry, dict):
+        text = str(entry.get("gate", "?"))
+        if entry.get("phase"):
+            text += " in phase %s" % entry["phase"]
+        if entry.get("stepId") is not None:
+            text += ", step %s" % entry["stepId"]
+        return text
+    return str(entry)
+
+
+def quality_status_lines(state):
+    """Lines of /status on quality gates: one per gate from the last run, then the waived gates. Reads state
+    only; never raises."""
+    try:
+        lines = []
+        results = state.get("qualityResults")
+        for name, record in (results.items() if isinstance(results, dict) else []):
+            if not isinstance(record, dict):
+                continue
+            where = "phase %s" % record.get("phase")
+            if record.get("stepId") is not None:
+                where += ", step %s" % record["stepId"]
+            lines.append("quality: %s %s (%s)" % (name, _result_text(record), where))
+        waived = state.get("qualityWaived")
+        for entry in (waived if isinstance(waived, list) else []):
+            lines.append("quality waived: %s" % _waived_text(entry))
+        return lines
+    except Exception as e:
+        return ["quality: unknown (%s)" % e]
 
 
 def relative_age(stamp):
@@ -2360,6 +3870,404 @@ def status_output(root):
     except Exception as e:
         return "%s\nupdate: unknown (%s)" % (output, e)
     return "%s\n%s" % (output, update_status_line(root, config))
+
+
+SHELL_WORDS = frozenset((":", ".", "[", "[[", "alias", "case", "cd", "command", "do", "done", "echo", "elif", "else",
+                         "eval", "exec", "exit", "export", "false", "fi", "for", "if", "pwd", "printf", "read",
+                         "return", "set", "shift", "source", "test", "then", "time", "trap", "true", "type",
+                         "ulimit", "umask", "unset", "until", "wait", "while"))
+ENV_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def gate_tool(command):
+    """The first word of a gate's command that names a program: leading VAR=value words are skipped. None when
+    there is none or the command starts with shell syntax."""
+    if not isinstance(command, str):
+        return None
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    for word in words:
+        if not ENV_ASSIGNMENT.match(word):
+            return None if (word in SHELL_WORDS or word[:1] in "$(`{!<>") else word
+    return None
+
+
+def missing_tool(root, command):
+    """The program a gate's command starts with when it is neither on PATH nor a file of the project, else None.
+    Shell builtins and keywords are not judged."""
+    word = gate_tool(command)
+    if not word:
+        return None
+    if "/" in word or "\\" in word:
+        path = word if os.path.isabs(word) else os.path.join(root, word)
+        return None if os.path.exists(path) else word
+    return None if shutil.which(word) else word
+
+
+def _quoted(text):
+    return '"%s"' % text if re.search(r"\s", text) else text
+
+
+def install_command(root):
+    """The command that installs the kit into this project again, as the installer recorded it, and where to run
+    it."""
+    source = read_manifest_source(root)
+    source = source if isinstance(source, dict) else {}
+    command = " ".join(["python install.py", _quoted(root)] + installer_args(source))
+    path = source.get("path")
+    return "%s, run from %s" % (command, _quoted(path) if isinstance(path, str) and path else "the specloop clone")
+
+
+def quality_budget_warning(root, config):
+    """A line when quality.timeoutSec is above what the installed Stop hook leaves, else None."""
+    configured, effective = quality_timeout(config), quality_budget(root, config)
+    if configured <= effective:
+        return None
+    return ("Warning: quality.timeoutSec is %s s, but the installed Stop hook leaves %s s for the gates, so that is "
+            "the budget in force. Install again to size the hook: %s." % (
+                _seconds_text(configured), _seconds_text(effective), install_command(root)))
+
+
+def quality_list_lines(root, config, state):
+    gates, results = quality_gates(config), state.get("qualityResults")
+    results = results if isinstance(results, dict) else {}
+    if not gates:
+        return ["No quality gates are configured (see docs/quality-gates.md)."]
+    lines = ["Quality gates (%d, in the order they run):" % len(gates)]
+    for name, gate in gates.items():
+        if not isinstance(gate, dict):
+            lines.append("  %s: invalid (a gate must be an object)" % name)
+            continue
+        phases = gate.get("phases", DEFAULT_GATE_PHASES)
+        last = results.get(name)
+        lines.append("  %s: phases %s, level %s, steps %s, last result: %s" % (
+            name, ", ".join(map(str, phases)) if isinstance(phases, list) else str(phases),
+            gate.get("level", "block"), gate.get("steps", "each"),
+            _result_text(last) if isinstance(last, dict) else "not run"))
+    return lines
+
+
+def quality_tool_lines(root, config):
+    missing = []
+    for name, gate in quality_gates(config).items():
+        tool = missing_tool(root, gate.get("command")) if isinstance(gate, dict) else None
+        if tool:
+            missing.append("  %s: %s" % (name, tool))
+    return ["Tools not found on PATH or in the project (gate: program):"] + missing if missing else []
+
+
+def quality_usage(config):
+    quality = cmd_name(config, "quality")
+    return "\n".join([
+        "Usage: %s [run [gate...]|init [preset]|accept]" % quality,
+        "  %s                  list the gates, their last results and problems with the setup" % quality,
+        "  %s run [gate...]    run gates now, outside the workflow" % quality,
+        "  %s init [preset]    set up gates for this project" % quality,
+        "  %s accept           accept changes to protected files, the quality block and forbidden lines" % quality,
+    ])
+
+
+def quality_overview(root, config):
+    try:
+        state = load_state(root) or {}
+    except Exception:  # an unreadable state must not hide the setup
+        state = {}
+    lines = quality_list_lines(root, config, state)
+    reason = unreadable_quality(config)
+    errors = validate_quality(root, config)
+    if errors:
+        lines += ["", "Configuration errors:"] + ["- " + e for e in errors]
+    if not reason:
+        warning = quality_budget_warning(root, config)
+        lines += ([""] + [warning]) if warning else []
+        tools = quality_tool_lines(root, config)
+        lines += ([""] + tools) if tools else []
+    return "\n".join(lines)
+
+
+ACCEPT_STATUSES = ("active", "paused", "stalled")
+ACCEPTED_LOG_LIMIT = 50
+
+
+def accept_refusal(config, state):
+    """Why `quality accept` cannot work on this state, or None when a run is going."""
+    if state and state.get("status") in ACCEPT_STATUSES:
+        return None
+    where = "no workflow is loaded" if not state else "the workflow is %s" % state.get("status", "not started")
+    return ("Nothing was accepted: %s, and %s accepts changes made during a run (status active, paused or "
+            "stalled). Start or resume one with %s." % (where, cmd_name(config, "quality accept"), cmd_name(config, "go")))
+
+
+def current_forbid_hits(root, config, state):
+    """The forbid hits of every gate that are not accepted yet, whatever the gate's phase, once per path and line
+    text. Raises ChangedFilesError when git cannot answer. Holds no lock."""
+    found: collections.OrderedDict = collections.OrderedDict()
+    for gate in quality_gates(config).values():
+        for hit in forbid_hits(root, config, state, gate):
+            found.setdefault(hit["hash"], hit)
+    return list(found.values())
+
+
+def accept_summary(paths, block_changed, hits):
+    """The lines of the accepted-changes log and of the command's output, one per accepted change."""
+    changes = ["protected file %s" % path for path in paths]
+    if block_changed:
+        changes.append("the quality block (config.json or config.local.json)")
+    for hit in hits:
+        text = hit["text"].strip()
+        changes.append("forbidden line %s:%d: %s" % (
+            hit["path"], hit["line"], text if len(text) <= MAX_HIT_CHARS else text[:MAX_HIT_CHARS] + "..."))
+    return changes
+
+
+def write_person_sections(root, state):
+    """Put the sections a person's commands add (waived gates, accepted changes) into run/quality.md, creating
+    the file when no gate has run. Writes nothing when there are none. Never raises."""
+    path = quality_report_path(root)
+    try:
+        lines = []
+        for extra in (quality_waived_lines(state), quality_accepted_lines(state)):
+            if extra:
+                lines += [""] + extra
+        if not lines:
+            return
+        text = ""
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        cuts = [c for c in (text.find("\n## Waived gates\n"), text.find("\n## Accepted changes\n")) if c >= 0]
+        text = text[:min(cuts)] if cuts else text or "# Quality gates\n\nNo gate has run yet."
+        text = text.rstrip("\n") + "\n" + "\n".join(lines) + "\n"
+        os.makedirs(run_dir(root), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception as e:
+        print("[specloop] could not write %s: %s" % (QUALITY_REPORT, e), file=sys.stderr)
+
+
+def quality_accept(root, config, args):
+    """/sl-quality accept: take the protected files, the quality block and the current forbid hits as the run's
+    own. Needs a run. Fingerprints and hits are computed with no lock, then stored through update_state, which
+    rechecks the reloaded state."""
+    if args:
+        return quality_usage(config)
+    state = load_state(root)
+    refusal = accept_refusal(config, state)
+    if refusal:
+        return refusal
+    fingerprints = quality_fingerprints(root, config)
+    if fingerprints is None:
+        return "Nothing was accepted: the protected files could not be fingerprinted (see the message above)."
+    try:
+        hits = current_forbid_hits(root, config, state)
+    except (ChangedFilesError, OSError) as e:
+        return "Nothing was accepted: the added lines cannot be determined: %s" % (str(e) or e.__class__.__name__)
+    seen = state.get("rev")
+
+    def apply(current):
+        refusal = accept_refusal(config, current)
+        if refusal:
+            raise Unchanged(refusal)
+        if current.get("rev") != seen:
+            raise Unchanged("Nothing was accepted: the workflow changed while %s ran. Run it again." % cmd_name(
+                config, "quality accept"))
+        paths, block_changed = fingerprint_changes(stored_fingerprints(current), fingerprints)
+        changes = accept_summary(paths, block_changed, hits)
+        if not changes and stored_fingerprints(current) == fingerprints:
+            raise Unchanged("Nothing to accept: the protected files, the quality block and the added lines are "
+                            "as the run (or an earlier accept) left them.")
+        current["qualityFingerprints"] = fingerprints
+        accepted = accepted_hits(current)
+        old = current.get("qualityAccepted")
+        stored = [h for h in old if isinstance(h, str)] if isinstance(old, list) else sorted(accepted)
+        current["qualityAccepted"] = stored + [h["hash"] for h in hits if h["hash"] not in accepted]
+        if changes:
+            log = current.get("qualityAcceptedLog")
+            log = log if isinstance(log, list) else []
+            log.append({"at": now(), "changes": changes})
+            current["qualityAcceptedLog"] = log[-ACCEPTED_LOG_LIMIT:]
+            write_person_sections(root, current)
+        if not changes:
+            return "Accepted: the fingerprints of this run are recorded now. Nothing differed."
+        return ("Accepted for this run:\n%s\nThe gates no longer report these. A later change, or a new forbidden "
+                "line, is reported again." % "\n".join("- " + c for c in changes))
+    return update_state(root, apply)
+
+
+def manual_gate_record(name, result, reason, text):
+    """(record, output) for a gate that `quality run` judges without running its command."""
+    return gate_record({"phase": "manual"}, name, result, None, 0, reason=reason), "[specloop] %s\n" % text
+
+
+def manual_gate_run(root, config, state, name, gate, definition_errors, budget_left):
+    """(record, output) of one gate for `quality run`. The log goes to run/quality-manual/. Protected files and
+    forbidden lines are not checked, and nothing is read from or written to the workflow except baseRef,
+    preexistingUntracked and the ratchet baseline, which {changed_files} and a ratchet gate need."""
+    if definition_errors:
+        reason = "invalid definition: %s" % "; ".join(definition_errors)
+        record, output = manual_gate_record(name, "broken", reason, "the gate did not run: %s" % reason)
+    else:
+        command = gate["command"]
+        if ("{changed_files}" in command or "{changed_files_file}" in command) and not state.get("baseRef"):
+            reason = "no baseRef: the workflow has not started a run in this repository, so there is no comparison point"
+            record, output = manual_gate_record(name, "skipped", reason, "skipped: %s; the command did not run" % reason)
+        else:
+            stand_in = {"phase": "manual", "baseRef": state.get("baseRef"),
+                        "preexistingUntracked": state.get("preexistingUntracked", [])}
+            command, record, output = expand_changed_files(root, config, stand_in, name, gate, QUALITY_MANUAL_DIR)
+            if not record:
+                return run_quality_gate(root, config, stand_in, name, gate, budget_left, command,
+                                        _metric_number(baseline_values(state).get(name)), log_dir=QUALITY_MANUAL_DIR)
+    write_gate_log(root, name, output.encode("utf-8"), QUALITY_MANUAL_DIR)
+    return record, output
+
+
+def manual_gate_line(record):
+    text = "  %s: %s" % (record["name"], record["result"])
+    if record.get("reason"):
+        text += " (%s)" % str(record["reason"]).strip().rstrip(".")
+    text += ", %ss" % _seconds_text(record.get("durationSec", 0))
+    if _metric_number(record.get("metric")) is not None:
+        text += ", metric %s" % _number_text(record["metric"])
+    return text + ", log %s" % _rel("run", QUALITY_MANUAL_DIR, record["name"] + ".log")
+
+
+def manual_run_text(config, runs):
+    """The output of `quality run`: a line per gate, then the end of the output of each gate that did not pass."""
+    lines = ["Quality gates run now, outside the workflow (nothing was recorded):"]
+    lines += [manual_gate_line(record) for record, _ in runs]
+    failing = [(r, o.rstrip("\n")) for r, o in runs if r["result"] in ("fail", "warn", "broken")]
+    shares = _shares([len(o) for _, o in failing], config.get("maxOutputChars", 4000))
+    for (record, output), share in zip(failing, shares):
+        lines += ["", "### %s (%s)" % (record["name"], _gate_exit(record)), _clip_tail(output, share)]
+    return "\n".join(lines)
+
+
+def quality_run(root, config, args):
+    """/sl-quality run [gate...]: run the named gates, or all, now and in declared order, with the runner, the
+    exit-code and metric rules and the time budget of a run, but with no change to the workflow: no state write,
+    no iteration, no pause. Logs go to run/quality-manual/, never to run/quality/. `steps` and the phase are not
+    honoured. Takes no lock."""
+    reason = unreadable_quality(config)
+    if reason:
+        return "Nothing ran: %s." % reason
+    gates = quality_gates(config)
+    if not gates:
+        return "No quality gates are configured (see docs/quality-gates.md)."
+    unknown = [a for a in args if a not in gates]
+    if unknown:
+        return "Unknown gate%s: %s.\nThe gates are: %s." % ("s" if len(unknown) > 1 else "", ", ".join(unknown),
+                                                          ", ".join(gates))
+    try:
+        state = load_state(root) or {}
+    except Exception:  # an unreadable state must not stop a gate from being tried
+        state = {}
+    selected = [(name, gate) for name, gate in gates.items() if not args or name in args]
+    invalid = gate_definition_errors(root, config, selected)
+    budget, started = quality_budget(root, config), _clock()
+    runs = []
+    for name, gate in selected:
+        runs.append(manual_gate_run(root, config, state, name, gate, invalid.get(name),
+                                    budget - (_clock() - started)))
+    return manual_run_text(config, runs)
+
+
+PRESETS_DIR = "presets"
+
+
+def load_presets(root):
+    """The shipped presets as an ordered {name: {"detect": [...], "quality": {...}}}, from presets/*.json. A file
+    that cannot be read or is not an object with a `quality` object is left out. Never raises."""
+    presets: collections.OrderedDict = collections.OrderedDict()
+    try:
+        names = sorted(n for n in os.listdir(_path(root, PRESETS_DIR)) if n.endswith(".json"))
+    except OSError:
+        return presets
+    for file_name in names:
+        try:
+            with open(_path(root, PRESETS_DIR, file_name), encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("quality"), dict):
+            detect = data.get("detect")
+            presets[file_name[:-len(".json")]] = {
+                "detect": [d for d in detect if isinstance(d, str)] if isinstance(detect, list) else [],
+                "quality": data["quality"]}
+    return presets
+
+
+def preset_detected(root, preset):
+    """The `detect` entries of the preset that match a file or directory of the project (globs allowed)."""
+    found = []
+    for pattern in preset["detect"]:
+        try:
+            if glob.glob(os.path.join(glob.escape(root), *pattern.split("/")), recursive=True):
+                found.append(pattern)
+        except Exception:  # an odd pattern must not break the listing
+            continue
+    return found
+
+
+def preset_lines(name, preset, detected=None):
+    head = "Preset %s" % name
+    if detected:
+        head += " (detected: %s)" % ", ".join(detected)
+    return [head + ":", json.dumps({"quality": preset["quality"]}, indent=2)]
+
+
+def quality_init(root, config, args):
+    """/sl-quality init [preset]: print the presets whose detect files exist, or the named one, for Claude to adapt
+    (see the command template). Refuses during a run. Changes nothing."""
+    quality = cmd_name(config, "quality")
+    if len(args) > 1:
+        return quality_usage(config)
+    try:
+        state = load_state(root)
+    except Exception:  # an unreadable state does not mean a run is going
+        state = None
+    if state and state.get("status") in ACCEPT_STATUSES:
+        return ("Nothing was set up: the workflow is %s, and %s init sets up gates between runs. Finish the run "
+                "or reset it with %s, then try again." % (state["status"], quality, cmd_name(config, "reset")))
+    presets = load_presets(root)
+    if not presets:
+        return "No presets are installed (expected %s/*.json); install specloop again." % _rel(PRESETS_DIR)
+    names = ", ".join(presets)
+    if args:
+        if args[0] not in presets:
+            return "Unknown preset %r. The presets are: %s." % (args[0], names)
+        return "\n".join(preset_lines(args[0], presets[args[0]]))
+    lines = []
+    for name, preset in presets.items():
+        detected = preset_detected(root, preset)
+        if detected:
+            lines += preset_lines(name, preset, detected) + [""]
+    if not lines:
+        return "No preset matches this project. The presets are: %s.\nName one to print it: %s init <preset>." % (
+            names, quality)
+    return "\n".join(lines).rstrip()
+
+
+QUALITY_FORMS = {"accept": quality_accept, "init": quality_init, "run": quality_run}  # form -> handler
+
+
+def cmd_quality(root, args):
+    """/sl-quality: `args` is the argument string. Never raises."""
+    config = {}
+    try:
+        config = load_config(root)
+        try:
+            words = shlex.split(args or "")
+        except ValueError as e:
+            return "Cannot read the arguments (%s).\n%s" % (e, quality_usage(config))
+        if not words:
+            return quality_overview(root, config)
+        handler = QUALITY_FORMS.get(words[0])
+        return handler(root, config, words[1:]) if handler else quality_usage(config)
+    except Exception as e:
+        return "[specloop] %s failed: %s" % (cmd_name(config, "quality"), str(e) or e.__class__.__name__)
 
 
 def cmd_reset(root):
@@ -2656,6 +4564,7 @@ def main(argv):
         "status": lambda: status_output(root),
         "reset": lambda: cmd_reset(root),
         "update": lambda: cmd_update(root, args),
+        "quality": lambda: cmd_quality(root, " ".join(args)),
     }
     if command not in handlers:
         print("Unknown command: " + command)

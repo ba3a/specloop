@@ -1,0 +1,26 @@
+{
+  "detect": ["package.json"],
+  "quality": {
+    "gates": {
+      "eslint": {
+        "command": "npx --no-install eslint .",
+        "hint": "Fix the finding instead of disabling the rule or changing the ESLint configuration.",
+        "protect": ["eslint.config.js", "eslint.config.mjs", "eslint.config.cjs", ".eslintrc.json", ".eslintrc.js", ".eslintrc.cjs"],
+        "forbid": [
+          { "pattern": "eslint-disable", "glob": ["*.js", "*.jsx", "*.mjs", "*.cjs", "*.ts", "*.tsx"], "message": "Fix the finding instead of disabling the rule." }
+        ]
+      },
+      "typecheck": {
+        "command": "npx --no-install tsc --noEmit",
+        "hint": "Fix the types instead of ignoring the error or loosening tsconfig.json.",
+        "protect": ["tsconfig.json"],
+        "forbid": [
+          { "pattern": "@ts-(ignore|nocheck)", "glob": ["*.ts", "*.tsx"], "message": "Fix the types instead of ignoring the error." }
+        ]
+      },
+      "tests": {
+        "command": "npm test --silent"
+      }
+    }
+  }
+}
