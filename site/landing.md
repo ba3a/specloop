@@ -31,7 +31,7 @@ accent:
 
 # Write the spec. Go make tea. Come back to reviewed commits.
 
-specloop turns Claude Code into a spec-driven **plan → implement → review** loop. Claude cannot say "done" until the tests pass and a reviewer approves the diff. You stop babysitting the chat.
+specloop turns Claude Code into a spec-driven **plan → implement → review** loop. Claude cannot say "done" until your tests and linters pass and a reviewer approves the diff. You stop babysitting the chat.
 
 [Get it on GitHub →](https://github.com/ba3a/specloop) [Install in 30 seconds](#quick-start)
 
@@ -98,8 +98,10 @@ Each time Claude tries to stop, specloop's Stop hook runs the current phase's ch
 | Phase | What Claude does | Gate |
 |-------|------------------|------|
 | **01 · plan** | Reads the spec and writes a plan. Can only edit the plan file, so no "let me just start coding". | The plan file exists |
-| **02 · implement** | Implements test-first, free to edit the code. Your linters and coverage can join as quality gates. | Your test command exits 0 |
+| **02 · implement** | Implements test-first, free to edit the code. | Your test command and quality gates pass |
 | **03 · review** | A fresh reviewer reads the diff, read-only, and writes a verdict. Changes requested? Back to implement. | `VERDICT: APPROVE` |
+
+Quality gates are your linter, type checker, tests or coverage report, each a named command. Every failing gate is reported in one message, with the end of its output.
 
 Big spec? `/sl-feature` splits it into steps. Each step runs implement → review in fresh subagents and ends in its own commit on a dedicated branch. If a step shows the plan is wrong, the remaining steps get replanned.
 
@@ -113,7 +115,7 @@ You do the parts that need a human: deciding what to build and approving the pla
 
 - **14:00** · *you* · Write `specs/password-reset.md`: goal, requirements, acceptance criteria.
 - **14:10** · *you* · `/sl-feature`, `/sl-go`. A planner splits it into 5 steps. You skim, approve.
-- **14:12** · Step 1: implement, tests go green, reviewer approves, committed.
+- **14:12** · Step 1: implement, tests and linter go green, reviewer approves, committed.
 - **14:40** · Step 3: the reviewer catches a token that can be reused. Back to implement. Fixed, approved, committed.
 - **15:20** · Last step committed. The run is `done`.
 - **15:25** · *you* · You're back with your tea. One branch, five reviewed commits. You open the PR.
@@ -156,12 +158,13 @@ new one through a link sent by email.
 
 - **🚧 Hard gates.** Phases complete on exit codes and verdicts, not on Claude's opinion of its own work.
 - **🔍 Independent review.** Review runs in a fresh subagent that never saw the implementation chat. It reads the diff, not the excuses.
-- **🧪 Quality gates.** Plug in your linter, tests and coverage as named gates. All failures are reported at once.
+- **🧪 Quality gates.** Your linter, type checker, tests and coverage as named gates, with optional thresholds such as "coverage ≥ 80". `/sl-quality init` sets them up from presets for Kotlin, Java, Python, Node, Go and Rust.
+- **🛡️ No gaming the gates.** Tool configs are fingerprinted, and new `# noqa` or `@Suppress` lines fail the gate. Only you can accept an exception, with `/sl-quality accept`.
+- **📉 Legacy code welcome.** A ratchet gate passes when a number is no worse than before the run. Old warnings don't block new work.
 - **🔒 Never pushes.** `git push` and PR creation are blocked until the work is done. Opening the PR stays your call.
 - **🧾 One commit per step.** Feature mode leaves a clean branch: one reviewed, tested commit per planned step. Easy to read, easy to revert.
 - **🛟 Can't run away.** After 15 blocked stops the run stalls and waits for you. A crash in specloop never breaks your session.
-- **💸 No extra bill.** It's hooks and slash commands inside your normal Claude Code session. Your subscription, no API keys, no orchestrator.
-- **🪶 Tiny and portable.** Pure Python standard library, 3.8+. CLI, desktop app or IDE. macOS, Linux and Windows.
+- **🪶 Tiny, portable, no extra bill.** Hooks and slash commands in your normal Claude Code session: your subscription, no API keys, no orchestrator. Pure Python standard library, 3.8+, on macOS, Linux and Windows.
 
 <div class="section-marker" id="dogfood"></div>
 
@@ -169,12 +172,12 @@ new one through a link sent by email.
 
 ## specloop is built by specloop
 
-Since feature mode landed, new specloop features are written as specs and run through specloop itself. The copy installed in the repository plans, implements, reviews and commits the next version of the kit.
+Since feature mode landed, new specloop features are written as specs and run through specloop itself. The copy installed in the repository plans, implements, reviews and commits the next version of the kit, held by its own quality gates: ruff, mypy, a rules checker and the test suite.
 
-- **3** · releases in 3 days: 0.2.0, 0.2.1, 0.3.0
-- **14** · commits authored by feature-mode steps for one spec
-- **12 → 14** · steps: the run replanned itself midway
-- **500+** · unit tests guarding the engine
+- **23** · steps planned for one spec: quality gates, built in 4 days
+- **9** · times the reviewer sent a step of that run back to implement
+- **12 → 14** · steps: the update checker's run replanned itself midway
+- **950+** · unit tests guarding the engine and the installer
 
 The real `git log` of the update checker, built from `specs/update-checker.md`:
 
@@ -208,7 +211,7 @@ Notice the count jump from `6/12` to `7/14`: the reviewer found problems the pla
 
 ## Install into any project
 
-You need Claude Code, Python 3.8+, git and `sh` (Git Bash on Windows). The installer copies the kit into your project's `.claude/` directory and never touches your own settings.
+You need Claude Code, Python 3.8+, git and `sh` (Git Bash on Windows). The installer copies the kit into your project's `.claude/` directory, detects your test command and never touches your own settings.
 
 Then start a **new** Claude Code session in the project. Updates are one command: `/sl-update`.
 
@@ -218,7 +221,10 @@ git clone https://github.com/ba3a/specloop.git ~/tools/specloop
 ~/tools/specloop/install.sh ~/code/my-project
 # Windows: install.cmd C:\code\my-project
 
-# in Claude Code, one reviewable diff
+# in Claude Code, optional: add linters as gates
+/sl-quality init
+
+# one reviewable diff
 /sl-spec specs/login.md
 /sl-go
 
@@ -248,11 +254,19 @@ After 15 blocked stops (configurable) the run goes to `stalled` and Claude is al
 
 ### Can I change the phases?
 
-Yes. The phases are a configurable graph. Add a lint phase, drop review, or write your own phase instructions in `overrides/`. Your config is never overwritten on update.
+Yes. The phases are a configurable graph. Add or drop a phase, attach quality gates to any phase that may edit code, or write your own phase instructions in `overrides/`. Your config is never overwritten on update.
 
 ### Does it work with my stack?
 
-If your tests run from a shell command, yes. specloop doesn't care about the language: the gate is an exit code.
+If your tests run from a shell command, yes. specloop doesn't care about the language: a gate is an exit code, optionally with a number read from the output. The installer detects Gradle, Maven, npm, pytest, Go, Cargo and .NET tests, and `/sl-quality init` ships presets for Kotlin, Java, Python, Node, Go and Rust.
+
+### Can't Claude just loosen the linter config?
+
+No. The files a gate depends on, and the gate definitions themselves, are fingerprinted when the run starts. A change fails the gate, even one made through the shell. New lines that match a forbidden pattern, such as `# noqa`, fail it too. Only you can allow an exception, with `/sl-quality accept`, and the reviewer sees what you allowed.
+
+### My project already has lint warnings. Will every run fail?
+
+No. Use the tool's own baseline, check only the files the run changed with `{changed_files}`, or set a gate to `ratchet`: it then passes when the number is no worse than before the run.
 
 ### Windows?
 
