@@ -1,0 +1,43 @@
+{
+  "commandPrefix": "sl-",
+  "checkTimeoutSec": 3500,
+  "quality": {
+    "gates": {
+      "rules": {
+        "command": "python tools/check_rules.py",
+        "hint": "These are the rules in CLAUDE.md."
+      },
+      "ruff": {
+        "command": "python -m ruff check .",
+        "protect": [
+          "ruff.toml"
+        ],
+        "forbid": [
+          {
+            "pattern": "# noqa",
+            "glob": [
+              "*.py"
+            ]
+          }
+        ]
+      },
+      "mypy": {
+        "command": "python -m mypy",
+        "protect": [
+          "mypy.ini"
+        ],
+        "forbid": [
+          {
+            "pattern": "# type: ignore",
+            "glob": [
+              "*.py"
+            ]
+          }
+        ]
+      },
+      "tests": {
+        "command": "python tests/run_parallel.py"
+      }
+    }
+  }
+}

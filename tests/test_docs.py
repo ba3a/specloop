@@ -461,7 +461,7 @@ class DocsTest(unittest.TestCase):
             self.assertIn("| `%s` |" % key, rows)
         for needle in ("./gradlew detekt", '"passExitCodes": [0, 2]', "detekt.json", "mypy.ini", "check_untyped_defs",
                        "python tools/check_rules.py", "python -m ruff check .", "python -m mypy",
-                       "python -m unittest discover -s tests -q", "# noqa", "# type: ignore", "./install.sh .",
+                       "python tests/run_parallel.py", "# noqa", "# type: ignore", "./install.sh .",
                        "/sl-quality run", "phases.implement.check", "already modified", "large tree"):
             self.assertIn(needle, page)
 

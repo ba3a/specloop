@@ -345,7 +345,7 @@ specloop develops itself with four gates. The `quality` block for this repositor
       "rules": { "command": "python tools/check_rules.py", "hint": "These are the rules in CLAUDE.md." },
       "ruff": { "command": "python -m ruff check .", "protect": ["ruff.toml"], "forbid": [{ "pattern": "# noqa", "glob": ["*.py"] }] },
       "mypy": { "command": "python -m mypy", "protect": ["mypy.ini"], "forbid": [{ "pattern": "# type: ignore", "glob": ["*.py"] }] },
-      "tests": { "command": "python -m unittest discover -s tests -q" }
+      "tests": { "command": "python tests/run_parallel.py" }
     }
   }
 }
@@ -354,7 +354,7 @@ specloop develops itself with four gates. The `quality` block for this repositor
 - `rules` runs `tools/check_rules.py`, which enforces the machine-checkable rules of `CLAUDE.md` (Python 3.8 grammar, the import allowlist, no hard-coded command names, line endings).
 - `ruff` and `mypy` are pinned in `requirements-dev.txt`, so `pip install -r requirements-dev.txt` installs them. Their settings are in `ruff.toml` and `mypy.ini`, which are `protect`ed: a run cannot pass a gate by loosening them. `forbid` rejects new `# noqa` and `# type: ignore` comments for the same reason.
 - mypy's `files` and `check_untyped_defs` settings live in the tracked `mypy.ini`, because `engine.py` has no annotations and mypy skips the body of an unannotated function without `check_untyped_defs`. This keeps the gate's command short.
-- `tests` replaces the `phases.implement.check` that this repository used before. A gate runs after a `check`, never instead of it, so the `check` is removed from `config.json`.
+- `tests` replaces the `phases.implement.check` that this repository used before. A gate runs after a `check`, never instead of it, so the `check` is removed from `config.json`. It uses `tests/run_parallel.py`, because the serial suite takes longer than the default [time budget](#time-budget) of 1800 seconds.
 
 The harness cannot be switched on from inside the run that builds it: `config.json` cannot be edited while a run is active (PreToolUse), `.claude/` is git-ignored here, and the installed engine lags behind `kit/`. After the run, by hand:
 
