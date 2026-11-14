@@ -2,7 +2,11 @@
 
 Needs Chrome and ffmpeg; set CHROME and FFMPEG if they are not in the default places.
 """
-import os, shutil, struct, subprocess, tempfile
+import os
+import shutil
+import struct
+import subprocess
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PNG = os.path.join(HERE, "png")

@@ -1124,7 +1124,8 @@ def verdict_line(line):
 
 def quote_depth(line):
     """Number of blockquote markers that start the line."""
-    return QUOTE_PREFIX.match(line).group().count(">")
+    match = QUOTE_PREFIX.match(line)
+    return match.group().count(">") if match else 0
 
 
 def code_fence(line):

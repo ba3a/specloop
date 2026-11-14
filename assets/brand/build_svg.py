@@ -1,4 +1,6 @@
-import math, os, sys
+import math
+import os
+import sys
 
 OUT = sys.argv[1]
 os.makedirs(OUT, exist_ok=True)
