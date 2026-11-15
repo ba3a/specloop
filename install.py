@@ -173,6 +173,26 @@ def install_commands(target, prefix):
     return installed
 
 
+def remove_agents(target):
+    for rel in read_json(manifest_path(target)).get("agents", []):
+        path = os.path.join(target, rel)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def install_agents(target):
+    """Copy the shipped subagent definitions to .claude/agents/; other files there are never touched."""
+    remove_agents(target)
+    dest = os.path.join(target, ".claude", "agents")
+    os.makedirs(dest, exist_ok=True)
+    installed = []
+    for src in sorted(glob.glob(os.path.join(KIT, "agents", "*.md"))):
+        name = os.path.basename(src)
+        shutil.copyfile(src, os.path.join(dest, name))
+        installed.append(".claude/agents/" + name)
+    return installed
+
+
 def in_git_work_tree(target):
     try:
         result = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=target,
@@ -272,8 +292,8 @@ def write_gitignore(target, block):
     return True
 
 
-def update_gitignore(target, commands):
-    if not write_gitignore(target, GITIGNORE_KIT + commands):
+def update_gitignore(target, installed):
+    if not write_gitignore(target, GITIGNORE_KIT + installed):
         print("! .gitignore not updated: %s is not in a git work tree or .gitignore is not writable." % target)
 
 
@@ -300,6 +320,7 @@ def install(target, scope="project", prefix=None, test_command=None, force=False
     config = write_config(target, test_command, prefix, force)
     prefix = config["commandPrefix"]
     commands = install_commands(target, prefix)
+    agents = install_agents(target)
     defaults = read_json(os.path.join(target, BASE_DIR, "defaults.json"))
     stop_timeout = stop_hook_timeout(config, defaults)
     chosen = settings_files(target)[0 if scope == "project" else 1]
@@ -308,12 +329,12 @@ def install(target, scope="project", prefix=None, test_command=None, force=False
             write_json(path, strip_hooks(read_json(path)))
     write_json(chosen, merge_hooks(read_json(chosen), stop_timeout))
     source = describe_source(scope, gitignore)
-    write_json(manifest_path(target), {"commands": commands, "settings": os.path.relpath(chosen, target),
+    write_json(manifest_path(target), {"commands": commands, "agents": agents, "settings": os.path.relpath(chosen, target),
                                        "stopTimeoutSec": stop_timeout, "source": source})
     if not source["checkable"]:
         print("! update checks unavailable: " + source["reason"])
     if gitignore:
-        update_gitignore(target, commands)
+        update_gitignore(target, commands + agents)
     return prefix
 
 
@@ -323,6 +344,7 @@ PROJECT_OWNED = ("config.json", "config.local.json", "overrides")
 
 def uninstall(target, keep_config=False):
     remove_commands(target)
+    remove_agents(target)
     write_gitignore(target, [])
     for path in settings_files(target):
         if os.path.exists(path):

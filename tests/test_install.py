@@ -279,6 +279,67 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(["mine.md"], os.listdir(self.path(".claude", "commands")))
         self.assertEqual({"model": "opus"}, self.read_json(".claude", "settings.json"))
 
+    AGENTS = ["specloop-implementer.md", "specloop-orchestrator.md", "specloop-planner.md", "specloop-reviewer.md"]
+
+    def agents_dir(self):
+        return sorted(os.listdir(self.path(".claude", "agents")))
+
+    def test_fresh_install_copies_agents_and_records_them(self):
+        install.install(self.root, test_command="true")
+        self.assertEqual(self.AGENTS, self.agents_dir())
+        manifest = self.read_json(".claude", "specloop", "manifest.json")
+        self.assertEqual([".claude/agents/" + name for name in self.AGENTS], manifest["agents"])
+
+    def frontmatter(self, name):
+        with open(self.path(".claude", "agents", name), encoding="utf-8") as f:
+            text = f.read()
+        head = text.split("---\n")[1]
+        return dict(line.split(": ", 1) for line in head.splitlines()), text
+
+    def test_agent_frontmatter(self):
+        install.install(self.root, test_command="true")
+        for name in self.AGENTS:
+            fields, text = self.frontmatter(name)
+            self.assertEqual(name[:-3], fields["name"])
+            self.assertTrue(fields["description"])
+            self.assertEqual("inherit", fields["model"])
+            self.assertNotIn("/sl-", text, name)
+            self.assertNotIn("{{prefix}}", text, name)
+            if name == "specloop-orchestrator.md":
+                self.assertEqual("Agent, Read, Grep, Glob", fields["tools"])
+            else:
+                self.assertNotIn("tools", fields, name)
+
+    def test_reinstall_replaces_modified_agent_file(self):
+        install.install(self.root, test_command="true")
+        self.write(".claude/agents/specloop-reviewer.md", "changed")
+        install.install(self.root)
+        with open(self.path(".claude", "agents", "specloop-reviewer.md"), encoding="utf-8") as f:
+            self.assertNotEqual("changed", f.read())
+
+    def test_own_agent_survives_install_reinstall_and_uninstall(self):
+        self.write(".claude/agents/mine.md", "mine")
+        install.install(self.root, test_command="true")
+        install.install(self.root)
+        self.assertEqual(sorted(self.AGENTS + ["mine.md"]), self.agents_dir())
+        install.uninstall(self.root)
+        self.assertEqual(["mine.md"], self.agents_dir())
+        with open(self.path(".claude", "agents", "mine.md"), encoding="utf-8") as f:
+            self.assertEqual("mine", f.read())
+
+    def test_uninstall_keep_config_removes_only_shipped_agents(self):
+        self.write(".claude/agents/mine.md", "mine")
+        install.install(self.root, test_command="true")
+        install.uninstall(self.root, keep_config=True)
+        self.assertEqual(["mine.md"], self.agents_dir())
+
+    def test_gitignore_ignores_installed_agents(self):
+        self.git_init()
+        install.install(self.root, test_command="true")
+        for name in self.AGENTS:
+            self.assertTrue(self.git_check_ignore(".claude/agents/" + name), name)
+        self.assertFalse(self.git_check_ignore(".claude/agents/mine.md"))
+
     def test_uninstall_keep_config(self):
         install.install(self.root, test_command="true")
         install.uninstall(self.root, keep_config=True)

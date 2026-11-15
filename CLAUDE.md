@@ -22,6 +22,8 @@ kit/specloop/phases/*.md              shipped phase instructions (replaced on up
   feature-plan.md, feature-replan.md    feature-mode planning and replanning
   step-implement.md, step-review.md     feature-mode step cycle
   delegate.md                           orchestration preamble for delegated phases ({brief})
+kit/agents/*.md                       subagent definitions copied verbatim to .claude/agents/ (no prefix substitution):
+                                      specloop-planner, -implementer, -reviewer and -orchestrator
 kit/commands/*.md                     slash command templates; {{prefix}} is substituted on install
                                       (spec, feature, go, pause, advance, status, reset, update, quality)
                                       kit/commands/update.md is /sl-update (check, skip, never)
@@ -41,7 +43,7 @@ assets/brand/                         logo, favicons and social preview image; S
                                       build_svg.py, PNGs by export_png.py (see its README.md); not installed
 ```
 
-Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,presets/,VERSION,manifest.json}` belong to the kit. `manifest.json` also records `source`: the clone that ran `install.py` (its path, version, remote, branch and `installArgs`, or `checkable: false` with a reason), which the update checker uses. `config.json` and `overrides/` belong to the project. `config.local.json` belongs to the person: a personal layer merged over `config.json`, git-ignored, and never created, changed or removed by the installer (the engine writes it only for `/sl-update never`). `state.json` (which also holds the quality-gate keys `qualityBaseline`, `qualityFingerprints`, `qualityResults`, `qualityWaived`, `qualityAccepted` and `qualityAcceptedLog`), `state.lock`, `update.json`, `update.lock` and `run/` (including `run/attempts/`, `run/quality.md`, `run/quality/` and `run/quality-manual/`) are runtime state; `update.json` is the update checker's semaphore file.
+Installed layout in a target: `.claude/specloop/{engine.py,run.sh,defaults.json,phases/,presets/,VERSION,manifest.json}` belong to the kit, and so do the `.claude/agents/specloop-*.md` files listed in manifest `agents`; other files in `.claude/agents/` belong to the project. `manifest.json` also records `source`: the clone that ran `install.py` (its path, version, remote, branch and `installArgs`, or `checkable: false` with a reason), which the update checker uses. `config.json` and `overrides/` belong to the project. `config.local.json` belongs to the person: a personal layer merged over `config.json`, git-ignored, and never created, changed or removed by the installer (the engine writes it only for `/sl-update never`). `state.json` (which also holds the quality-gate keys `qualityBaseline`, `qualityFingerprints`, `qualityResults`, `qualityWaived`, `qualityAccepted` and `qualityAcceptedLog`), `state.lock`, `update.json`, `update.lock` and `run/` (including `run/attempts/`, `run/quality.md`, `run/quality/` and `run/quality-manual/`) are runtime state; `update.json` is the update checker's semaphore file.
 
 ## Commands
 

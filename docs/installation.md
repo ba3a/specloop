@@ -31,8 +31,9 @@ Then start a **new** Claude Code session in that project. Hooks are loaded at se
 - copies the kit into `<project>/.claude/specloop/` (see [Files and ownership](how-it-works.md#files-and-ownership));
 - creates `config.json` and tries to detect the test command (Gradle, Maven, npm, pytest, Go, Cargo, .NET);
 - installs the slash commands into `.claude/commands/` (see [Commands](commands.md));
+- installs the subagent definitions `specloop-planner.md`, `specloop-implementer.md`, `specloop-reviewer.md` and `specloop-orchestrator.md` into `.claude/agents/`, replacing the shipped ones on every run and leaving your own files there alone;
 - merges the hooks into `.claude/settings.json` and leaves your other settings and hooks alone;
-- if the project is in a git work tree and `.gitignore` is writable, keeps a marked `# >>> specloop` block in `.gitignore`. The block ignores the installed kit, the runtime state and the installed slash commands. `config.json` and `overrides/` stay tracked so the team can share them. Re-running the installer rewrites the block, and `--uninstall` removes it.
+- if the project is in a git work tree and `.gitignore` is writable, keeps a marked `# >>> specloop` block in `.gitignore`. The block ignores the installed kit, the runtime state, the installed slash commands and the installed subagent definitions. `config.json` and `overrides/` stay tracked so the team can share them. Re-running the installer rewrites the block, and `--uninstall` removes it.
 
 ## Installer options
 
@@ -43,7 +44,7 @@ Then start a **new** Claude Code session in that project. Hooks are loaded at se
 | `--prefix <p>` | Slash command prefix, default `sl-`. Use `--prefix ""` for plain `/spec`, `/go`, … |
 | `--force` | Recreate `config.json` from scratch. |
 | `--no-gitignore` | Don't touch `.gitignore`. |
-| `--uninstall [--keep-config]` | Remove specloop: kit, commands, hooks. Other settings are kept. |
+| `--uninstall [--keep-config]` | Remove specloop: kit, commands, subagent definitions, hooks. Other settings are kept. |
 
 ## Updating
 
@@ -65,6 +66,8 @@ The kit is git-ignored, so a new `git worktree` does not get it. Run the install
 ```bash
 ~/tools/specloop/install.sh ~/code/my-project --uninstall
 ```
+
+This removes the kit, the hooks, the slash commands and the subagent definitions in `.claude/agents/` that the installer recorded in `manifest.json`. Your own files in `.claude/commands/` and `.claude/agents/` stay.
 
 ## See also
 

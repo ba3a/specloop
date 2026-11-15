@@ -49,9 +49,16 @@ Files in `<project>/.claude/specloop/`:
 | `run/quality.md`, `run/quality/` | runtime | The [quality gates](quality-gates.md#results-file) report of the last gate run and each gate's complete output. Both move to `run/steps/<id>/` when a feature-mode step finishes. |
 | `run/quality-manual/` | runtime | The logs of [`/sl-quality run`](quality-gates.md#trying-gates-with-run), kept apart from `run/quality/`. It does not move when a step finishes. |
 | `update.json`, `update.lock` | runtime | Result of the last update check and the lock of a running check. See [Updates](updates.md). |
-| `manifest.json` | kit | What the installer wrote: `commands`, `settings`, `stopTimeoutSec` (the Stop hook's timeout, which bounds the [quality gates](quality-gates.md#time-budget)) and `source`, the clone the kit was installed from. |
+| `manifest.json` | kit | What the installer wrote: `commands`, `agents` (the installed subagent definitions), `settings`, `stopTimeoutSec` (the Stop hook's timeout, which bounds the [quality gates](quality-gates.md#time-budget)) and `source`, the clone the kit was installed from. |
 
 Everything in this directory except `config.json` and `overrides/` is git-ignored.
+
+Files in `<project>/.claude/agents/`:
+
+| File | Owner | Purpose |
+|------|-------|---------|
+| `specloop-planner.md`, `specloop-implementer.md`, `specloop-reviewer.md`, `specloop-orchestrator.md` | kit (replaced on update) | Subagent definitions for the planner, implementer and reviewer roles, and a main-thread orchestrator restricted to `Agent`, `Read`, `Grep` and `Glob`. Listed in `manifest.json` under `agents` and git-ignored. |
+| any other file | **project** | Never touched by the installer. |
 
 `state.json` holds, besides the workflow position, the state of [quality gates](quality-gates.md). `qualityBaseline` is one key: the value of each [ratchet](quality-gates.md#existing-problems) gate, measured once per run on the Stop that passes the planning phase and kept for the rest of the run. `qualityFingerprints` holds the SHA-256 of each [protected](quality-gates.md#protected-files) file and of the merged `quality` block, stored on the first `/sl-go`; a gate compares against it before its command runs. `qualityResults` is the last result of each gate, `qualityAccepted` the hashes of the forbidden lines a person accepted (with `qualityAcceptedLog`, the accepted changes), and `qualityWaived` the gates `/sl-advance` skipped. `pausedFor` names the gate and the reason while a [broken gate](quality-gates.md#broken-gates) pauses the run. In single mode `baseRef` and `preexistingUntracked`, recorded on the first `/sl-go` in a git repository, give `{changed_files}` its [comparison point](quality-gates.md#changed-files); feature mode records them when it creates its branch.
 
