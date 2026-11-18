@@ -102,9 +102,9 @@ The `feature` block of the [configuration](configuration.md). The keys for repla
 | `feature.planPhase` | `"feature-plan"` | First phase of a feature run. |
 | `feature.requirePlanApproval` | `true` | Pause for approval after planning. When `false`, the plan is approved as soon as its gate passes. |
 | `feature.gitTimeoutSec` | `60` | Timeout for every git call the engine makes. |
-| `feature.planPhases` | `feature-plan` phase | Phase graph for planning, with the same keys as `phases` (`delegate`, `allowEdits`, `check`, `instructions`). |
+| `feature.planPhases` | `feature-plan` phase | Phase graph for planning, with the same keys as `phases` (`delegate`, `subagent`, `allowEdits`, `check`, `instructions`). Both phases default to `subagent: "specloop-planner"`; see [Choosing the subagent](delegation.md#choosing-the-subagent). |
 | `feature.stepInitialPhase` | `"implement"` | First phase of every step. |
-| `feature.stepPhases` | `implement` → `review` → `commit` | Phase graph of the step cycle; `commit` is the reserved terminal pseudo-phase. |
+| `feature.stepPhases` | `implement` → `review` → `commit` | Phase graph of the step cycle; `commit` is the reserved terminal pseudo-phase. Each phase may set `subagent`; `implement` defaults to `specloop-implementer` and `review` to `specloop-reviewer` (see [Choosing the subagent](delegation.md#choosing-the-subagent)). |
 | `feature.commitExclude` | `[".claude/specloop/"]` | Paths never included in step commits. |
 | `feature.commitMessage` | `"{type}: {step_title}\n\nspecloop step {step_index}/{step_count} ({step_id}) of {spec}"` | Commit message template; `{type}` is the step's `type` (default `feat`). |
 | `feature.pauseBetweenSteps` | `false` | Pause after each step's commit. |

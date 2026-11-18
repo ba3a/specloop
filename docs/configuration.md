@@ -39,7 +39,7 @@ Nested blocks have one row here and are described on the page of the feature tha
 | `largeSpecWarning` | `maxLines` 200, `maxWords` 2000, `maxPlanItems` 12 | Single-mode size warnings; see [Size warnings](size-warnings.md). |
 | `update` | `mode` `"notify"`, `intervalHours` 24, `timeoutSec` 20 | Update checks for the kit; see [Updates](updates.md). |
 | `quality` | `timeoutSec` 1800, `failFast` false, `legacy` `"baseline"`, no gates | Quality gates that hold a phase until they pass; see [Quality gates](quality-gates.md). |
-| `phases` | `plan` → `implement` → `review` | The single-mode phase graph; see [Phases](phases.md). |
+| `phases` | `plan` → `implement` → `review` | The single-mode phase graph; see [Phases](phases.md). Each phase may name its `subagent`; see [Choosing the subagent](delegation.md#choosing-the-subagent). |
 | `feature` | see [Feature mode](feature-mode.md#configuration-keys) | Feature-mode settings and phase graphs. |
 
 ## Personal configuration: config.local.json

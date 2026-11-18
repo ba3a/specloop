@@ -6,7 +6,7 @@ The single-mode workflow is a graph of phases in the `phases` key of the [config
 
 ## The phase graph
 
-Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of path prefixes (omit it to allow all edits), an optional `instructions` file, an optional `delegate` flag (see [Delegating a phase](delegation.md)) and an optional `check`.
+Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of path prefixes (omit it to allow all edits), an optional `instructions` file, an optional `delegate` flag and an optional `subagent` name (see [Delegating a phase](delegation.md) and [Choosing the subagent](delegation.md#choosing-the-subagent)) and an optional `check`.
 
 ## Check types
 

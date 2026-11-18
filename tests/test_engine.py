@@ -740,6 +740,65 @@ class EngineTest(unittest.TestCase):
         text = workflow.handle_context(self.root, "SessionStart")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Phase 'plan' is delegated", text)
 
+    # --- the per-phase subagent ----------------------------------------------------
+
+    def test_subagent_defaults_per_single_mode_phase(self):
+        config = workflow.load_config(self.root)
+        expected = {"plan": "specloop-planner", "implement": "specloop-implementer", "review": "specloop-reviewer"}
+        for phase, name in expected.items():
+            self.assertEqual(name, workflow.phase_subagent(config, {"mode": "single", "phase": phase}))
+
+    def test_old_config_without_subagent_keeps_defaults_and_delegates(self):
+        self.delegate("plan")
+        config = workflow.load_config(self.root)
+        self.assertEqual("specloop-planner", config["phases"]["plan"]["subagent"])
+        workflow.cmd_init(self.root, "spec.md")
+        out = workflow.cmd_go(self.root)
+        self.assertIn("exactly one subagent", out)
+        self.assertEqual("active", self.state()["status"])
+
+    def test_project_subagent_overrides_default(self):
+        self.set_config({"phases": {"implement": {"subagent": "my-coder", "check": None}}})
+        config = workflow.load_config(self.root)
+        self.assertEqual("my-coder", workflow.phase_subagent(config, {"mode": "single", "phase": "implement"}))
+        self.assertEqual([], workflow.validate_config(config))
+
+    def test_project_phase_without_subagent_is_general_purpose(self):
+        self.set_config({"phases": {"implement": {"next": "extra"}, "extra": {"next": "review", "check": None}}})
+        config = workflow.load_config(self.root)
+        self.assertEqual("general-purpose", workflow.phase_subagent(config, {"mode": "single", "phase": "extra"}))
+
+    def test_invalid_subagent_makes_go_refuse_without_changing_state(self):
+        for value in ("", "a b", "-x", 5):
+            self.set_config({"phases": {"implement": {"subagent": value, "check": None}}})
+            workflow.cmd_reset(self.root)
+            workflow.cmd_init(self.root, "spec.md")
+            path = os.path.join(self.base, "state.json")
+            with open(path, "rb") as f:
+                before = f.read()
+            out = workflow.cmd_go(self.root)
+            self.assertIn("phases.implement.subagent", out)
+            self.assertIn("config.json", out)
+            self.assertIn("config.local.json", out)
+            self.assertIn("/sl-go", out)
+            with open(path, "rb") as f:
+                self.assertEqual(before, f.read())
+
+    def test_validate_config_checks_only_subagent_and_never_raises(self):
+        config = workflow.load_config(self.root)
+        self.assertEqual([], workflow.validate_config(config))
+        config["phases"]["plan"]["allowEdits"] = 5
+        config["maxIterations"] = "x"
+        self.assertEqual([], workflow.validate_config(config))
+        for broken in (None, [], {"phases": 5}, {"feature": 5}, {"feature": {"stepPhases": [1]}},
+                       {"phases": {"x": 5}}):
+            self.assertIsInstance(workflow.validate_config(broken), list)
+        errors = workflow.validate_config({"feature": {"stepPhases": {"review": {"subagent": "a b"}},
+                                                       "planPhases": {"feature-plan": {"subagent": None}}}})
+        self.assertEqual(2, len(errors))
+        self.assertTrue(any("feature.stepPhases.review.subagent" in e for e in errors))
+        self.assertTrue(any("feature.planPhases.feature-plan.subagent" in e for e in errors))
+
 
 def valid_steps():
     return {
@@ -1316,6 +1375,22 @@ class FeatureModeTest(unittest.TestCase):
         self.assertEqual("deny", out["hookSpecificOutput"]["permissionDecision"])
         steps = os.path.join(self.base, "run", "steps.json")
         self.assertIsNone(workflow.handle_pretool(self.root, {"tool_name": "Write", "tool_input": {"file_path": steps}}))
+
+    def test_subagent_defaults_per_feature_phase(self):
+        config = workflow.load_config(self.root)
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        state = self.state()
+        self.assertEqual("specloop-planner", workflow.phase_subagent(config, state))
+        state["stepId"] = 1
+        for phase, name in (("implement", "specloop-implementer"), ("review", "specloop-reviewer"),
+                            ("feature-replan", "specloop-planner")):
+            state["phase"] = phase
+            self.assertEqual(name, workflow.phase_subagent(config, state))
+
+    def test_invalid_feature_subagent_makes_go_refuse(self):
+        self.set_config({"feature": {"stepPhases": {"review": {"subagent": "-x"}}}})
+        out = self.assertRefusedUnchanged("feature.stepPhases.review.subagent")
+        self.assertIn("/sl-go", out)
 
     def test_context_and_delegation_in_feature_plan(self):
         self.start()

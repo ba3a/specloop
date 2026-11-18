@@ -199,6 +199,15 @@ def in_replan(config, state):
     return in_step(state) and state.get("phase") == config["feature"].get("replanPhase", "feature-replan")
 
 
+DEFAULT_SUBAGENT = "general-purpose"  # Claude Code's built-in agent, for a project's own phases
+
+
+def phase_subagent(config, state):
+    """The subagent_type of the current phase: its `subagent`, or general-purpose when it has none."""
+    name = (phase_graph(config, state).get(state.get("phase")) or {}).get("subagent")
+    return name if isinstance(name, str) and name else DEFAULT_SUBAGENT
+
+
 def current_step(state):
     """Return (index, step) of the active step in approvedSteps, or (None, None)."""
     for index, step in enumerate((state.get("approvedSteps") or {}).get("steps", [])):
@@ -1580,6 +1589,43 @@ def validate_quality(root, config):
         return _validate_quality(root, config)
     except Exception as e:  # validation must never break a hook or a command
         return ["quality could not be validated: %s" % (str(e) or e.__class__.__name__)]
+
+
+def validate_config(config):
+    """Validate the config keys outside `quality` that /sl-go checks: each phase's `subagent`. Return a list of
+    error strings (empty means valid); never raises."""
+    try:
+        return _validate_config(config)
+    except Exception as e:  # validation must never break a hook or a command
+        return ["the configuration could not be validated: %s" % (str(e) or e.__class__.__name__)]
+
+
+def _phase_graphs(config):
+    """(where, graph) for each phase graph in the config that is an object."""
+    feature = config.get("feature") if isinstance(config.get("feature"), dict) else {}
+    graphs = (("phases", config.get("phases")), ("feature.planPhases", feature.get("planPhases")),
+              ("feature.stepPhases", feature.get("stepPhases")))
+    return [(where, graph) for where, graph in graphs if isinstance(graph, dict)]
+
+
+def _validate_config(config):
+    if not isinstance(config, dict):
+        return []
+    errors = []
+    for where, graph in _phase_graphs(config):
+        for name, phase in graph.items():
+            if not isinstance(phase, dict) or "subagent" not in phase:
+                continue
+            value = phase["subagent"]
+            if not (isinstance(value, str) and GATE_NAME.fullmatch(value)):
+                errors.append("%s.%s.subagent is %s; it must be an agent name matching "
+                              "[A-Za-z0-9][A-Za-z0-9_-]*" % (where, name, json.dumps(value)))
+    return errors
+
+
+def config_errors_message(config, errors):
+    return ("Not started: the configuration is invalid:\n%s\n\nFix it in %s (or %s), then run %s again." % (
+        "\n".join("- " + e for e in errors), _rel("config.json"), _rel("config.local.json"), cmd_name(config, "go")))
 
 
 def unreadable_quality(config):
@@ -3573,6 +3619,9 @@ def cmd_go(root):
     errors = validate_quality(root, config)
     if errors:
         return quality_errors_message(config, errors)
+    errors = validate_config(config)
+    if errors:
+        return config_errors_message(config, errors)
     plan, replan = None, None
     if is_feature(state):
         if state.get("branch"):

@@ -22,11 +22,13 @@
     "planPhases": {
       "feature-plan": {
         "delegate": true,
+        "subagent": "specloop-planner",
         "allowEdits": [".claude/specloop/run/"],
         "check": { "type": "steps", "path": ".claude/specloop/run/steps.json", "requireAllPending": true }
       },
       "feature-replan": {
         "delegate": true,
+        "subagent": "specloop-planner",
         "allowEdits": [".claude/specloop/run/"],
         "check": { "type": "steps", "path": ".claude/specloop/run/steps.json", "requireAllPending": false }
       }
@@ -38,11 +40,13 @@
     "stepPhases": {
       "implement": {
         "delegate": true,
+        "subagent": "specloop-implementer",
         "next": "review",
         "check": null
       },
       "review": {
         "delegate": true,
+        "subagent": "specloop-reviewer",
         "next": "commit",
         "allowEdits": [".claude/specloop/run/"],
         "check": {
@@ -63,15 +67,18 @@
   },
   "phases": {
     "plan": {
+      "subagent": "specloop-planner",
       "next": "implement",
       "allowEdits": [".claude/specloop/run/"],
       "check": { "type": "file", "path": ".claude/specloop/run/plan.md" }
     },
     "implement": {
+      "subagent": "specloop-implementer",
       "next": "review",
       "check": null
     },
     "review": {
+      "subagent": "specloop-reviewer",
       "next": "done",
       "allowEdits": [".claude/specloop/run/"],
       "check": {
