@@ -957,7 +957,10 @@ def phase_prompt(root, config, state):
         return phase_instructions(root, config, state)
     brief = phase_brief(root, config, state)
     path = _kit_file(root, "delegate")
-    return render_phase(_read_text(path), config, state).replace("{brief}", brief) if path else brief
+    if not path:
+        return brief
+    text = render_phase(_read_text(path), config, state).replace("{subagent}", phase_subagent(config, state))
+    return text.replace("{brief}", brief)
 
 
 def failure_path(root):
@@ -3465,8 +3468,9 @@ def handle_pretool(root, hook_input):
         # Claude Code sets agent_id in hook input only for tool calls made inside a subagent.
         if (config["feature"].get("enforceDelegation") and is_delegated(config, state)
                 and not hook_input.get("agent_id") and not in_run):
-            return deny("phase '%s' is delegated: start one subagent with the phase brief and let it make this "
-                        "edit. The main session may only edit %s/." % (phase, _rel("run")))
+            return deny("phase '%s' is delegated: start one subagent (subagent_type %s) with the phase "
+                        "brief and let it make this edit. The main session may only edit %s/." % (
+                            phase, phase_subagent(config, state), _rel("run")))
 
     if tool == "Bash":
         command = tool_input.get("command", "")
@@ -3560,9 +3564,10 @@ def workflow_context(root, event, state, hook_input):
                     "hookSpecificOutput": {"hookEventName": event, "additionalContext": notice}}
         text = header(state)
         if is_delegated(config, state):
-            text += ("\n[specloop] Phase '%s' is delegated: start one subagent with the phase brief, relay a short "
-                     "summary, and finish your turn; do not do the phase's work yourself. If the user's message is "
-                     "about something else, answer that first and say the workflow is waiting." % state["phase"])
+            text += ("\n[specloop] Phase '%s' is delegated: start one subagent (subagent_type %s) with the phase brief, "
+                     "relay a short summary, and finish your turn; do not do the phase's work yourself. If the "
+                     "user's message is about something else, answer that first and say the workflow is waiting." % (
+                         state["phase"], phase_subagent(config, state)))
         if event == "SessionStart" or state.get("iter", 0) == 0:
             text += "\n\n" + phase_prompt(root, config, state)
         elif state.get("lastFailure"):

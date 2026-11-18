@@ -692,6 +692,43 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("exactly one subagent", out)
         self.assertIn("## Phase: plan", out)
 
+    def test_preamble_names_subagent_type_and_brief_exactly(self):
+        self.delegate("plan")
+        workflow.cmd_init(self.root, "spec.md")
+        config = workflow.load_config(self.root)
+        state = self.state()
+        out = workflow.phase_prompt(self.root, config, state)
+        self.assertIn("`subagent_type` `specloop-planner`", out)
+        self.assertNotIn("{subagent}", out)
+        self.assertIn("Never start a second one", out)
+        brief = workflow.phase_brief(self.root, config, state)
+        between = out.split("\n--- BEGIN PHASE BRIEF ---\n")[1].split("\n--- END PHASE BRIEF ---")[0]
+        self.assertTrue(between.startswith("Run long commands in the foreground"))
+        self.assertTrue(between.endswith("\n\n" + brief))
+        self.set_config({"phases": {"plan": {"delegate": True, "subagent": "my-planner"}}})
+        config = workflow.load_config(self.root)
+        self.assertIn("`subagent_type` `my-planner`", workflow.phase_prompt(self.root, config, state))
+
+    def test_delegate_override_without_subagent_renders_brief(self):
+        self.write_override("delegate", "CUSTOM\n{brief}")
+        self.delegate("plan")
+        workflow.cmd_init(self.root, "spec.md")
+        config = workflow.load_config(self.root)
+        state = self.state()
+        self.assertEqual("CUSTOM\n" + workflow.phase_brief(self.root, config, state),
+                         workflow.phase_prompt(self.root, config, state))
+
+    def test_context_line_and_deny_reason_name_subagent_type(self):
+        self.set_config({"feature": {"enforceDelegation": True},
+                         "phases": {"implement": {"delegate": True, "check": None}}})
+        self.start()
+        workflow.cmd_advance(self.root)
+        text = workflow.handle_context(self.root, "UserPromptSubmit")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("subagent_type specloop-implementer", text)
+        out = workflow.handle_pretool(self.root, {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(self.root, "src", "Main.java")}})
+        self.assertIn("subagent_type specloop-implementer", out["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_last_failure_written_on_failed_command_with_full_output(self):
         self.set_config({"maxOutputChars": 50, "phases": {"implement": {"check": {
             "type": "command", "command": "echo FIRST-$((2*3)); printf 'x%.0s' $(seq 1 200); echo; exit 2"}}}})
