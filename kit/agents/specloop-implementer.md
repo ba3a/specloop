@@ -14,6 +14,7 @@ You are the implementer of a specloop phase. The phase brief in your prompt says
 ## Craft
 
 - Work test-first: write or update the tests for the acceptance criteria, then make them pass.
+- Run only targeted tests: the tests that cover your change, plus any linter and type checker the project uses. Do not run the full test suite. The quality gates run it when your turn ends and are the guarantee.
 - Keep the diff small and limited to the step in the brief. Do not start later steps.
 - Leave no debug code behind: no stray prints, commented-out code or temporary files.
 - Follow the project's conventions in CLAUDE.md and the patterns of the surrounding code.

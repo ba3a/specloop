@@ -21,10 +21,12 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 ### Changed
 
+- The shipped implement instructions (`implement.md`, `step-implement.md`) and `specloop-implementer` tell the agent to run only targeted tests, plus the linter and type checker, and to leave the full suite to the quality gates, which are the guarantee. This avoids running the suite twice. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent) and [Running gates](docs/quality-gates.md#running-gates).
 - The documentation moved from one long `README.md` into focused pages under [`docs/`](docs/README.md). The README is now a short introduction. Old README anchors such as `README.md#feature-mode` no longer exist; use the page for the topic, for example [Feature mode](docs/feature-mode.md). Behaviour is unchanged.
 
 ### Fixed
 
+- Tests no longer inherit `CLAUDE_PROJECT_DIR`. Under the quality gates, a hook subprocess in `tests/test_multi_chat.py` paused the real run instead of the test project.
 - A `verdict` check no longer approves a review that only mentions `VERDICT: APPROVE`, for example inside a sentence, a code block or a quotation, while requesting changes. The check now reads whole verdict lines and the last one wins; a marker in a fenced or indented code block or a blockquote does not count. `reject` is optional. See [Verdict lines](docs/phases.md#verdict-lines).
 
 ## [0.3.0] - 2026-10-31

@@ -49,6 +49,7 @@ On a Stop, after the phase's `check` passes, the engine runs every gate whose `p
 
 - An exit code listed in `passExitCodes` (by default only `0`) is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, except 126 and 127, which make it [broken](#broken-gates). A `metric` can still fail a gate that passed by exit code; see [Pass criteria](#pass-criteria).
 - With `failFast: false` every gate runs, so all failures are reported at once. With `failFast: true` the first failing `block` gate ends the run: later gates do not run and keep their previous results. A failing `warn` gate never ends the run.
+- The gates are the guarantee that the project is sound. The shipped implement phases and `specloop-implementer` tell the agent to run only targeted tests and to leave the full suite to the gates, so the suite does not run twice.
 - The phase passes only if every `block` gate passes. Failing `warn` gates are named, with their log paths, in the message that announces the next phase.
 
 ## Feature mode

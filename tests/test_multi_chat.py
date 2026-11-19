@@ -43,6 +43,7 @@ class ProjectTest(unittest.TestCase):
 
     def setUp(self):
         self.root = tempfile.mkdtemp()
+        self.isolate_env()
         self.ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
         os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self.root)
         self.base = os.path.join(self.root, ".claude", "specloop")
@@ -50,7 +51,19 @@ class ProjectTest(unittest.TestCase):
         self.write("spec.md", "# Spec\nDo the thing.\n")
         self.set_config({})
 
+    def isolate_env(self):
+        """Point CLAUDE_PROJECT_DIR at this project, so subprocesses never reach the real one."""
+        self.saved_project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+
+    def restore_env(self):
+        if self.saved_project_dir is None:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        else:
+            os.environ["CLAUDE_PROJECT_DIR"] = self.saved_project_dir
+
     def tearDown(self):
+        self.restore_env()
         if self.ceiling is None:
             os.environ.pop("GIT_CEILING_DIRECTORIES", None)
         else:
@@ -127,14 +140,12 @@ class ProjectTest(unittest.TestCase):
 
     def main(self, *argv, stdin=""):
         old_stdin, sys.stdin = sys.stdin, io.StringIO(stdin)
-        os.environ["CLAUDE_PROJECT_DIR"] = self.root
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out):
                 self.assertEqual(0, workflow.main(list(argv)))
         finally:
             sys.stdin = old_stdin
-            del os.environ["CLAUDE_PROJECT_DIR"]
         return out.getvalue()
 
     def stalled(self):
@@ -844,6 +855,21 @@ class FeatureStopTest(ProjectTest):
         self.write("a.py", "a = 1\n")
         workflow.handle_stop(self.root, {})
         self.assertEqual("review", self.state()["phase"])
+
+    def test_a_leaked_project_dir_does_not_reach_the_hook_subprocess(self):
+        other = tempfile.mkdtemp()
+        self.addCleanup(force_rmtree, other)
+        os.environ["CLAUDE_PROJECT_DIR"] = other  # as set by the Stop hook of a real run
+        saved = self.saved_project_dir
+        self.isolate_env()
+        self.saved_project_dir = saved
+        self.start_feature()
+        self.to_review()
+        self.pre_commit("'%s' '%s' pause" % (sys.executable.replace("\\", "/"), ENGINE.replace("\\", "/")))
+        self.write_attempt("review.md", "VERDICT: APPROVE")
+        workflow.handle_stop(self.root, {})
+        self.assertEqual("paused", self.state()["status"])
+        self.assertFalse(os.path.exists(os.path.join(other, ".claude")))
 
     def test_a_pause_during_a_commit_survives(self):
         self.start_feature()

@@ -34,6 +34,8 @@ A phase you add yourself has no default and uses `general-purpose`. A `config.js
 
 The name must match `^[A-Za-z0-9][A-Za-z0-9_-]*$`. `/sl-go` refuses to start or resume while any phase in `phases`, `feature.planPhases` or `feature.stepPhases` has another value, lists the errors, and asks you to fix `config.json` or `config.local.json`.
 
+The shipped implement instructions and `specloop-implementer` tell the agent to run only targeted tests (the tests that cover its change, plus the linter and type checker) and not the full suite. The [quality gates](quality-gates.md#running-gates) run the full suite when the turn ends and are the guarantee, so the suite does not run twice.
+
 ## Gates while a subagent runs
 
 Gates still run only when the main session stops; specloop registers no `SubagentStop` hook. A phase is not checked while its subagent runs: when Stop's `background_tasks` lists a `subagent`, `workflow` or `teammate`, in any phase, the Stop hook does nothing and costs no iteration. The subagent's completion wakes the chat, and the next Stop runs the gate. Shell tasks and monitors do not count, because a dev server must not hold a phase open forever. On a Claude Code version that does not send `background_tasks`, the check runs as usual.
