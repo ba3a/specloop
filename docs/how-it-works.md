@@ -68,4 +68,5 @@ Files in `<project>/.claude/agents/`:
 - [Review attempts](review-attempts.md): how a review is tied to one attempt.
 - [Configuration](configuration.md): how the configuration files are layered.
 - [Commands](commands.md): the slash commands that drive the workflow.
+- [Native Claude Code features](native-features.md): why Claude Code's own features do not replace the engine.
 - [Quality gates](quality-gates.md): the gates, their results, presets and the state keys above.

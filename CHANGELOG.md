@@ -6,6 +6,7 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 ### Added
 
+- Documentation: [Native Claude Code features](docs/native-features.md) lists `/goal`, workflows, agent teams, deny rules, worktrees, plugins and agent definitions with what each does, what specloop uses it for and why it does not replace the engine. It states the check date and the Claude Code version.
 - `feature.branchMode` (`"create"` by default, or `"current"`): with `"current"` a feature run records the checked-out branch and creates none, so it can run in a linked worktree (`claude -w`) on that worktree's branch. The refusals for a detached `HEAD` and a dirty tree stay; another value makes `/sl-go` refuse. See [Branch](docs/feature-mode.md#branch) and [Git worktrees](docs/installation.md#git-worktrees).
 - A passing gate is not rerun when nothing it depends on changed. The key is the gate name, its definition and command, and a content hash of the working tree (tracked changes, untracked files, HEAD), stored with `qualityResults`. Any change reruns it; a failed, warned, broken or missing result always runs. See [Reusing a pass](docs/quality-gates.md#reusing-a-pass).
 - A logo. The README shows it, and the logo, favicons and social preview image are in [`assets/brand/`](assets/brand/README.md).

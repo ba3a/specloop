@@ -499,6 +499,25 @@ class DocsTest(unittest.TestCase):
         self.assertIn('"gates"', example)
         self.assertNotIn("&&", example)
 
+    def test_native_features_page_has_a_row_per_feature_and_is_linked(self):
+        page = read(ROOT, "docs", "native-features.md")
+        self.assertTrue(page.startswith("[Documentation](README.md) › Native Claude Code features"))
+        self.assertIn("## See also", page)
+        for feature in ("`/goal`", "Workflows", "Agent teams", "Deny rules", "Worktrees", "Plugins",
+                        "Agent definitions"):
+            rows = [ln for ln in page.splitlines() if ln.startswith("| " + feature)]
+            self.assertEqual(1, len(rows), feature)
+            self.assertEqual(4, rows[0].count("|") - 1, feature)
+        self.assertRegex(page, r"Checked on \d{4}-\d{2}-\d{2}")
+        self.assertIn("Claude Code version", page)
+        index = read(ROOT, "docs", "README.md")
+        self.assertEqual(1, index.count("(native-features.md)"))
+        concepts = index.split("## Concepts", 1)[1].split("\n## ", 1)[0]
+        self.assertIn("(native-features.md)", concepts)
+        for name in ("delegation", "limitations", "how-it-works"):
+            self.assertIn("(native-features.md", read(ROOT, "docs", name + ".md"), name)
+            self.assertIn("(%s.md" % name, page, name)
+
     def test_the_changelog_has_one_added_section_for_unreleased(self):
         text = read(ROOT, "CHANGELOG.md")
         unreleased = text.split("## [Unreleased]", 1)[1].split("\n## [", 1)[0]

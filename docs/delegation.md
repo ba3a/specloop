@@ -57,4 +57,5 @@ Delegation is an instruction to the main session, not a guarantee; see [Hacks an
 - [Feature mode](feature-mode.md): the default user of delegated phases.
 - [Phases](phases.md): the `delegate` and `subagent` fields in the phase graph and the instruction placeholders.
 - [Hacks and limitations](limitations.md): what delegation cannot guarantee.
+- [Native Claude Code features](native-features.md): agent definitions, `/goal`, workflows and the limits that keep the engine.
 - [Guard rails](guard-rails.md): other PreToolUse rules.
