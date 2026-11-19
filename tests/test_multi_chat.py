@@ -1324,6 +1324,65 @@ class InFlightTest(ProjectTest):
         self.assertIn("do not end your turn", brief)
 
 
+class MissingAgentNoteTest(ProjectTest):
+
+    def setUp(self):
+        super().setUp()
+        self.home = tempfile.mkdtemp()
+        self.saved_home = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = os.environ["USERPROFILE"] = self.home
+
+    def tearDown(self):
+        for key, value in self.saved_home.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        force_rmtree(self.home)
+        super().tearDown()
+
+    def delegate(self, subagent="my-agent", phase="plan"):
+        self.set_config({"phases": {phase: {"delegate": True, "subagent": subagent}}})
+
+    def test_a_missing_agent_file_is_named_and_the_run_starts(self):
+        self.delegate()
+        out = self.start()
+        self.assertIn("[specloop] Note:", out)
+        self.assertIn("my-agent (phase 'plan')", out)
+        self.assertIn("Agent tool will fail", out)
+        self.assertIn("installer runs again", out)
+        self.assertEqual("active", self.state()["status"])
+        self.assertIn("BEGIN PHASE BRIEF", out)
+
+    def test_a_project_agent_file_silences_it(self):
+        self.delegate()
+        self.write(os.path.join(".claude", "agents", "my-agent.md"), "x")
+        self.assertNotIn("Note:", self.start())
+
+    def test_a_home_agent_file_silences_it(self):
+        self.delegate()
+        os.makedirs(os.path.join(self.home, ".claude", "agents"))
+        with open(os.path.join(self.home, ".claude", "agents", "my-agent.md"), "w") as f:
+            f.write("x")
+        self.assertNotIn("Note:", self.start())
+
+    def test_a_phase_that_is_not_delegated_never_warns(self):
+        self.set_config({"phases": {"plan": {"subagent": "my-agent"}}})
+        self.assertNotIn("Note:", self.start())
+
+    def test_general_purpose_never_warns(self):
+        self.delegate("general-purpose")
+        self.assertNotIn("Note:", self.start())
+
+    def test_feature_mode_names_the_shipped_agents(self):
+        self.init_git()
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        out = workflow.cmd_go(self.root)
+        self.assertIn("specloop-planner", out)
+        self.assertIn("specloop-implementer", out)
+        self.assertIn("specloop-reviewer", out)
+
+
 class StaleOverrideTest(ProjectTest):
 
     def override(self, name, text):

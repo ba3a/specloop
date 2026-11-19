@@ -20,6 +20,8 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 - A phase may set `subagent`, the agent that runs it when delegated. The shipped phases default to `specloop-planner` (`plan`, `feature-plan`, `feature-replan`), `specloop-implementer` (`implement`) and `specloop-reviewer` (`review`); a phase you add uses `general-purpose`. `/sl-go` refuses a name that does not match `^[A-Za-z0-9][A-Za-z0-9_-]*$`. Existing `config.json` files keep working unchanged. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent).
 - The orchestration preamble names the phase's `subagent_type`: `delegate.md` has a `{subagent}` placeholder, and the delegated-phase context line and the `enforceDelegation` denial name it too. An override of `delegate.md` without `{subagent}` keeps working. See [The orchestrator and the phase brief](docs/delegation.md#the-orchestrator-and-the-phase-brief).
 
+- `/sl-go` appends a `[specloop] Note:` when a delegated phase names a subagent that has no file in `.claude/agents/` or `~/.claude/agents/`: the Agent tool fails for it until the installer runs again. The run still starts. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent).
+
 ### Changed
 
 - The shipped implement instructions (`implement.md`, `step-implement.md`) and `specloop-implementer` tell the agent to run only targeted tests, plus the linter and type checker, and to leave the full suite to the quality gates, which are the guarantee. This avoids running the suite twice. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent) and [Running gates](docs/quality-gates.md#running-gates).

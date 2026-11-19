@@ -34,6 +34,8 @@ A phase you add yourself has no default and uses `general-purpose`. A `config.js
 
 The name must match `^[A-Za-z0-9][A-Za-z0-9_-]*$`. `/sl-go` refuses to start or resume while any phase in `phases`, `feature.planPhases` or `feature.stepPhases` has another value, lists the errors, and asks you to fix `config.json` or `config.local.json`.
 
+When `/sl-go` starts or resumes a run and a delegated phase of its graphs names a subagent with no file in `.claude/agents/` of the project or in `~/.claude/agents/`, it appends a `[specloop] Note:` naming each missing agent and its phase. The note says the Agent tool will fail for that agent until the installer runs again. It does not stop the run. `general-purpose` is built in and never named, and a phase that is not delegated is not checked.
+
 The shipped implement instructions and `specloop-implementer` tell the agent to run only targeted tests (the tests that cover its change, plus the linter and type checker) and not the full suite. The [quality gates](quality-gates.md#running-gates) run the full suite when the turn ends and are the guarantee, so the suite does not run twice.
 
 ## Gates while a subagent runs

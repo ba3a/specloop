@@ -1307,6 +1307,37 @@ def stale_override_warning(root, config, state):
     return "\n".join(lines) or None
 
 
+def missing_agent_note(root, config, state):
+    """Note naming each subagent of a delegated phase of this run whose file is in neither .claude/agents/ of the
+    project nor of the home directory. general-purpose is built in. Return the note, else None. Never raises."""
+    try:
+        if is_feature(state):
+            graphs = [config["feature"]["planPhases"], config["feature"]["stepPhases"]]
+        else:
+            graphs = [config["phases"]]
+        home = os.path.expanduser("~")
+        missing: dict = {}
+        for graph in graphs:
+            for phase, phase_config in graph.items():
+                if not isinstance(phase_config, dict) or not phase_config.get("delegate"):
+                    continue
+                name = phase_config.get("subagent")
+                if not isinstance(name, str) or not name or name == DEFAULT_SUBAGENT:
+                    continue
+                if any(os.path.isfile(os.path.join(base, ".claude", "agents", name + ".md")) for base in (root, home)):
+                    continue
+                missing.setdefault(name, [])
+                if phase not in missing[name]:
+                    missing[name].append(phase)
+        if not missing:
+            return None
+        parts = ["%s (phase %s)" % (name, ", ".join("'%s'" % p for p in phases)) for name, phases in missing.items()]
+        return ("[specloop] Note: no agent file for %s in .claude/agents/ or ~/.claude/agents/. The Agent tool will "
+                "fail for %s until the installer runs again." % ("; ".join(parts), "it" if len(parts) == 1 else "them"))
+    except Exception:
+        return None
+
+
 def count_plan_items(root):
     try:
         with open(os.path.join(run_dir(root), "plan.md"), encoding="utf-8", errors="replace") as f:
@@ -3738,8 +3769,10 @@ def cmd_go(root):
             current["qualityFingerprints"] = fingerprints
         return resume(root, config, current, plan, replan)
     out = update_state(root, apply)
-    warning = stale_override_warning(root, config, state)
-    return out + "\n\n" + warning if warning else out
+    for note in (stale_override_warning(root, config, state), missing_agent_note(root, config, state)):
+        if note:
+            out += "\n\n" + note
+    return out
 
 
 def resume(root, config, state, plan, replan):
