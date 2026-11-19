@@ -164,7 +164,7 @@ new one through a link sent by email.
 - **🔒 Never pushes.** `git push` and PR creation are blocked until the work is done. Opening the PR stays your call.
 - **🧾 One commit per step.** Feature mode leaves a clean branch: one reviewed, tested commit per planned step. Easy to read, easy to revert.
 - **🛑 Can't run away.** After 15 blocked stops the run stalls and waits for you. A crash in specloop never breaks your session.
-- **📦 Tiny, portable, no extra bill.** Hooks and slash commands in your normal Claude Code session: your subscription, no API keys, no orchestrator. Pure Python standard library, 3.8+, on macOS, Linux and Windows.
+- **📦 Tiny, portable, no extra bill.** Hooks and slash commands in your normal Claude Code session: your subscription, no API keys, no external orchestrator. Pure Python standard library, 3.8+, on macOS, Linux and Windows.
 
 <div class="section-marker" id="dogfood"></div>
 
