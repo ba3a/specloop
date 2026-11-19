@@ -157,7 +157,7 @@ new one through a link sent by email.
 ## Guard rails, so "unattended" doesn't mean "unsupervised"
 
 - **🚧 Hard gates.** Phases complete on exit codes and verdicts, not on Claude's opinion of its own work.
-- **🔍 Independent review.** Review runs in a fresh subagent that never saw the implementation chat. It reads the diff, not the excuses.
+- **🔍 Independent review.** Review runs in a fresh subagent (`specloop-reviewer`, installed with the kit) that never saw the implementation chat. It reads the diff, not the excuses.
 - **🧪 Quality gates.** Your linter, type checker, tests and coverage as named gates, with optional thresholds such as "coverage ≥ 80". `/sl-quality init` sets them up from presets for Kotlin, Java, Python, Node, Go and Rust.
 - **🛡️ No gaming the gates.** Tool configs are fingerprinted, and new `# noqa` or `@Suppress` lines fail the gate. Only you can accept an exception, with `/sl-quality accept`.
 - **📉 Legacy code welcome.** A ratchet gate passes when a number is no worse than before the run. Old warnings don't block new work.
