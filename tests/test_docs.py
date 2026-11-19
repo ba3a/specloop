@@ -426,6 +426,14 @@ class DocsTest(unittest.TestCase):
                        "Several chats in one project", "git worktree", "waits on its own background work"):
             self.assertIn(needle, docs)
 
+    def test_orchestrator_route_is_documented_and_linked_from_limitations(self):
+        delegation = read(ROOT, "docs", "delegation.md")
+        for needle in ("specloop-orchestrator", "enforceDelegation", "claude --agent", "experimental"):
+            self.assertIn(needle, delegation)
+        limitations = read(ROOT, "docs", "limitations.md")
+        self.assertIn("delegation.md#the-orchestrator-agent-route", limitations)
+        self.assertIn("native-features.md", limitations)
+
     def test_guide_describes_installed_update_files(self):
         guide = read(ROOT, "CLAUDE.md")
         for needle in ("config.local.json", "update.json", "update.lock", "manifest.json", "source",

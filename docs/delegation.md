@@ -44,9 +44,33 @@ Gates still run only when the main session stops; specloop registers no `Subagen
 
 There is one gap. A subagent that ends its turn and waits on its own background work is not listed as a `subagent`: Stop sees only its shell, as `type: shell`, until the work finishes and the subagent resumes. The check therefore runs while that subagent is unfinished, as it would on a version with no `background_tasks`. A failed check costs an iteration, and a passing check can advance the phase before the subagent reports. A subagent stays listed for as long as it keeps working, so the shipped preamble's brief tells it to run long commands in the foreground and not to end its turn while it waits on background work. An override of `delegate.md` should keep that line.
 
+## The orchestrator agent route
+
+Status: **experimental**.
+
+Start the session as the orchestrator:
+
+```bash
+claude --agent specloop-orchestrator
+```
+
+The main thread then has only `Agent`, `Read`, `Grep` and `Glob`. It cannot edit files, so the tool list enforces delegation: the main thread has no way to do the phase itself. The cost is that the main thread cannot run Bash. Work that needs a shell must go to a subagent.
+
+The route is experimental because the by-hand checks of the [spec](../specs/native-claude.md) were not reported to this run. These must be verified:
+
+- hooks still fire in a session started with `--agent`;
+- `/sl-go` works in that session;
+- `agent_id` is absent from hook input for the main thread and present for subagents;
+- `subagent_type` resolves to the specloop agents after a restart;
+- the SessionStart hook runs after `/compact`.
+
+Once these pass, this page will name the tested Claude Code version.
+
+Use `feature.enforceDelegation` (next section) for sessions that are not started with `--agent`.
+
 ## Enforcing delegation
 
-Delegation is an instruction to the main session, not a guarantee; see [Hacks and limitations](limitations.md#delegation-is-instruction-only-and-not-guaranteed) for how to notice and recover. `feature.enforceDelegation` makes the hook deny the main session's own edits in delegated phases; what it can and cannot do is in [its limitations](limitations.md#featureenforcedelegation-can-block-not-force).
+Delegation is an instruction to the main session, not a guarantee; see [Hacks and limitations](limitations.md#delegation-is-instruction-only-and-not-guaranteed) for how to notice and recover. For a session not started with `--agent`, `feature.enforceDelegation` makes the hook deny the main session's own edits in delegated phases; what it can and cannot do is in [its limitations](limitations.md#featureenforcedelegation-can-block-not-force).
 
 | Key | Default | Meaning |
 |-----|---------|---------|

@@ -24,6 +24,8 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 - `/sl-go` appends a `[specloop] Note:` when a delegated phase names a subagent that has no file in `.claude/agents/` or `~/.claude/agents/`: the Agent tool fails for it until the installer runs again. The run still starts. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent).
 
+- Documentation: `claude --agent specloop-orchestrator` as an experimental route to enforced delegation. The main thread gets only `Agent`, `Read`, `Grep` and `Glob`, so it cannot edit files or run Bash. The by-hand checks are not yet reported. `feature.enforceDelegation` stays for sessions without `--agent`. See [The orchestrator agent route](docs/delegation.md#the-orchestrator-agent-route) and [Hacks and limitations](docs/limitations.md#delegation-is-instruction-only-and-not-guaranteed).
+
 ### Changed
 
 - The craft rules of the implementer and the reviewer (work test-first, no leftover debug code, follow the project's conventions, look for correctness bugs and edge cases) moved from the shipped phase files into the bodies of `specloop-implementer` and `specloop-reviewer`. Non-delegated phases no longer carry these rules. The phase files keep the verdict lines, `replan.md`, `last-failure.md`, acceptance coverage, step scope and the quality-gate review items. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent).
