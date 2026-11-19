@@ -2629,6 +2629,76 @@ def measure_baselines(root, config, state, outcome):
     return dict(outcome, qualityBaseline=measured) if measured else outcome
 
 
+_UNSET = object()
+TREE_KEY_EXCLUDES = ("**/.claude/specloop/run/**", "**/.claude/specloop/state.*", "**/.claude/specloop/update.*")
+
+
+def tree_key(root, config):
+    """A hash of the working tree: HEAD plus the content of every tracked change and every untracked file that
+    git does not ignore, except specloop's own run state. None when it cannot be computed (no git repository, a
+    git failure): a gate then always runs. Never raises, and never touches the real index."""
+    timeout = config.get("feature", {}).get("gitTimeoutSec", 60)
+
+    def run(args, env=None):
+        proc = subprocess.run(["git"] + args, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=timeout)
+        return proc.stdout.decode("utf-8", errors="replace").strip() if proc.returncode == 0 else None
+
+    fd, temp = tempfile.mkstemp(prefix="specloop-index-")
+    os.close(fd)
+    try:
+        os.remove(temp)
+        head = run(["rev-parse", "--verify", "-q", "HEAD"]) or "no-commit"
+        index = run(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+        if not index:
+            return None
+        if os.path.isfile(index):
+            shutil.copyfile(index, temp)
+        env = dict(os.environ, GIT_INDEX_FILE=temp)
+        excludes = [":(exclude,glob)%s" % pattern for pattern in TREE_KEY_EXCLUDES]
+        if run(["add", "-A", "--", ":/"] + excludes, env) is None:
+            return None
+        tree = run(["write-tree"], env)
+        if not tree:
+            return None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+    return hashlib.sha256(("%s\n%s" % (head, tree)).encode("utf-8")).hexdigest()
+
+
+def gate_key(name, gate, command, tree):
+    """The key a passing result is reused under: gate name, gate definition, the command that runs and the
+    content hash of the working tree. None when the tree has no hash."""
+    if tree is None:
+        return None
+    definition = json.dumps([name, gate, command or gate.get("command")], sort_keys=True, default=str)
+    return hashlib.sha256((definition + "\n" + tree).encode("utf-8")).hexdigest()
+
+
+def reused_gate_run(root, state, name, key):
+    """(record, output) of a stored pass for this key, or None. A failed, warned, broken or missing result, or a
+    different key, never matches."""
+    results = state.get("qualityResults")
+    prior = results.get(name) if isinstance(results, dict) else None
+    if key is None or not isinstance(prior, dict) or prior.get("result") != "pass" or prior.get("key") != key:
+        return None
+    record = gate_record(state, name, "pass", prior.get("exitCode"), 0, key=key, reused=True)
+    for extra in ("metric", "baseline"):
+        if extra in prior:
+            record[extra] = prior[extra]
+    try:
+        with open(gate_log_path(root, name), encoding="utf-8", errors="replace") as f:
+            output = f.read()
+    except OSError:
+        output = ""
+    return record, output
+
+
 def run_quality_gates(root, config, state, outcome):
     """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record.
 
@@ -2651,6 +2721,7 @@ def run_quality_gates(root, config, state, outcome):
     budget = quality_budget(root, config)
     started = _clock()
     baselines = baseline_values(state)
+    tree: Any = _UNSET
     if quality_block_changed(config, state):
         runs = block_changed_runs(root, config, state, selected)
         details, full = gate_failure(config, runs)
@@ -2670,8 +2741,17 @@ def run_quality_gates(root, config, state, outcome):
         if record:
             write_gate_log(root, name, output.encode("utf-8"))
         else:
-            record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
-                                              command, _metric_number(baselines.get(name)))
+            if tree is _UNSET:
+                tree = tree_key(root, config)
+            key = gate_key(name, gate, command, tree)
+            reused = reused_gate_run(root, state, name, key)
+            if reused:
+                record, output = reused
+            else:
+                record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
+                                                  command, _metric_number(baselines.get(name)))
+                if key is not None:
+                    record["key"] = key
         runs.append((record, output))
         if record["result"] == "broken":
             return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},

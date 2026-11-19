@@ -77,6 +77,12 @@ After each gate run, `.claude/specloop/run/quality.md` is rewritten from that ru
 
 In a feature-mode run, `run/quality.md` and `run/quality/` move to `run/steps/<id>/` when the step finishes, with the step's review files; the next step starts without them. In single mode they stay in `run/`.
 
+### Reusing a pass
+
+A gate that passed is not run again while nothing it depends on changed. Each result stores a `key`: a hash of the gate name, its definition, the command that ran (after placeholders are expanded) and a content hash of the working tree. The tree hash covers HEAD, every tracked change and every untracked file that git does not ignore, and leaves out specloop's own state under `.claude/specloop/run/`. A reused result is marked `reused: true`, keeps its `metric` and `baseline`, and shows the log of the run that made it.
+
+Any change to a file, to the gate definition or to HEAD gives a new key, so the gate runs. A `fail`, `warn`, `broken` or `skipped` result, a missing result and a project that is not a git repository never reuse: the gate always runs. A gate that writes files into the tree changes the key itself, so it runs again on the next stop.
+
 ## Pass criteria
 
 By default the exit code decides, so a tool's own threshold works unchanged, for example detekt's `maxIssues`. Two keys refine that:
