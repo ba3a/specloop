@@ -15,8 +15,6 @@ The step's changes are everything since the previous step's commit: `git diff HE
 Check that:
 - every acceptance criterion of this step is implemented and covered by a test;
 - the change stays within this step and does not start later steps from `{steps_file}`;
-- there are no correctness bugs, unhandled edge cases, or leftover debug code;
-- the code follows the project's conventions (CLAUDE.md, linters, existing patterns);
 - the quality gates hold: if `{run_dir}/quality.md` exists, read it. Judge each warning (is it a real problem that was left unfixed?) and each accepted change (a protected file, the quality configuration or a forbidden line that a person accepted: is it justified by this step?). A waived gate is a finding unless the specification allows it.
 
 Write `{review_file}` with the findings (list each required change), and end it with exactly one verdict line:

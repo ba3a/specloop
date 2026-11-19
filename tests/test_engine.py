@@ -1,3 +1,4 @@
+import atexit
 import contextlib
 import io
 import json
@@ -692,6 +693,43 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("exactly one subagent", out)
         self.assertIn("## Phase: plan", out)
 
+    def test_preamble_names_subagent_type_and_brief_exactly(self):
+        self.delegate("plan")
+        workflow.cmd_init(self.root, "spec.md")
+        config = workflow.load_config(self.root)
+        state = self.state()
+        out = workflow.phase_prompt(self.root, config, state)
+        self.assertIn("`subagent_type` `specloop-planner`", out)
+        self.assertNotIn("{subagent}", out)
+        self.assertIn("Never start a second one", out)
+        brief = workflow.phase_brief(self.root, config, state)
+        between = out.split("\n--- BEGIN PHASE BRIEF ---\n")[1].split("\n--- END PHASE BRIEF ---")[0]
+        self.assertTrue(between.startswith("Run long commands in the foreground"))
+        self.assertTrue(between.endswith("\n\n" + brief))
+        self.set_config({"phases": {"plan": {"delegate": True, "subagent": "my-planner"}}})
+        config = workflow.load_config(self.root)
+        self.assertIn("`subagent_type` `my-planner`", workflow.phase_prompt(self.root, config, state))
+
+    def test_delegate_override_without_subagent_renders_brief(self):
+        self.write_override("delegate", "CUSTOM\n{brief}")
+        self.delegate("plan")
+        workflow.cmd_init(self.root, "spec.md")
+        config = workflow.load_config(self.root)
+        state = self.state()
+        self.assertEqual("CUSTOM\n" + workflow.phase_brief(self.root, config, state),
+                         workflow.phase_prompt(self.root, config, state))
+
+    def test_context_line_and_deny_reason_name_subagent_type(self):
+        self.set_config({"feature": {"enforceDelegation": True},
+                         "phases": {"implement": {"delegate": True, "check": None}}})
+        self.start()
+        workflow.cmd_advance(self.root)
+        text = workflow.handle_context(self.root, "UserPromptSubmit")["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("subagent_type specloop-implementer", text)
+        out = workflow.handle_pretool(self.root, {"tool_name": "Edit", "tool_input": {
+            "file_path": os.path.join(self.root, "src", "Main.java")}})
+        self.assertIn("subagent_type specloop-implementer", out["hookSpecificOutput"]["permissionDecisionReason"])
+
     def test_last_failure_written_on_failed_command_with_full_output(self):
         self.set_config({"maxOutputChars": 50, "phases": {"implement": {"check": {
             "type": "command", "command": "echo FIRST-$((2*3)); printf 'x%.0s' $(seq 1 200); echo; exit 2"}}}})
@@ -739,6 +777,65 @@ class EngineTest(unittest.TestCase):
         self.assertNotIn("## Files to read", text)
         text = workflow.handle_context(self.root, "SessionStart")["hookSpecificOutput"]["additionalContext"]
         self.assertIn("Phase 'plan' is delegated", text)
+
+    # --- the per-phase subagent ----------------------------------------------------
+
+    def test_subagent_defaults_per_single_mode_phase(self):
+        config = workflow.load_config(self.root)
+        expected = {"plan": "specloop-planner", "implement": "specloop-implementer", "review": "specloop-reviewer"}
+        for phase, name in expected.items():
+            self.assertEqual(name, workflow.phase_subagent(config, {"mode": "single", "phase": phase}))
+
+    def test_old_config_without_subagent_keeps_defaults_and_delegates(self):
+        self.delegate("plan")
+        config = workflow.load_config(self.root)
+        self.assertEqual("specloop-planner", config["phases"]["plan"]["subagent"])
+        workflow.cmd_init(self.root, "spec.md")
+        out = workflow.cmd_go(self.root)
+        self.assertIn("exactly one subagent", out)
+        self.assertEqual("active", self.state()["status"])
+
+    def test_project_subagent_overrides_default(self):
+        self.set_config({"phases": {"implement": {"subagent": "my-coder", "check": None}}})
+        config = workflow.load_config(self.root)
+        self.assertEqual("my-coder", workflow.phase_subagent(config, {"mode": "single", "phase": "implement"}))
+        self.assertEqual([], workflow.validate_config(config))
+
+    def test_project_phase_without_subagent_is_general_purpose(self):
+        self.set_config({"phases": {"implement": {"next": "extra"}, "extra": {"next": "review", "check": None}}})
+        config = workflow.load_config(self.root)
+        self.assertEqual("general-purpose", workflow.phase_subagent(config, {"mode": "single", "phase": "extra"}))
+
+    def test_invalid_subagent_makes_go_refuse_without_changing_state(self):
+        for value in ("", "a b", "-x", 5):
+            self.set_config({"phases": {"implement": {"subagent": value, "check": None}}})
+            workflow.cmd_reset(self.root)
+            workflow.cmd_init(self.root, "spec.md")
+            path = os.path.join(self.base, "state.json")
+            with open(path, "rb") as f:
+                before = f.read()
+            out = workflow.cmd_go(self.root)
+            self.assertIn("phases.implement.subagent", out)
+            self.assertIn("config.json", out)
+            self.assertIn("config.local.json", out)
+            self.assertIn("/sl-go", out)
+            with open(path, "rb") as f:
+                self.assertEqual(before, f.read())
+
+    def test_validate_config_checks_only_subagent_and_never_raises(self):
+        config = workflow.load_config(self.root)
+        self.assertEqual([], workflow.validate_config(config))
+        config["phases"]["plan"]["allowEdits"] = 5
+        config["maxIterations"] = "x"
+        self.assertEqual([], workflow.validate_config(config))
+        for broken in (None, [], {"phases": 5}, {"feature": 5}, {"feature": {"stepPhases": [1]}},
+                       {"phases": {"x": 5}}):
+            self.assertIsInstance(workflow.validate_config(broken), list)
+        errors = workflow.validate_config({"feature": {"stepPhases": {"review": {"subagent": "a b"}},
+                                                       "planPhases": {"feature-plan": {"subagent": None}}}})
+        self.assertEqual(2, len(errors))
+        self.assertTrue(any("feature.stepPhases.review.subagent" in e for e in errors))
+        self.assertTrue(any("feature.planPhases.feature-plan.subagent" in e for e in errors))
 
 
 def valid_steps():
@@ -1043,6 +1140,29 @@ def force_rmtree(path):
         shutil.rmtree(path, onerror=make_writable)
 
 
+_feature_template = []  # One built project per process; FeatureModeTest copies it for every test.
+
+
+def feature_template():
+    """Return a project with the kit, spec.md and one commit, built once with git."""
+    if not _feature_template:
+        root = tempfile.mkdtemp()
+        atexit.register(force_rmtree, root)
+        shutil.copytree(KIT, os.path.join(root, ".claude", "specloop"))
+        with open(os.path.join(root, "spec.md"), "w", encoding="utf-8") as f:
+            f.write("# My Big Feature!\n\nDo many things.\n")
+        env = gitfixture.clean_env()
+        env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(root)
+        for args in (("init", "-q"), ("config", "user.name", "Test"),
+                     ("config", "user.email", "test@example.com"), ("config", "commit.gpgsign", "false"),
+                     ("add", "spec.md"), ("commit", "-q", "-m", "initial")):
+            subprocess.run(["git"] + list(args), cwd=root, env=env, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        subprocess.run(["git", "gc", "-q"], cwd=root, env=env, check=True)
+        _feature_template.append(root)
+    return _feature_template[0]
+
+
 class FeatureModeTest(unittest.TestCase):
 
     def setUp(self):
@@ -1051,15 +1171,9 @@ class FeatureModeTest(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         self.ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
         os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self.root)
+        shutil.rmtree(self.root)
+        shutil.copytree(feature_template(), self.root)
         self.base = os.path.join(self.root, ".claude", "specloop")
-        shutil.copytree(KIT, self.base)
-        self.write("spec.md", "# My Big Feature!\n\nDo many things.\n")
-        self.git("init", "-q")
-        self.git("config", "user.name", "Test")
-        self.git("config", "user.email", "test@example.com")
-        self.git("config", "commit.gpgsign", "false")
-        self.git("add", "spec.md")
-        self.git("commit", "-q", "-m", "initial")
         self.start_branch = self.git("symbolic-ref", "--short", "HEAD")
 
     def tearDown(self):
@@ -1316,6 +1430,89 @@ class FeatureModeTest(unittest.TestCase):
         self.assertEqual("deny", out["hookSpecificOutput"]["permissionDecision"])
         steps = os.path.join(self.base, "run", "steps.json")
         self.assertIsNone(workflow.handle_pretool(self.root, {"tool_name": "Write", "tool_input": {"file_path": steps}}))
+
+    def test_subagent_defaults_per_feature_phase(self):
+        config = workflow.load_config(self.root)
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        state = self.state()
+        self.assertEqual("specloop-planner", workflow.phase_subagent(config, state))
+        state["stepId"] = 1
+        for phase, name in (("implement", "specloop-implementer"), ("review", "specloop-reviewer"),
+                            ("feature-replan", "specloop-planner")):
+            state["phase"] = phase
+            self.assertEqual(name, workflow.phase_subagent(config, state))
+
+    def test_invalid_feature_subagent_makes_go_refuse(self):
+        self.set_config({"feature": {"stepPhases": {"review": {"subagent": "-x"}}}})
+        out = self.assertRefusedUnchanged("feature.stepPhases.review.subagent")
+        self.assertIn("/sl-go", out)
+
+    # --- feature.branchMode ----------------------------------------------------------
+
+    def test_branch_mode_current_records_branch_and_creates_none(self):
+        self.set_config({"feature": {"branchMode": "current"}})
+        branches = self.git("branch", "--list")
+        head = self.git("rev-parse", "HEAD")
+        self.write("notes.txt", "n")
+        self.start()
+        state = self.state()
+        self.assertEqual(self.start_branch, state["branch"])
+        self.assertEqual(head, state["baseRef"])
+        self.assertEqual(["notes.txt"], state["preexistingUntracked"])
+        self.assertEqual("active", state["status"])
+        self.assertEqual(self.start_branch, self.current_branch())
+        self.assertEqual(branches, self.git("branch", "--list"))
+
+    def test_branch_mode_current_refuses_detached_head_and_dirty_tree(self):
+        self.set_config({"feature": {"branchMode": "current"}})
+        self.git("checkout", "-q", "--detach")
+        self.assertRefusedUnchanged("detached")
+        self.git("checkout", "-q", self.start_branch)
+        self.write("spec.md", "# My Big Feature!\nchanged\n")
+        self.assertRefusedUnchanged("uncommitted changes")
+
+    def test_branch_mode_create_creates_branch(self):
+        self.set_config({"feature": {"branchMode": "create"}})
+        self.start()
+        self.assertEqual("specloop/my-big-feature", self.current_branch())
+
+    def test_invalid_branch_mode_makes_go_refuse(self):
+        self.set_config({"feature": {"branchMode": "fork"}})
+        out = self.assertRefusedUnchanged("feature.branchMode")
+        self.assertIn("/sl-go", out)
+
+    def test_branch_mode_current_in_linked_worktree_commits_on_its_branch(self):
+        wt = os.path.join(tempfile.mkdtemp(), "wt")
+        self.addCleanup(force_rmtree, os.path.dirname(wt))
+        self.git("worktree", "add", "-q", "-b", "wt", wt)
+        shutil.copytree(KIT, os.path.join(wt, ".claude", "specloop"))
+        with open(os.path.join(wt, ".claude", "specloop", "config.json"), "w") as f:
+            json.dump({"feature": {"branchMode": "current"},
+                       "phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}}}, f)
+        branches = self.git("branch", "--list", "--format=%(refname:short)").split()
+        workflow.cmd_init(wt, "spec.md", mode="feature")
+        workflow.cmd_go(wt)
+        self.assertEqual("wt", workflow.load_state(wt)["branch"])
+        run = os.path.join(wt, ".claude", "specloop", "run")
+        for name, text in (("plan.md", "# Plan"), ("steps.json", json.dumps(valid_steps()))):
+            with open(os.path.join(run, name), "w", encoding="utf-8") as f:
+                f.write(text)
+        workflow.handle_stop(wt, {})
+        workflow.cmd_go(wt)
+        with open(os.path.join(wt, "a.py"), "w") as f:
+            f.write("a = 1\n")
+        workflow.handle_stop(wt, {})
+        state = workflow.load_state(wt)
+        os.makedirs(workflow.attempt_path(wt, state), exist_ok=True)
+        with open(os.path.join(workflow.attempt_path(wt, state), "review.md"), "w") as f:
+            f.write("ok\nVERDICT: APPROVE")
+        workflow.handle_stop(wt, {})
+        subject = subprocess.run(["git", "log", "-n", "1", "--format=%s", "wt"], cwd=self.root,
+                                 stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+        self.assertEqual("feat: Add steps.json schema validation", subject)
+        self.assertEqual(self.start_branch, self.current_branch())
+        self.assertEqual("1", self.git("rev-list", "--count", self.start_branch))
+        self.assertEqual(sorted(branches), sorted(self.git("branch", "--list", "--format=%(refname:short)").split()))
 
     def test_context_and_delegation_in_feature_plan(self):
         self.start()

@@ -199,6 +199,15 @@ def in_replan(config, state):
     return in_step(state) and state.get("phase") == config["feature"].get("replanPhase", "feature-replan")
 
 
+DEFAULT_SUBAGENT = "general-purpose"  # Claude Code's built-in agent, for a project's own phases
+
+
+def phase_subagent(config, state):
+    """The subagent_type of the current phase: its `subagent`, or general-purpose when it has none."""
+    name = (phase_graph(config, state).get(state.get("phase")) or {}).get("subagent")
+    return name if isinstance(name, str) and name else DEFAULT_SUBAGENT
+
+
 def current_step(state):
     """Return (index, step) of the active step in approvedSteps, or (None, None)."""
     for index, step in enumerate((state.get("approvedSteps") or {}).get("steps", [])):
@@ -948,7 +957,10 @@ def phase_prompt(root, config, state):
         return phase_instructions(root, config, state)
     brief = phase_brief(root, config, state)
     path = _kit_file(root, "delegate")
-    return render_phase(_read_text(path), config, state).replace("{brief}", brief) if path else brief
+    if not path:
+        return brief
+    text = render_phase(_read_text(path), config, state).replace("{subagent}", phase_subagent(config, state))
+    return text.replace("{brief}", brief)
 
 
 def failure_path(root):
@@ -1295,6 +1307,37 @@ def stale_override_warning(root, config, state):
     return "\n".join(lines) or None
 
 
+def missing_agent_note(root, config, state):
+    """Note naming each subagent of a delegated phase of this run whose file is in neither .claude/agents/ of the
+    project nor of the home directory. general-purpose is built in. Return the note, else None. Never raises."""
+    try:
+        if is_feature(state):
+            graphs = [config["feature"]["planPhases"], config["feature"]["stepPhases"]]
+        else:
+            graphs = [config["phases"]]
+        home = os.path.expanduser("~")
+        missing: dict = {}
+        for graph in graphs:
+            for phase, phase_config in graph.items():
+                if not isinstance(phase_config, dict) or not phase_config.get("delegate"):
+                    continue
+                name = phase_config.get("subagent")
+                if not isinstance(name, str) or not name or name == DEFAULT_SUBAGENT:
+                    continue
+                if any(os.path.isfile(os.path.join(base, ".claude", "agents", name + ".md")) for base in (root, home)):
+                    continue
+                missing.setdefault(name, [])
+                if phase not in missing[name]:
+                    missing[name].append(phase)
+        if not missing:
+            return None
+        parts = ["%s (phase %s)" % (name, ", ".join("'%s'" % p for p in phases)) for name, phases in missing.items()]
+        return ("[specloop] Note: no agent file for %s in .claude/agents/ or ~/.claude/agents/. The Agent tool will "
+                "fail for %s until the installer runs again." % ("; ".join(parts), "it" if len(parts) == 1 else "them"))
+    except Exception:
+        return None
+
+
 def count_plan_items(root):
     try:
         with open(os.path.join(run_dir(root), "plan.md"), encoding="utf-8", errors="replace") as f:
@@ -1400,6 +1443,7 @@ FORBID_KEYS = ("pattern", "glob", "message")
 GATE_STEPS = ("each", "last")
 GATE_LEVELS = ("block", "warn")
 LEGACY_MODES = ("baseline", "ratchet")
+BRANCH_MODES = ("create", "current")
 # Shell conventions for "not executable" and "not found": a gate exiting so is broken, never passed.
 SHELL_EXIT_REASONS = {126: "command not executable (exit 126)", 127: "command not found (exit 127)"}
 SHELL_EXIT_CODES = tuple(sorted(SHELL_EXIT_REASONS))
@@ -1580,6 +1624,47 @@ def validate_quality(root, config):
         return _validate_quality(root, config)
     except Exception as e:  # validation must never break a hook or a command
         return ["quality could not be validated: %s" % (str(e) or e.__class__.__name__)]
+
+
+def validate_config(config):
+    """Validate the config keys outside `quality` that /sl-go checks: each phase's `subagent`. Return a list of
+    error strings (empty means valid); never raises."""
+    try:
+        return _validate_config(config)
+    except Exception as e:  # validation must never break a hook or a command
+        return ["the configuration could not be validated: %s" % (str(e) or e.__class__.__name__)]
+
+
+def _phase_graphs(config):
+    """(where, graph) for each phase graph in the config that is an object."""
+    feature = config.get("feature") if isinstance(config.get("feature"), dict) else {}
+    graphs = (("phases", config.get("phases")), ("feature.planPhases", feature.get("planPhases")),
+              ("feature.stepPhases", feature.get("stepPhases")))
+    return [(where, graph) for where, graph in graphs if isinstance(graph, dict)]
+
+
+def _validate_config(config):
+    if not isinstance(config, dict):
+        return []
+    errors = []
+    for where, graph in _phase_graphs(config):
+        for name, phase in graph.items():
+            if not isinstance(phase, dict) or "subagent" not in phase:
+                continue
+            value = phase["subagent"]
+            if not (isinstance(value, str) and GATE_NAME.fullmatch(value)):
+                errors.append("%s.%s.subagent is %s; it must be an agent name matching "
+                              "[A-Za-z0-9][A-Za-z0-9_-]*" % (where, name, json.dumps(value)))
+    feature = config.get("feature")
+    if isinstance(feature, dict) and feature.get("branchMode", "create") not in BRANCH_MODES:
+        errors.append("feature.branchMode is %s; it must be \"create\" or \"current\"" % json.dumps(
+            feature["branchMode"]))
+    return errors
+
+
+def config_errors_message(config, errors):
+    return ("Not started: the configuration is invalid:\n%s\n\nFix it in %s (or %s), then run %s again." % (
+        "\n".join("- " + e for e in errors), _rel("config.json"), _rel("config.local.json"), cmd_name(config, "go")))
 
 
 def unreadable_quality(config):
@@ -2580,6 +2665,76 @@ def measure_baselines(root, config, state, outcome):
     return dict(outcome, qualityBaseline=measured) if measured else outcome
 
 
+_UNSET = object()
+TREE_KEY_EXCLUDES = ("**/.claude/specloop/run/**", "**/.claude/specloop/state.*", "**/.claude/specloop/update.*")
+
+
+def tree_key(root, config):
+    """A hash of the working tree: HEAD plus the content of every tracked change and every untracked file that
+    git does not ignore, except specloop's own run state. None when it cannot be computed (no git repository, a
+    git failure): a gate then always runs. Never raises, and never touches the real index."""
+    timeout = config.get("feature", {}).get("gitTimeoutSec", 60)
+
+    def run(args, env=None):
+        proc = subprocess.run(["git"] + args, cwd=root, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, timeout=timeout)
+        return proc.stdout.decode("utf-8", errors="replace").strip() if proc.returncode == 0 else None
+
+    fd, temp = tempfile.mkstemp(prefix="specloop-index-")
+    os.close(fd)
+    try:
+        os.remove(temp)
+        head = run(["rev-parse", "--verify", "-q", "HEAD"]) or "no-commit"
+        index = run(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+        if not index:
+            return None
+        if os.path.isfile(index):
+            shutil.copyfile(index, temp)
+        env = dict(os.environ, GIT_INDEX_FILE=temp)
+        excludes = [":(exclude,glob)%s" % pattern for pattern in TREE_KEY_EXCLUDES]
+        if run(["add", "-A", "--", ":/"] + excludes, env) is None:
+            return None
+        tree = run(["write-tree"], env)
+        if not tree:
+            return None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    finally:
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+    return hashlib.sha256(("%s\n%s" % (head, tree)).encode("utf-8")).hexdigest()
+
+
+def gate_key(name, gate, command, tree):
+    """The key a passing result is reused under: gate name, gate definition, the command that runs and the
+    content hash of the working tree. None when the tree has no hash."""
+    if tree is None:
+        return None
+    definition = json.dumps([name, gate, command or gate.get("command")], sort_keys=True, default=str)
+    return hashlib.sha256((definition + "\n" + tree).encode("utf-8")).hexdigest()
+
+
+def reused_gate_run(root, state, name, key):
+    """(record, output) of a stored pass for this key, or None. A failed, warned, broken or missing result, or a
+    different key, never matches."""
+    results = state.get("qualityResults")
+    prior = results.get(name) if isinstance(results, dict) else None
+    if key is None or not isinstance(prior, dict) or prior.get("result") != "pass" or prior.get("key") != key:
+        return None
+    record = gate_record(state, name, "pass", prior.get("exitCode"), 0, key=key, reused=True)
+    for extra in ("metric", "baseline"):
+        if extra in prior:
+            record[extra] = prior[extra]
+    try:
+        with open(gate_log_path(root, name), encoding="utf-8", errors="replace") as f:
+            output = f.read()
+    except OSError:
+        output = ""
+    return record, output
+
+
 def run_quality_gates(root, config, state, outcome):
     """Run the gates of the current phase after its check passed, with no lock. Return the outcome to record.
 
@@ -2602,6 +2757,7 @@ def run_quality_gates(root, config, state, outcome):
     budget = quality_budget(root, config)
     started = _clock()
     baselines = baseline_values(state)
+    tree: Any = _UNSET
     if quality_block_changed(config, state):
         runs = block_changed_runs(root, config, state, selected)
         details, full = gate_failure(config, runs)
@@ -2621,8 +2777,17 @@ def run_quality_gates(root, config, state, outcome):
         if record:
             write_gate_log(root, name, output.encode("utf-8"))
         else:
-            record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
-                                              command, _metric_number(baselines.get(name)))
+            if tree is _UNSET:
+                tree = tree_key(root, config)
+            key = gate_key(name, gate, command, tree)
+            reused = reused_gate_run(root, state, name, key)
+            if reused:
+                record, output = reused
+            else:
+                record, output = run_quality_gate(root, config, state, name, gate, budget - (_clock() - started),
+                                                  command, _metric_number(baselines.get(name)))
+                if key is not None:
+                    record["key"] = key
         runs.append((record, output))
         if record["result"] == "broken":
             return broken_outcome([r for r, _ in runs], {"gate": name, "reason": record["reason"]},
@@ -2831,6 +2996,9 @@ def start_feature_branch(root, config, state):
     except OSError:
         spec_text = ""
     feature = config["feature"]
+    if feature.get("branchMode", "create") == "current":
+        state.update(branch=out, baseRef=base, preexistingUntracked=untracked)
+        return None
     name = stem = feature.get("branchPrefix", "specloop/") + branch_slug(spec_text, state.get("spec", ""))
     suffix = 2
     while git(root, config, "rev-parse", "--verify", "--quiet", "refs/heads/" + name)[0]:
@@ -3419,8 +3587,9 @@ def handle_pretool(root, hook_input):
         # Claude Code sets agent_id in hook input only for tool calls made inside a subagent.
         if (config["feature"].get("enforceDelegation") and is_delegated(config, state)
                 and not hook_input.get("agent_id") and not in_run):
-            return deny("phase '%s' is delegated: start one subagent with the phase brief and let it make this "
-                        "edit. The main session may only edit %s/." % (phase, _rel("run")))
+            return deny("phase '%s' is delegated: start one subagent (subagent_type %s) with the phase "
+                        "brief and let it make this edit. The main session may only edit %s/." % (
+                            phase, phase_subagent(config, state), _rel("run")))
 
     if tool == "Bash":
         command = tool_input.get("command", "")
@@ -3514,9 +3683,10 @@ def workflow_context(root, event, state, hook_input):
                     "hookSpecificOutput": {"hookEventName": event, "additionalContext": notice}}
         text = header(state)
         if is_delegated(config, state):
-            text += ("\n[specloop] Phase '%s' is delegated: start one subagent with the phase brief, relay a short "
-                     "summary, and finish your turn; do not do the phase's work yourself. If the user's message is "
-                     "about something else, answer that first and say the workflow is waiting." % state["phase"])
+            text += ("\n[specloop] Phase '%s' is delegated: start one subagent (subagent_type %s) with the phase brief, "
+                     "relay a short summary, and finish your turn; do not do the phase's work yourself. If the "
+                     "user's message is about something else, answer that first and say the workflow is waiting." % (
+                         state["phase"], phase_subagent(config, state)))
         if event == "SessionStart" or state.get("iter", 0) == 0:
             text += "\n\n" + phase_prompt(root, config, state)
         elif state.get("lastFailure"):
@@ -3573,6 +3743,9 @@ def cmd_go(root):
     errors = validate_quality(root, config)
     if errors:
         return quality_errors_message(config, errors)
+    errors = validate_config(config)
+    if errors:
+        return config_errors_message(config, errors)
     plan, replan = None, None
     if is_feature(state):
         if state.get("branch"):
@@ -3604,8 +3777,10 @@ def cmd_go(root):
             current["qualityFingerprints"] = fingerprints
         return resume(root, config, current, plan, replan)
     out = update_state(root, apply)
-    warning = stale_override_warning(root, config, state)
-    return out + "\n\n" + warning if warning else out
+    for note in (stale_override_warning(root, config, state), missing_agent_note(root, config, state)):
+        if note:
+            out += "\n\n" + note
+    return out
 
 
 def resume(root, config, state, plan, replan):

@@ -9,6 +9,7 @@
 ## Concepts
 
 - [How it works](how-it-works.md): the phases, the four hooks, the safety valves and the files specloop keeps in a project.
+- [Native Claude Code features](native-features.md): which Claude Code features specloop uses, and why the others do not replace the engine.
 - [Review attempts](review-attempts.md): how a review is tied to one attempt, and what happens to a late result.
 
 ## Features

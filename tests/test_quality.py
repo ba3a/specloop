@@ -4166,5 +4166,84 @@ class PresetsTest(GateProject):
         self.assertNotIn("/sl-", text)
 
 
+class GateReuseTest(ChangedFilesProject):
+    """A passing gate is not rerun while its key (gate, definition, working tree, HEAD) is unchanged."""
+
+    def setUp(self):
+        super().setUp()
+        self.gates = {"tests": self.counting("tests", "exit 0")}
+        self.apply_config()
+        workflow.cmd_init(self.root, "spec.md")
+        workflow.cmd_go(self.root)
+        self.write(self.run_file("plan.md"), "- [ ] step")
+        self.assertIn("entering phase 'implement'", self.stop()["reason"])
+
+    def apply_config(self):
+        self.set_config({"phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}},
+                         "quality": {"gates": self.gates}})
+        if "qualityFingerprints" in (self.state() or {}):  # a person accepted the changed quality block
+            workflow.update_state(self.root, lambda s: s["qualityFingerprints"].update(
+                quality=workflow.quality_block_fingerprint(self.config())))
+
+    def run_gates(self):
+        state = self.state()
+        outcome = workflow.run_quality_gates(self.root, self.config(), state, {"result": "pass", "details": ""})
+        workflow.update_state(self.root, lambda s: workflow.record_quality(s, outcome.get("quality", [])))
+        return outcome
+
+    def test_unchanged_tree_reuses_a_pass(self):
+        self.run_gates()
+        self.run_gates()
+        self.assertEqual(1, self.marker("tests"))
+        result = self.state()["qualityResults"]["tests"]
+        self.assertEqual("pass", result["result"])
+        self.assertTrue(result["reused"])
+
+    def test_gate_state_files_do_not_change_the_key(self):
+        self.run_gates()
+        self.write(self.run_file("junk.txt"))
+        self.run_gates()
+        self.assertEqual(1, self.marker("tests"))
+
+    def test_changed_tracked_file_reruns(self):
+        self.run_gates()
+        self.write("tracked.txt", "two\n")
+        self.run_gates()
+        self.assertEqual(2, self.marker("tests"))
+        self.assertNotIn("reused", self.state()["qualityResults"]["tests"])
+
+    def test_new_untracked_file_reruns(self):
+        self.run_gates()
+        self.write("new.txt")
+        self.run_gates()
+        self.assertEqual(2, self.marker("tests"))
+
+    def test_changed_gate_definition_reruns(self):
+        self.run_gates()
+        self.gates["tests"]["timeoutSec"] = 100
+        self.apply_config()
+        self.run_gates()
+        self.assertEqual(2, self.marker("tests"))
+
+    def test_changed_head_reruns(self):
+        self.run_gates()
+        self.git("commit", "-q", "--allow-empty", "-m", "next")
+        self.run_gates()
+        self.assertEqual(2, self.marker("tests"))
+
+    def test_failed_result_always_runs(self):
+        self.gates["tests"] = self.counting("tests", "exit 1")
+        self.apply_config()
+        self.run_gates()
+        self.run_gates()
+        self.assertEqual(2, self.marker("tests"))
+        self.assertEqual("fail", self.state()["qualityResults"]["tests"]["result"])
+
+    def test_missing_result_runs(self):
+        self.assertNotIn("tests", self.state().get("qualityResults") or {})
+        self.run_gates()
+        self.assertEqual(1, self.marker("tests"))
+
+
 if __name__ == "__main__":
     unittest.main()

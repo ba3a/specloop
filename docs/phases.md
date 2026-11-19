@@ -6,7 +6,7 @@ The single-mode workflow is a graph of phases in the `phases` key of the [config
 
 ## The phase graph
 
-Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of path prefixes (omit it to allow all edits), an optional `instructions` file, an optional `delegate` flag (see [Delegating a phase](delegation.md)) and an optional `check`.
+Each phase has `next` (a phase name or `done`), an optional `allowEdits` list of path prefixes (omit it to allow all edits), an optional `instructions` file, an optional `delegate` flag and an optional `subagent` name (see [Delegating a phase](delegation.md) and [Choosing the subagent](delegation.md#choosing-the-subagent)) and an optional `check`.
 
 ## Check types
 
@@ -45,7 +45,7 @@ To add a phase, for example `docs` after `implement`, define it in `config.json`
 
 Shipped instructions are in `phases/` and are replaced on update; a file of the same name in `overrides/` takes precedence. The shipped files are `plan.md`, `implement.md` and `review.md` (single mode), `feature-plan.md`, `feature-replan.md`, `step-implement.md` and `step-review.md` (feature mode, see [Feature mode](feature-mode.md#step-cycle)) and `delegate.md` (the orchestration preamble, see [Delegating a phase](delegation.md#the-orchestrator-and-the-phase-brief)).
 
-In instruction files, `{spec}` becomes the spec path, `{run_dir}` becomes `.claude/specloop/run`, `{attempt_dir}` becomes the current attempt's directory, and `{review_file}` becomes the path the current phase's verdict check reads, which is `{attempt_dir}/review.md` in a phase without one. `{quality_gates}` becomes a Markdown list of the [quality gates](quality-gates.md#what-the-agent-and-the-reviewer-see) that run in the current phase and step, with the protected paths and forbidden patterns, and nothing when no gate applies; the shipped `implement.md` and `step-implement.md` use it, and an override without it keeps working. Feature-mode step placeholders are listed under [Step cycle](feature-mode.md#step-cycle).
+In instruction files, `{spec}` becomes the spec path, `{run_dir}` becomes `.claude/specloop/run`, `{attempt_dir}` becomes the current attempt's directory, and `{review_file}` becomes the path the current phase's verdict check reads, which is `{attempt_dir}/review.md` in a phase without one. `{quality_gates}` becomes a Markdown list of the [quality gates](quality-gates.md#what-the-agent-and-the-reviewer-see) that run in the current phase and step, with the protected paths and forbidden patterns, and nothing when no gate applies; the shipped `implement.md` and `step-implement.md` use it, and an override without it keeps working. In `delegate.md` only, `{subagent}` becomes the `subagent_type` of the current phase (see [Choosing the subagent](delegation.md#choosing-the-subagent)) and `{brief}` becomes the phase brief; an override without `{subagent}` keeps working. Feature-mode step placeholders are listed under [Step cycle](feature-mode.md#step-cycle).
 
 ## `run/last-failure.md`
 

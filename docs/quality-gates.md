@@ -49,6 +49,7 @@ On a Stop, after the phase's `check` passes, the engine runs every gate whose `p
 
 - An exit code listed in `passExitCodes` (by default only `0`) is a pass. Any other exit code fails the gate at level `block` and gives a warning at level `warn`, except 126 and 127, which make it [broken](#broken-gates). A `metric` can still fail a gate that passed by exit code; see [Pass criteria](#pass-criteria).
 - With `failFast: false` every gate runs, so all failures are reported at once. With `failFast: true` the first failing `block` gate ends the run: later gates do not run and keep their previous results. A failing `warn` gate never ends the run.
+- The gates are the guarantee that the project is sound. The shipped implement phases and `specloop-implementer` tell the agent to run only targeted tests and to leave the full suite to the gates, so the suite does not run twice.
 - The phase passes only if every `block` gate passes. Failing `warn` gates are named, with their log paths, in the message that announces the next phase.
 
 ## Feature mode
@@ -75,6 +76,12 @@ Each gate's complete output is written to `.claude/specloop/run/quality/<gate>.l
 After each gate run, `.claude/specloop/run/quality.md` is rewritten from that run's results: a table with one row per gate that ran (name, `result`, duration and the metric value, or `-` when the gate has none), then, for each `warn` result, a section with the end of its output, bounded by `maxOutputChars` across all warnings, then, for each [ratchet](#existing-problems) gate, its baseline or the note that it has none, then the changes a person [accepted](#accepting-changes). The reviewer reads this file. It is written together with `qualityResults`, so a dropped result writes nothing, and a run without gates never creates it.
 
 In a feature-mode run, `run/quality.md` and `run/quality/` move to `run/steps/<id>/` when the step finishes, with the step's review files; the next step starts without them. In single mode they stay in `run/`.
+
+### Reusing a pass
+
+A gate that passed is not run again while nothing it depends on changed. Each result stores a `key`: a hash of the gate name, its definition, the command that ran (after placeholders are expanded) and a content hash of the working tree. The tree hash covers HEAD, every tracked change and every untracked file that git does not ignore, and leaves out specloop's own state under `.claude/specloop/run/`. A reused result is marked `reused: true`, keeps its `metric` and `baseline`, and shows the log of the run that made it.
+
+Any change to a file, to the gate definition or to HEAD gives a new key, so the gate runs. A `fail`, `warn`, `broken` or `skipped` result, a missing result and a project that is not a git repository never reuse: the gate always runs. A gate that writes files into the tree changes the key itself, so it runs again on the next stop.
 
 ## Pass criteria
 

@@ -30,6 +30,8 @@ The [size warnings](size-warnings.md) suggest feature mode when a single-mode sp
 
 The first `/sl-go` of a feature run creates and checks out `feature.branchPrefix` + a slug of the spec's first `# ` heading (or its file name): lowercase ASCII, `-` separators, at most 50 characters. If that branch exists, `-2`, `-3`, … is appended. It refuses, without changing anything, when the directory is not a git repository, the repository has no commits, `HEAD` is detached, or tracked files have uncommitted changes (staged or not; changes under `.claude/specloop/` are ignored). State records `branch`, `baseRef` (the starting commit) and `preexistingUntracked` (untracked files that existed at start). Later `/sl-go` calls refuse if the current branch is not the run's branch.
 
+With `feature.branchMode` set to `"current"`, `/sl-go` creates and checks out no branch. It applies the same refusals, then records the checked-out branch as `branch`, `HEAD` as `baseRef` and the untracked files as `preexistingUntracked`; the steps commit on that branch. Use it in a linked worktree that already has its own branch (see [Git worktrees](installation.md#git-worktrees)). Any value other than `"create"` (the default) or `"current"` makes `/sl-go` refuse.
+
 ## Planning
 
 The `feature-plan` phase is delegated to a subagent (see [Delegating a phase](delegation.md)). It writes `run/plan.md` (goal, acceptance criteria, assumptions, step-order rationale) and `run/steps.json`:
@@ -99,12 +101,13 @@ The `feature` block of the [configuration](configuration.md). The keys for repla
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `feature.branchPrefix` | `"specloop/"` | Prefix of the feature branch name. |
+| `feature.branchMode` | `"create"` | `"create"` makes a new branch from `branchPrefix`; `"current"` runs on the checked-out branch and creates none. |
 | `feature.planPhase` | `"feature-plan"` | First phase of a feature run. |
 | `feature.requirePlanApproval` | `true` | Pause for approval after planning. When `false`, the plan is approved as soon as its gate passes. |
 | `feature.gitTimeoutSec` | `60` | Timeout for every git call the engine makes. |
-| `feature.planPhases` | `feature-plan` phase | Phase graph for planning, with the same keys as `phases` (`delegate`, `allowEdits`, `check`, `instructions`). |
+| `feature.planPhases` | `feature-plan` phase | Phase graph for planning, with the same keys as `phases` (`delegate`, `subagent`, `allowEdits`, `check`, `instructions`). Both phases default to `subagent: "specloop-planner"`; see [Choosing the subagent](delegation.md#choosing-the-subagent). |
 | `feature.stepInitialPhase` | `"implement"` | First phase of every step. |
-| `feature.stepPhases` | `implement` → `review` → `commit` | Phase graph of the step cycle; `commit` is the reserved terminal pseudo-phase. |
+| `feature.stepPhases` | `implement` → `review` → `commit` | Phase graph of the step cycle; `commit` is the reserved terminal pseudo-phase. Each phase may set `subagent`; `implement` defaults to `specloop-implementer` and `review` to `specloop-reviewer` (see [Choosing the subagent](delegation.md#choosing-the-subagent)). |
 | `feature.commitExclude` | `[".claude/specloop/"]` | Paths never included in step commits. |
 | `feature.commitMessage` | `"{type}: {step_title}\n\nspecloop step {step_index}/{step_count} ({step_id}) of {spec}"` | Commit message template; `{type}` is the step's `type` (default `feat`). |
 | `feature.pauseBetweenSteps` | `false` | Pause after each step's commit. |

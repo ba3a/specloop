@@ -43,6 +43,7 @@ class ProjectTest(unittest.TestCase):
 
     def setUp(self):
         self.root = tempfile.mkdtemp()
+        self.isolate_env()
         self.ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
         os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self.root)
         self.base = os.path.join(self.root, ".claude", "specloop")
@@ -50,7 +51,19 @@ class ProjectTest(unittest.TestCase):
         self.write("spec.md", "# Spec\nDo the thing.\n")
         self.set_config({})
 
+    def isolate_env(self):
+        """Point CLAUDE_PROJECT_DIR at this project, so subprocesses never reach the real one."""
+        self.saved_project_dir = os.environ.get("CLAUDE_PROJECT_DIR")
+        os.environ["CLAUDE_PROJECT_DIR"] = self.root
+
+    def restore_env(self):
+        if self.saved_project_dir is None:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        else:
+            os.environ["CLAUDE_PROJECT_DIR"] = self.saved_project_dir
+
     def tearDown(self):
+        self.restore_env()
         if self.ceiling is None:
             os.environ.pop("GIT_CEILING_DIRECTORIES", None)
         else:
@@ -127,14 +140,12 @@ class ProjectTest(unittest.TestCase):
 
     def main(self, *argv, stdin=""):
         old_stdin, sys.stdin = sys.stdin, io.StringIO(stdin)
-        os.environ["CLAUDE_PROJECT_DIR"] = self.root
         out = io.StringIO()
         try:
             with contextlib.redirect_stdout(out):
                 self.assertEqual(0, workflow.main(list(argv)))
         finally:
             sys.stdin = old_stdin
-            del os.environ["CLAUDE_PROJECT_DIR"]
         return out.getvalue()
 
     def stalled(self):
@@ -845,6 +856,21 @@ class FeatureStopTest(ProjectTest):
         workflow.handle_stop(self.root, {})
         self.assertEqual("review", self.state()["phase"])
 
+    def test_a_leaked_project_dir_does_not_reach_the_hook_subprocess(self):
+        other = tempfile.mkdtemp()
+        self.addCleanup(force_rmtree, other)
+        os.environ["CLAUDE_PROJECT_DIR"] = other  # as set by the Stop hook of a real run
+        saved = self.saved_project_dir
+        self.isolate_env()
+        self.saved_project_dir = saved
+        self.start_feature()
+        self.to_review()
+        self.pre_commit("'%s' '%s' pause" % (sys.executable.replace("\\", "/"), ENGINE.replace("\\", "/")))
+        self.write_attempt("review.md", "VERDICT: APPROVE")
+        workflow.handle_stop(self.root, {})
+        self.assertEqual("paused", self.state()["status"])
+        self.assertFalse(os.path.exists(os.path.join(other, ".claude")))
+
     def test_a_pause_during_a_commit_survives(self):
         self.start_feature()
         self.to_review()
@@ -1296,6 +1322,65 @@ class InFlightTest(ProjectTest):
         brief = out.split("\n--- BEGIN PHASE BRIEF ---\n")[1].split("\n--- END PHASE BRIEF ---")[0]
         self.assertIn("Run long commands in the foreground", brief)
         self.assertIn("do not end your turn", brief)
+
+
+class MissingAgentNoteTest(ProjectTest):
+
+    def setUp(self):
+        super().setUp()
+        self.home = tempfile.mkdtemp()
+        self.saved_home = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = os.environ["USERPROFILE"] = self.home
+
+    def tearDown(self):
+        for key, value in self.saved_home.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        force_rmtree(self.home)
+        super().tearDown()
+
+    def delegate(self, subagent="my-agent", phase="plan"):
+        self.set_config({"phases": {phase: {"delegate": True, "subagent": subagent}}})
+
+    def test_a_missing_agent_file_is_named_and_the_run_starts(self):
+        self.delegate()
+        out = self.start()
+        self.assertIn("[specloop] Note:", out)
+        self.assertIn("my-agent (phase 'plan')", out)
+        self.assertIn("Agent tool will fail", out)
+        self.assertIn("installer runs again", out)
+        self.assertEqual("active", self.state()["status"])
+        self.assertIn("BEGIN PHASE BRIEF", out)
+
+    def test_a_project_agent_file_silences_it(self):
+        self.delegate()
+        self.write(os.path.join(".claude", "agents", "my-agent.md"), "x")
+        self.assertNotIn("Note:", self.start())
+
+    def test_a_home_agent_file_silences_it(self):
+        self.delegate()
+        os.makedirs(os.path.join(self.home, ".claude", "agents"))
+        with open(os.path.join(self.home, ".claude", "agents", "my-agent.md"), "w") as f:
+            f.write("x")
+        self.assertNotIn("Note:", self.start())
+
+    def test_a_phase_that_is_not_delegated_never_warns(self):
+        self.set_config({"phases": {"plan": {"subagent": "my-agent"}}})
+        self.assertNotIn("Note:", self.start())
+
+    def test_general_purpose_never_warns(self):
+        self.delegate("general-purpose")
+        self.assertNotIn("Note:", self.start())
+
+    def test_feature_mode_names_the_shipped_agents(self):
+        self.init_git()
+        workflow.cmd_init(self.root, "spec.md", mode="feature")
+        out = workflow.cmd_go(self.root)
+        self.assertIn("specloop-planner", out)
+        self.assertIn("specloop-implementer", out)
+        self.assertIn("specloop-reviewer", out)
 
 
 class StaleOverrideTest(ProjectTest):
