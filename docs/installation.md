@@ -61,6 +61,8 @@ An override written for 0.2.0 or earlier may still send a review to `{run_dir}/r
 
 The kit is git-ignored, so a new `git worktree` does not get it. Run the installer once per worktree. If the project commits its hook settings, a worktree without the kit has the hooks but no `run.sh`: each hook fails with exit code 127, which Claude Code reports as a hook error and otherwise ignores, so nothing is enforced there.
 
+To run a feature in a native worktree (`claude -w`), install the kit there and set `feature.branchMode` to `"current"` in the worktree's `config.json` or `config.local.json`. The run then commits its steps on the worktree's own branch and creates no `specloop/` branch. See [Branch](feature-mode.md#branch).
+
 ## Uninstall
 
 ```bash

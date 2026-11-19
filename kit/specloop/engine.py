@@ -1443,6 +1443,7 @@ FORBID_KEYS = ("pattern", "glob", "message")
 GATE_STEPS = ("each", "last")
 GATE_LEVELS = ("block", "warn")
 LEGACY_MODES = ("baseline", "ratchet")
+BRANCH_MODES = ("create", "current")
 # Shell conventions for "not executable" and "not found": a gate exiting so is broken, never passed.
 SHELL_EXIT_REASONS = {126: "command not executable (exit 126)", 127: "command not found (exit 127)"}
 SHELL_EXIT_CODES = tuple(sorted(SHELL_EXIT_REASONS))
@@ -1654,6 +1655,10 @@ def _validate_config(config):
             if not (isinstance(value, str) and GATE_NAME.fullmatch(value)):
                 errors.append("%s.%s.subagent is %s; it must be an agent name matching "
                               "[A-Za-z0-9][A-Za-z0-9_-]*" % (where, name, json.dumps(value)))
+    feature = config.get("feature")
+    if isinstance(feature, dict) and feature.get("branchMode", "create") not in BRANCH_MODES:
+        errors.append("feature.branchMode is %s; it must be \"create\" or \"current\"" % json.dumps(
+            feature["branchMode"]))
     return errors
 
 
@@ -2991,6 +2996,9 @@ def start_feature_branch(root, config, state):
     except OSError:
         spec_text = ""
     feature = config["feature"]
+    if feature.get("branchMode", "create") == "current":
+        state.update(branch=out, baseRef=base, preexistingUntracked=untracked)
+        return None
     name = stem = feature.get("branchPrefix", "specloop/") + branch_slug(spec_text, state.get("spec", ""))
     suffix = 2
     while git(root, config, "rev-parse", "--verify", "--quiet", "refs/heads/" + name)[0]:

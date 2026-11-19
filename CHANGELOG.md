@@ -6,6 +6,7 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 ### Added
 
+- `feature.branchMode` (`"create"` by default, or `"current"`): with `"current"` a feature run records the checked-out branch and creates none, so it can run in a linked worktree (`claude -w`) on that worktree's branch. The refusals for a detached `HEAD` and a dirty tree stay; another value makes `/sl-go` refuse. See [Branch](docs/feature-mode.md#branch) and [Git worktrees](docs/installation.md#git-worktrees).
 - A passing gate is not rerun when nothing it depends on changed. The key is the gate name, its definition and command, and a content hash of the working tree (tracked changes, untracked files, HEAD), stored with `qualityResults`. Any change reruns it; a failed, warned, broken or missing result always runs. See [Reusing a pass](docs/quality-gates.md#reusing-a-pass).
 - A logo. The README shows it, and the logo, favicons and social preview image are in [`assets/brand/`](assets/brand/README.md).
 - Quality gates: named commands such as a linter, the test suite or a coverage report that a phase must pass before the workflow leaves it. They are declared in the new `quality` block (`timeoutSec`, `failFast`, `legacy`, `gates`; an empty `gates` block changes nothing). `gates` is an object in declared order, so `config.local.json` can change one key of one gate or set a gate to `null` to remove it. `/sl-go` validates the block and refuses to start or resume while it has errors. See [Quality gates](docs/quality-gates.md).

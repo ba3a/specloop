@@ -1447,6 +1447,73 @@ class FeatureModeTest(unittest.TestCase):
         out = self.assertRefusedUnchanged("feature.stepPhases.review.subagent")
         self.assertIn("/sl-go", out)
 
+    # --- feature.branchMode ----------------------------------------------------------
+
+    def test_branch_mode_current_records_branch_and_creates_none(self):
+        self.set_config({"feature": {"branchMode": "current"}})
+        branches = self.git("branch", "--list")
+        head = self.git("rev-parse", "HEAD")
+        self.write("notes.txt", "n")
+        self.start()
+        state = self.state()
+        self.assertEqual(self.start_branch, state["branch"])
+        self.assertEqual(head, state["baseRef"])
+        self.assertEqual(["notes.txt"], state["preexistingUntracked"])
+        self.assertEqual("active", state["status"])
+        self.assertEqual(self.start_branch, self.current_branch())
+        self.assertEqual(branches, self.git("branch", "--list"))
+
+    def test_branch_mode_current_refuses_detached_head_and_dirty_tree(self):
+        self.set_config({"feature": {"branchMode": "current"}})
+        self.git("checkout", "-q", "--detach")
+        self.assertRefusedUnchanged("detached")
+        self.git("checkout", "-q", self.start_branch)
+        self.write("spec.md", "# My Big Feature!\nchanged\n")
+        self.assertRefusedUnchanged("uncommitted changes")
+
+    def test_branch_mode_create_creates_branch(self):
+        self.set_config({"feature": {"branchMode": "create"}})
+        self.start()
+        self.assertEqual("specloop/my-big-feature", self.current_branch())
+
+    def test_invalid_branch_mode_makes_go_refuse(self):
+        self.set_config({"feature": {"branchMode": "fork"}})
+        out = self.assertRefusedUnchanged("feature.branchMode")
+        self.assertIn("/sl-go", out)
+
+    def test_branch_mode_current_in_linked_worktree_commits_on_its_branch(self):
+        wt = os.path.join(tempfile.mkdtemp(), "wt")
+        self.addCleanup(force_rmtree, os.path.dirname(wt))
+        self.git("worktree", "add", "-q", "-b", "wt", wt)
+        shutil.copytree(KIT, os.path.join(wt, ".claude", "specloop"))
+        with open(os.path.join(wt, ".claude", "specloop", "config.json"), "w") as f:
+            json.dump({"feature": {"branchMode": "current"},
+                       "phases": {"implement": {"check": {"type": "command", "command": "exit 0"}}}}, f)
+        branches = self.git("branch", "--list", "--format=%(refname:short)").split()
+        workflow.cmd_init(wt, "spec.md", mode="feature")
+        workflow.cmd_go(wt)
+        self.assertEqual("wt", workflow.load_state(wt)["branch"])
+        run = os.path.join(wt, ".claude", "specloop", "run")
+        for name, text in (("plan.md", "# Plan"), ("steps.json", json.dumps(valid_steps()))):
+            with open(os.path.join(run, name), "w", encoding="utf-8") as f:
+                f.write(text)
+        workflow.handle_stop(wt, {})
+        workflow.cmd_go(wt)
+        with open(os.path.join(wt, "a.py"), "w") as f:
+            f.write("a = 1\n")
+        workflow.handle_stop(wt, {})
+        state = workflow.load_state(wt)
+        os.makedirs(workflow.attempt_path(wt, state), exist_ok=True)
+        with open(os.path.join(workflow.attempt_path(wt, state), "review.md"), "w") as f:
+            f.write("ok\nVERDICT: APPROVE")
+        workflow.handle_stop(wt, {})
+        subject = subprocess.run(["git", "log", "-n", "1", "--format=%s", "wt"], cwd=self.root,
+                                 stdout=subprocess.PIPE, check=True).stdout.decode().strip()
+        self.assertEqual("feat: Add steps.json schema validation", subject)
+        self.assertEqual(self.start_branch, self.current_branch())
+        self.assertEqual("1", self.git("rev-list", "--count", self.start_branch))
+        self.assertEqual(sorted(branches), sorted(self.git("branch", "--list", "--format=%(refname:short)").split()))
+
     def test_context_and_delegation_in_feature_plan(self):
         self.start()
         workflow.handle_stop(self.root, {})

@@ -16,6 +16,7 @@
   },
   "feature": {
     "branchPrefix": "specloop/",
+    "branchMode": "create",
     "planPhase": "feature-plan",
     "requirePlanApproval": true,
     "gitTimeoutSec": 60,
