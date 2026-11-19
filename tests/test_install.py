@@ -431,6 +431,21 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         return result
 
+    def test_fixture_copy_of_the_usual_install_equals_a_real_install(self):
+        self.install()
+        copied = self.manifest()
+        real_fx = gitfixture.GitFixture()
+        self.addCleanup(real_fx.cleanup)
+        # A different argument order skips the fixture's copy and runs install.py.
+        result = real_fx.run_install("--prefix", "sl-", "--test-command", "exit 0")
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        with open(os.path.join(real_fx.target, ".claude", "specloop", "manifest.json"), encoding="utf-8") as f:
+            real = json.load(f)
+        for manifest, fx in ((copied, self.fx), (real, real_fx)):
+            self.assertEqual(fx.clone.replace("\\", "/"), manifest["source"].pop("path"))
+            self.assertEqual(fx.remote, manifest["source"].pop("url"))
+        self.assertEqual(real, copied)
+
     def test_records_clone_upstream_and_commit(self):
         result = self.install()
         manifest = self.manifest()

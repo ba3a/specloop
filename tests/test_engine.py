@@ -1,3 +1,4 @@
+import atexit
 import contextlib
 import io
 import json
@@ -1139,6 +1140,29 @@ def force_rmtree(path):
         shutil.rmtree(path, onerror=make_writable)
 
 
+_feature_template = []  # One built project per process; FeatureModeTest copies it for every test.
+
+
+def feature_template():
+    """Return a project with the kit, spec.md and one commit, built once with git."""
+    if not _feature_template:
+        root = tempfile.mkdtemp()
+        atexit.register(force_rmtree, root)
+        shutil.copytree(KIT, os.path.join(root, ".claude", "specloop"))
+        with open(os.path.join(root, "spec.md"), "w", encoding="utf-8") as f:
+            f.write("# My Big Feature!\n\nDo many things.\n")
+        env = gitfixture.clean_env()
+        env["GIT_CEILING_DIRECTORIES"] = os.path.dirname(root)
+        for args in (("init", "-q"), ("config", "user.name", "Test"),
+                     ("config", "user.email", "test@example.com"), ("config", "commit.gpgsign", "false"),
+                     ("add", "spec.md"), ("commit", "-q", "-m", "initial")):
+            subprocess.run(["git"] + list(args), cwd=root, env=env, check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        subprocess.run(["git", "gc", "-q"], cwd=root, env=env, check=True)
+        _feature_template.append(root)
+    return _feature_template[0]
+
+
 class FeatureModeTest(unittest.TestCase):
 
     def setUp(self):
@@ -1147,15 +1171,9 @@ class FeatureModeTest(unittest.TestCase):
         self.root = tempfile.mkdtemp()
         self.ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
         os.environ["GIT_CEILING_DIRECTORIES"] = os.path.dirname(self.root)
+        shutil.rmtree(self.root)
+        shutil.copytree(feature_template(), self.root)
         self.base = os.path.join(self.root, ".claude", "specloop")
-        shutil.copytree(KIT, self.base)
-        self.write("spec.md", "# My Big Feature!\n\nDo many things.\n")
-        self.git("init", "-q")
-        self.git("config", "user.name", "Test")
-        self.git("config", "user.email", "test@example.com")
-        self.git("config", "commit.gpgsign", "false")
-        self.git("add", "spec.md")
-        self.git("commit", "-q", "-m", "initial")
         self.start_branch = self.git("symbolic-ref", "--short", "HEAD")
 
     def tearDown(self):

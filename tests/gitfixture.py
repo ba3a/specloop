@@ -15,9 +15,14 @@ The repositories are built once per process, in a template directory removed at 
 fixture copies them. Building them with git for every test is slow: every command is a new
 process, and an on-access virus scanner inspects each new object file when git first reads it.
 The template is packed, so a copy holds a few files instead of one per object.
+
+The usual install (``--test-command "exit 0"`` from the clone into the target) is also done once,
+and each fixture copies the installed files and rewrites the only two paths that name the fixture
+(``source.path`` and ``source.url`` in manifest.json).
 """
 
 import atexit
+import json
 import os
 import shutil
 import subprocess
@@ -51,6 +56,7 @@ def copy_kit_source(dest):
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
 
 
+USUAL_INSTALL = ("--test-command", "exit 0")
 _template = None  # The fixture whose repositories every other fixture copies.
 
 
@@ -73,6 +79,7 @@ class GitFixture(object):
         self.clone = os.path.join(self.root, "clone")
         self.work = os.path.join(self.root, "work")
         self.target = os.path.join(self.root, "target")
+        self.installed = None  # Template only: the target after the usual install, built on demand.
         try:
             if _is_template:
                 self._build()
@@ -154,7 +161,8 @@ class GitFixture(object):
         if not os.path.isdir(self.work):
             shutil.copytree(template().clone, self.work)
             self._point_at_remote(self.work)
-        self.git(self.work, "pull", "-q", "--ff-only")
+        else:
+            self.git(self.work, "pull", "-q", "--ff-only")
         commit = self._commit_version(self.work, version)
         self.git(self.work, "push", "-q", "origin", BRANCH)
         return commit
@@ -167,9 +175,54 @@ class GitFixture(object):
         """Run the clone's install.py (or the one in `source`) with this Python; return the result."""
         source = kwargs.pop("source", self.clone)
         target = kwargs.pop("target", self.target)
+        if (args == USUAL_INSTALL and not kwargs and source == self.clone and target == self.target
+                and os.path.isdir(self.target) and os.listdir(self.target) == [".git"]
+                and self.head() == template().head() and self._config_text() == template()._config_text()):
+            return self._copy_usual_install()
         return subprocess.run([sys.executable, os.path.join(source, "install.py"), target] + list(args),
                               env=clean_env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, universal_newlines=True, **kwargs)
+
+    def _config_text(self):
+        """The clone's git config with this fixture's directory blanked out."""
+        with open(os.path.join(self.clone, ".git", "config"), encoding="utf-8") as f:
+            return f.read().replace(self.root, "").replace(self.root.replace("\\", "/"), "")
+
+    def _copy_usual_install(self):
+        """Do the usual install by copying the template's installed target; return a result."""
+        source = template()
+        if source.installed is None:
+            result = source._install_here()
+            if result.returncode != 0:
+                return result
+        for name in os.listdir(source.installed):
+            if name == ".git":
+                continue
+            src, dest = os.path.join(source.installed, name), os.path.join(self.target, name)
+            if os.path.isdir(src):
+                shutil.copytree(src, dest)
+            else:
+                shutil.copy2(src, dest)
+        path = os.path.join(self.target, ".claude", "specloop", "manifest.json")
+        with open(path, encoding="utf-8") as f:
+            manifest = json.load(f)
+        manifest["source"]["path"] = os.path.abspath(self.clone).replace("\\", "/")
+        manifest["source"]["url"] = self.git(self.clone, "remote", "get-url", "origin")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(manifest, f, indent=2)
+            f.write("\n")
+        return subprocess.CompletedProcess(["install.py"], 0, "", "")
+
+    def _install_here(self):
+        """Template only: run the usual install into a copy of the empty target, keep the result."""
+        self.installed = os.path.join(self.root, "installed")
+        shutil.copytree(self.target, self.installed)
+        result = subprocess.run([sys.executable, os.path.join(self.clone, "install.py"), self.installed]
+                                + list(USUAL_INSTALL), env=clean_env(), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if result.returncode != 0:
+            self.installed = None
+        return result
 
     def _restore_ceiling(self):
         if self._ceiling is None:
