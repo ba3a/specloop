@@ -36,7 +36,7 @@ The name must match `^[A-Za-z0-9][A-Za-z0-9_-]*$`. `/sl-go` refuses to start or 
 
 When `/sl-go` starts or resumes a run and a delegated phase of its graphs names a subagent with no file in `.claude/agents/` of the project or in `~/.claude/agents/`, it appends a `[specloop] Note:` naming each missing agent and its phase. The note says the Agent tool will fail for that agent until the installer runs again. It does not stop the run. `general-purpose` is built in and never named, and a phase that is not delegated is not checked.
 
-The shipped implement instructions and `specloop-implementer` tell the agent to run only targeted tests (the tests that cover its change, plus the linter and type checker) and not the full suite. The [quality gates](quality-gates.md#running-gates) run the full suite when the turn ends and are the guarantee, so the suite does not run twice.
+The role rules (work test-first, no debug code left behind, follow the project's conventions, look for correctness bugs and edge cases) live in the agent bodies in `kit/agents/`, not in the shipped phase files. The phase files keep only what the engine reads or the step needs. A phase that is not delegated therefore no longer carries these rules. The shipped implement instructions and `specloop-implementer` tell the agent to run only targeted tests (the tests that cover its change, plus the linter and type checker) and not the full suite. The [quality gates](quality-gates.md#running-gates) run the full suite when the turn ends and are the guarantee, so the suite does not run twice.
 
 ## Gates while a subagent runs
 

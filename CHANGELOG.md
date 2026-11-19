@@ -24,6 +24,7 @@ All notable changes to specloop are recorded here. The format follows [Keep a Ch
 
 ### Changed
 
+- The craft rules of the implementer and the reviewer (work test-first, no leftover debug code, follow the project's conventions, look for correctness bugs and edge cases) moved from the shipped phase files into the bodies of `specloop-implementer` and `specloop-reviewer`. Non-delegated phases no longer carry these rules. The phase files keep the verdict lines, `replan.md`, `last-failure.md`, acceptance coverage, step scope and the quality-gate review items. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent).
 - The shipped implement instructions (`implement.md`, `step-implement.md`) and `specloop-implementer` tell the agent to run only targeted tests, plus the linter and type checker, and to leave the full suite to the quality gates, which are the guarantee. This avoids running the suite twice. See [Choosing the subagent](docs/delegation.md#choosing-the-subagent) and [Running gates](docs/quality-gates.md#running-gates).
 - The documentation moved from one long `README.md` into focused pages under [`docs/`](docs/README.md). The README is now a short introduction. Old README anchors such as `README.md#feature-mode` no longer exist; use the page for the topic, for example [Feature mode](docs/feature-mode.md). Behaviour is unchanged.
 

@@ -517,5 +517,42 @@ class InstallSourceTest(unittest.TestCase):
         self.assertEqual(["! update checks unavailable: " + source["reason"]], lines)
 
 
+class PhaseFileContentTest(unittest.TestCase):
+    KIT = os.path.join(os.path.dirname(HERE), "kit")
+    MARKERS = {
+        "review.md": ["VERDICT:"],
+        "step-review.md": ["VERDICT:", "replan.md"],
+        "step-implement.md": ["replan.md", "last-failure.md"],
+        "feature-replan.md": ["replan.md"],
+        "implement.md": ["last-failure.md"],
+    }
+    CRAFT = {
+        "test-first": "specloop-implementer.md",
+        "leftover debug code": "specloop-reviewer.md",
+        "conventions (CLAUDE.md": "specloop-reviewer.md",
+    }
+
+    def read(self, *parts):
+        with open(os.path.join(self.KIT, *parts), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_phase_files_keep_engine_markers(self):
+        for name, markers in self.MARKERS.items():
+            text = self.read("specloop", "phases", name)
+            for marker in markers:
+                self.assertIn(marker, text, name)
+
+    def test_phase_files_hold_no_craft_phrases(self):
+        phases = os.path.join(self.KIT, "specloop", "phases")
+        for name in sorted(os.listdir(phases)):
+            text = self.read("specloop", "phases", name)
+            for phrase in self.CRAFT:
+                self.assertNotIn(phrase, text, name)
+
+    def test_agent_bodies_hold_craft_phrases(self):
+        for phrase, agent in self.CRAFT.items():
+            self.assertIn(phrase, self.read("agents", agent), agent)
+
+
 if __name__ == "__main__":
     unittest.main()

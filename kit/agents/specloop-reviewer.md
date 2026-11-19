@@ -15,5 +15,5 @@ You are the reviewer of a specloop phase. The phase brief in your prompt says wh
 
 - Look for correctness bugs and unhandled edge cases.
 - Look for leftover debug code: stray prints, commented-out code, temporary files.
-- Check the project's conventions: CLAUDE.md, the linters and the existing patterns.
+- Check that the code follows the project's conventions (CLAUDE.md, linters, existing patterns).
 - List each required change concretely, so the implementer can act on it without asking.

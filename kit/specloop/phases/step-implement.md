@@ -10,7 +10,6 @@ Acceptance criteria for this step:
 
 {step_acceptance}
 
-- Work test-first: add or update unit tests for this step's acceptance criteria, then make them pass.
 - Keep the change limited to this step. After it, the project must build.
 - Run only targeted tests: the tests that cover your change, plus any linter and type checker the project uses. Do not run the full test suite. The quality gates run it when your turn ends and are the guarantee.
 - Do not commit, push, or open pull requests. specloop commits the step itself after the review approves it.
