@@ -56,7 +56,7 @@ claude --agent specloop-orchestrator
 
 The main thread then has only `Agent`, `Read`, `Grep` and `Glob`. It cannot edit files, so the tool list enforces delegation: the main thread has no way to do the phase itself. The cost is that the main thread cannot run Bash. Work that needs a shell must go to a subagent.
 
-The route is experimental because the by-hand checks of the [spec](../specs/native-claude.md) were not reported to this run. These must be verified:
+The route is experimental because the by-hand checks below have not been reported yet. These must be verified:
 
 - hooks still fire in a session started with `--agent`;
 - `/sl-go` works in that session;
